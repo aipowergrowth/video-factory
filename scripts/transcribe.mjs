@@ -1,5 +1,6 @@
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
 import {
   downloadWhisperModel,
   installWhisperCpp,
@@ -7,7 +8,7 @@ import {
   toCaptions,
 } from "@remotion/install-whisper-cpp";
 
-const projectDir = "/Users/passwordis0000/fabrica-videos";
+const projectDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const to = path.join(projectDir, "whisper.cpp");
 const wavPath = process.argv[2];
 const outJson = process.argv[3];
