@@ -1,0 +1,9 @@
+{
+  "channelId": "la-nave-tierra",
+  "displayName": "La Nave Tierra",
+  "theme": {
+    "accentColor": "#3AAFA9",
+    "captionBackgroundColor": "rgba(0,0,0,0.6)",
+    "captionTextColor": "#ffffff"
+  }
+}

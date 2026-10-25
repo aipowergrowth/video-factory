@@ -10,6 +10,9 @@
   "private": true,
   "dependencies": {
     "@remotion/cli": "4.0.538",
+    "@remotion/install-whisper-cpp": "4.0.538",
+    "express": "4.21.2",
+    "multer": "1.4.5-lts.1",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "remotion": "4.0.538"
@@ -26,7 +29,8 @@
     "dev": "remotion studio",
     "build": "remotion bundle",
     "upgrade": "remotion upgrade",
-    "lint": "eslint src && tsc"
+    "lint": "eslint src && tsc",
+    "server": "node server/index.mjs"
   },
   "allowScripts": {
     "esbuild": false

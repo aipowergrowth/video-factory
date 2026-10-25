@@ -1,0 +1,9 @@
+{
+  "channelId": "a-mi-no-me-cuadra",
+  "displayName": "A mí no me cuadra",
+  "theme": {
+    "accentColor": "#E53935",
+    "captionBackgroundColor": "rgba(0,0,0,0.6)",
+    "captionTextColor": "#ffffff"
+  }
+}

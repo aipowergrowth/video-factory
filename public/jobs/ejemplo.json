@@ -1,0 +1,34 @@
+{
+  "channel": "a-mi-no-me-cuadra",
+  "destination": "youtube-16-9",
+  "input": {
+    "type": "recorded-video",
+    "baseVideo": "videos/original.mp4",
+    "durationInSeconds": 30
+  },
+  "overlays": [
+    {
+      "id": "broll-apertura",
+      "type": "broll",
+      "startSeconds": 3,
+      "durationSeconds": 4,
+      "src": "broll/apertura.mp4",
+      "muted": true
+    },
+    {
+      "id": "imagen-grafico",
+      "type": "image",
+      "startSeconds": 10,
+      "durationSeconds": 3,
+      "src": "images/grafico.png"
+    },
+    {
+      "id": "texto-dato",
+      "type": "text",
+      "startSeconds": 15,
+      "durationSeconds": 3,
+      "text": "Dato clave para el video"
+    }
+  ],
+  "captions": []
+}

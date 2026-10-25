@@ -1,0 +1,13 @@
+node_modules
+out
+whisper.cpp
+.remotion-macos12-binaries
+.git
+.DS_Store
+*.log
+
+# Datos de ejecución: en producción viven en volúmenes montados, no en la imagen.
+public/uploads
+
+# Video de prueba de desarrollo (pesado); no hace falta en la imagen de producción.
+public/videos/dopamina

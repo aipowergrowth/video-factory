@@ -5,3 +5,18 @@ dist
 
 # Ignore the output video from Git but not videos you import into src/.
 out
+
+# Herramientas de transcripción descargadas localmente (pesadas, no son código).
+whisper.cpp
+
+# Binarios de compositor compatibles con macOS 12 (ver README). Específicos de esta máquina.
+.remotion-macos12-binaries
+
+# Videos/B-roll originales: demasiado pesados para git, se gestionan aparte.
+public/videos/**/*.mp4
+public/videos/**/*.mov
+public/broll/**/*.mp4
+public/broll/**/*.mov
+
+# Escritos en tiempo real por server/index.mjs (API/Docker); no se versionan.
+public/uploads/

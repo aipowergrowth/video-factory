@@ -1,0 +1,43 @@
+# Stack para Portainer (modo Swarm). No publica ningún puerto al exterior:
+# solo es alcanzable desde dentro de la red "aipowergrowthrpa" (la misma
+# red donde corre n8n), por su nombre de servicio
+# "fabrica-videos-engine", puerto 3001.
+version: "3.8"
+
+services:
+  fabrica-videos-engine:
+    image: ghcr.io/TU-USUARIO-GITHUB/fabrica-videos-engine:latest
+    environment:
+      PORT: "3001"
+      RENDER_CONCURRENCY: "1"
+      REMOTION_CONCURRENCY: "2"
+      ENABLE_MULTIPROCESS_ON_LINUX: "true"
+      OUTPUTS_DIR: "/data/outputs"
+      UPLOADS_JOBS_DIR: "/app/public/uploads/jobs"
+      UPLOADS_VIDEOS_DIR: "/app/public/uploads/videos"
+    volumes:
+      - fabrica_videos_inputs:/app/public/uploads
+      - fabrica_videos_outputs:/data/outputs
+    networks:
+      - aipowergrowthrpa
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "4"
+          memory: 6G
+        reservations:
+          cpus: "1"
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+      update_config:
+        order: stop-first
+
+volumes:
+  fabrica_videos_inputs:
+  fabrica_videos_outputs:
+
+networks:
+  aipowergrowthrpa:
+    external: true

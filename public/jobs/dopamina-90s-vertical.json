@@ -1,0 +1,232 @@
+{
+  "channel": "a-mi-no-me-cuadra",
+  "destination": "vertical-9-16",
+  "input": {
+    "type": "recorded-video",
+    "baseVideo": "videos/dopamina/original-90s.mp4",
+    "durationInSeconds": 90
+  },
+  "overlays": [
+    {
+      "id": "kw-detox-dopamina",
+      "type": "text",
+      "startSeconds": 5.44,
+      "durationSeconds": 3,
+      "text": "DETOX DE DOPAMINA"
+    },
+    {
+      "id": "fuente-cameron-sepah",
+      "type": "graphic",
+      "graphic": "stat",
+      "startSeconds": 27.28,
+      "durationSeconds": 6.5,
+      "props": {
+        "value": "Dr. Cameron Sepah",
+        "label": "UCSF — creador del concepto \"Detox de dopamina\""
+      }
+    },
+    {
+      "id": "titulo-capitulo",
+      "type": "graphic",
+      "graphic": "stat",
+      "startSeconds": 45.5,
+      "durationSeconds": 5,
+      "props": {
+        "value": "A MÍ NO ME CUADRA",
+        "label": "Capítulo: La Dopamina"
+      }
+    },
+    {
+      "id": "pregunta-hype",
+      "type": "text",
+      "startSeconds": 51.98,
+      "durationSeconds": 4,
+      "text": "¿ADICCIÓN REAL... O PURO HYPE?"
+    },
+    {
+      "id": "diagrama-neurotransmisor",
+      "type": "graphic",
+      "graphic": "cycle",
+      "startSeconds": 70.93,
+      "durationSeconds": 8,
+      "props": {
+        "title": "Así se comunican tus neuronas",
+        "steps": [
+          "Célula A",
+          "Dopamina",
+          "Célula B"
+        ]
+      }
+    }
+  ],
+  "captions": [
+    {
+      "text": "estamos siendo bombardeados por",
+      "startMs": 840,
+      "endMs": 4920,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "los cuatro vientos de este concepto llamado detox de dopamina y si tú",
+      "startMs": 4920,
+      "endMs": 8040,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "te vas a YouTube por ejemplo y pones detox de dopamina no te va a",
+      "startMs": 8040,
+      "endMs": 12070,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "alcanzar la vida para ver tanto contenido que se está haciendo de esto",
+      "startMs": 12070,
+      "endMs": 15950,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "y hay algo que no me cuadra si es una sustancia que genera nuestro",
+      "startMs": 15950,
+      "endMs": 19850,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "propio cuerpo cómo es posible que somos adictos a algo que nuestro",
+      "startMs": 19850,
+      "endMs": 23160,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "propio cuerpo produce eso no me cuadra además que el creador",
+      "startMs": 23160,
+      "endMs": 27280,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "del concepto detox de dopamina el doctor Cameron Sepah de la universidad",
+      "startMs": 27280,
+      "endMs": 31580,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "de San Francisco él mismo dijo que el concepto no es",
+      "startMs": 31580,
+      "endMs": 35730,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "literal ya que si eliminamos la dopamina de nuestro cuerpo",
+      "startMs": 35730,
+      "endMs": 39930,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "de nuestro cerebro traería efectos nada favorables para",
+      "startMs": 39930,
+      "endMs": 43760,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "nuestro organismo yo soy Alex Villarreal y esto es un capítulo de",
+      "startMs": 43760,
+      "endMs": 47870,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "a mí no me cuadra capítulo la dopamina es real",
+      "startMs": 47870,
+      "endMs": 51980,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "que somos adictos a ella o es puro hype vamos a entender",
+      "startMs": 51980,
+      "endMs": 56090,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "esto lo primero que tenemos que entender es qué es la dopamina no voy",
+      "startMs": 56090,
+      "endMs": 59850,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "a entrar en términos supercientíficos de esto porque puede ir una",
+      "startMs": 59850,
+      "endMs": 63980,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "inteligencia artificial o puedes irte a YouTube y vas a ver decenas de",
+      "startMs": 63980,
+      "endMs": 67320,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "cientos de vídeos que te hablan de esto pero básicamente lo que",
+      "startMs": 67320,
+      "endMs": 70930,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "tenemos que entender es que es un neurotransmisor que comunica una célula",
+      "startMs": 70930,
+      "endMs": 74720,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "con otra para múltiples funciones de sobrevivencia de nuestro",
+      "startMs": 74720,
+      "endMs": 78370,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "cuerpo de nuestra vida ok una de las más",
+      "startMs": 78370,
+      "endMs": 82060,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "importantes o dos de las más importantes que nos ha ayudado",
+      "startMs": 82060,
+      "endMs": 85930,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "inclusive evolucionar como especie humana es",
+      "startMs": 85930,
+      "endMs": 89990,
+      "timestampMs": null,
+      "confidence": null
+    },
+    {
+      "text": "que",
+      "startMs": 89990,
+      "endMs": 90000,
+      "timestampMs": null,
+      "confidence": null
+    }
+  ]
+}
