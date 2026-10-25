@@ -28,6 +28,22 @@ const ENABLE_MULTIPROCESS_ON_LINUX =
 const REMOTION_BROWSER_EXECUTABLE = process.env.REMOTION_BROWSER_EXECUTABLE;
 const REMOTION_BINARIES_DIRECTORY = process.env.REMOTION_BINARIES_DIRECTORY;
 
+// Videos de 1-2 GB (y más) deben caber. 5 GB de margen por defecto.
+const MAX_UPLOAD_BYTES = Number(
+  process.env.MAX_UPLOAD_BYTES ?? 5 * 1024 * 1024 * 1024,
+);
+// Un render que se cuelga no debe bloquear la cola para siempre. 3 horas
+// de margen por defecto para videos largos (40+ min).
+const RENDER_TIMEOUT_MINUTES = Number(
+  process.env.RENDER_TIMEOUT_MINUTES ?? 180,
+);
+// Limpieza automática: entradas/salidas terminadas más viejas que esto se
+// borran, para no llenar el disco con el uso semanal.
+const RETENTION_DAYS = Number(process.env.RETENTION_DAYS ?? 7);
+const CLEANUP_INTERVAL_HOURS = Number(
+  process.env.CLEANUP_INTERVAL_HOURS ?? 6,
+);
+
 // Códecs de video que el Chromium que usa Remotion decodifica de forma
 // fiable. HEVC/H.265 (típico de grabaciones de iPhone) NO funciona — hay
 // que convertirlo antes (ver scripts/trim_video.swift o un paso de ffmpeg
@@ -110,16 +126,56 @@ const probeVideoCodec = async (filePath) => {
 /**
  * Cola simple de renders: como mucho RENDER_CONCURRENCY trabajos de
  * render a la vez (pensado para 4 CPU / 6 GB — ver docker-stack.yml).
+ *
+ * El estado de cada job se guarda también en disco (en el volumen
+ * persistente), no solo en memoria: si el contenedor se reinicia a mitad
+ * de un render, ese trabajo se pierde igual (no hay checkpoint/resume),
+ * pero al menos el estado no desaparece en silencio — queda marcado como
+ * error explicando qué pasó, en vez de un 404 fantasma.
  */
 const jobs = new Map(); // jobId -> { status, error, createdAt, updatedAt }
 const queue = [];
 let active = 0;
 
+const statusFilePath = (jobId) =>
+  path.join(UPLOADS_JOBS_DIR, `${jobId}.status.json`);
+
 const writeStatus = (jobId, patch) => {
   const current = jobs.get(jobId) ?? {};
   const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
   jobs.set(jobId, next);
+  fs.writeFile(statusFilePath(jobId), JSON.stringify(next, null, 2), () => {});
   return next;
+};
+
+const recoverJobsFromDisk = () => {
+  let recovered = 0;
+  let markedAsInterrupted = 0;
+  for (const file of fs.readdirSync(UPLOADS_JOBS_DIR)) {
+    if (!file.endsWith(".status.json")) continue;
+    const jobId = file.replace(/\.status\.json$/, "");
+    try {
+      const raw = fs.readFileSync(path.join(UPLOADS_JOBS_DIR, file), "utf8");
+      const status = JSON.parse(raw);
+      if (status.status === "queued" || status.status === "rendering") {
+        status.status = "error";
+        status.error =
+          "El servicio se reinició mientras este trabajo estaba en curso. Vuelve a enviarlo.";
+        status.updatedAt = new Date().toISOString();
+        fs.writeFileSync(statusFilePath(jobId), JSON.stringify(status, null, 2));
+        markedAsInterrupted += 1;
+      }
+      jobs.set(jobId, status);
+      recovered += 1;
+    } catch (err) {
+      console.log(`No se pudo recuperar el estado de ${jobId}:`, err.message ?? err);
+    }
+  }
+  if (recovered > 0) {
+    console.log(
+      `Recuperados ${recovered} trabajo(s) previos del disco (${markedAsInterrupted} marcados como interrumpidos por reinicio).`,
+    );
+  }
 };
 
 const runRender = (jobId) =>
@@ -152,13 +208,27 @@ const runRender = (jobId) =>
     });
 
     let stderrTail = "";
+    let timedOut = false;
     child.stderr.on("data", (chunk) => {
       stderrTail = (stderrTail + chunk.toString()).slice(-4000);
     });
 
+    const timeoutMs = RENDER_TIMEOUT_MINUTES * 60 * 1000;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      console.log(
+        `[render ${jobId}] superó ${RENDER_TIMEOUT_MINUTES} min, terminando el proceso.`,
+      );
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 10_000);
+    }, timeoutMs);
+
     child.on("exit", (code, signal) => {
+      clearTimeout(timeoutTimer);
       console.log(`[render ${jobId}] proceso hijo salió: code=${code} signal=${signal}`);
-      if (code === 0) {
+      if (timedOut) {
+        reject(new Error(`El render superó el límite de ${RENDER_TIMEOUT_MINUTES} minutos.`));
+      } else if (code === 0) {
         resolve();
       } else {
         reject(
@@ -169,6 +239,7 @@ const runRender = (jobId) =>
       }
     });
     child.on("error", (err) => {
+      clearTimeout(timeoutTimer);
       console.log(`[render ${jobId}] error al lanzar el proceso:`, err);
       reject(err);
     });
@@ -205,8 +276,48 @@ const enqueue = (jobId) => {
   processQueue();
 };
 
+/**
+ * Borra entradas y salidas de trabajos ya terminados (done/error) más
+ * viejos que RETENTION_DAYS. Nunca toca un trabajo en cola o en render.
+ */
+const cleanupOldFiles = async () => {
+  const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  let deleted = 0;
+
+  for (const [jobId, status] of jobs.entries()) {
+    if (status.status !== "done" && status.status !== "error") continue;
+    const updatedAt = Date.parse(status.updatedAt ?? "") || 0;
+    if (updatedAt > cutoff) continue;
+
+    for (const file of [
+      path.join(OUTPUTS_DIR, `${jobId}.mp4`),
+      path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`),
+      path.join(UPLOADS_JOBS_DIR, `${jobId}.json`),
+      statusFilePath(jobId),
+    ]) {
+      try {
+        await fsp.unlink(file);
+        deleted += 1;
+      } catch {
+        // Puede no existir (p.ej. input.type no era recorded-video); se ignora.
+      }
+    }
+    jobs.delete(jobId);
+  }
+
+  if (deleted > 0) {
+    console.log(`Limpieza automática: ${deleted} archivo(s) de trabajos de hace más de ${RETENTION_DAYS} días.`);
+  }
+};
+
 const app = express();
-const upload = multer({ dest: "/tmp/fabrica-videos-uploads" });
+const upload = multer({
+  dest: "/tmp/fabrica-videos-uploads",
+  limits: {
+    fileSize: MAX_UPLOAD_BYTES,
+    fieldSize: 5 * 1024 * 1024,
+  },
+});
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, active, queued: queue.length });
@@ -282,10 +393,27 @@ app.get("/jobs/:id/download", (req, res) => {
   res.download(file);
 });
 
+// Errores de multer (p.ej. archivo más grande que MAX_UPLOAD_BYTES) llegan
+// aquí en vez de tumbar el proceso.
+app.use((err, _req, res, _next) => {
+  if (err instanceof multer.MulterError) {
+    const status = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
+    return res.status(status).json({ error: `Error subiendo el archivo: ${err.message}` });
+  }
+  res.status(500).json({ error: String(err.message ?? err) });
+});
+
+recoverJobsFromDisk();
+cleanupOldFiles();
+setInterval(cleanupOldFiles, CLEANUP_INTERVAL_HOURS * 60 * 60 * 1000);
+
 app.listen(PORT, () => {
   console.log(`fabrica-videos API escuchando en :${PORT}`);
   console.log(`  uploads/jobs   -> ${UPLOADS_JOBS_DIR}`);
   console.log(`  uploads/videos -> ${UPLOADS_VIDEOS_DIR}`);
   console.log(`  outputs        -> ${OUTPUTS_DIR}`);
   console.log(`  concurrencia de renders -> ${RENDER_CONCURRENCY}`);
+  console.log(`  tope de subida -> ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB`);
+  console.log(`  timeout de render -> ${RENDER_TIMEOUT_MINUTES} min`);
+  console.log(`  retención -> ${RETENTION_DAYS} días (limpieza cada ${CLEANUP_INTERVAL_HOURS}h)`);
 });
