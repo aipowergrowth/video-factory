@@ -235,9 +235,13 @@ definir.
 
 `server/index.mjs` expone una API mínima (`POST /jobs`, `GET /jobs/:id`,
 `GET /jobs/:id/download`) para que n8n mande un video + un `EngineJob` y
-reciba el MP4. El `Dockerfile`, `docker-stack.yml` (Portainer/Swarm) y
-`registry/docker-stack.yml` (registro privado autoalojado, opcional) están
-listos para desplegar. **Todo el detalle — y qué de esto está probado de
+reciba el MP4, alcanzable solo desde la red interna de Docker (sin puerto
+publicado a Internet). El código vive en
+[`github.com/aipowergrowth/video-factory`](https://github.com/aipowergrowth/video-factory);
+cada cambio en `main` publica sola una imagen nueva en
+`ghcr.io/aipowergrowth/fabrica-videos-engine` vía GitHub Actions
+(`.github/workflows/docker-publish.yml`). **La guía de despliegue en
+Portainer, clic a clic y sin terminal — y qué de esto está probado de
 verdad y qué no — está en [`DEPLOY.md`](./DEPLOY.md).**
 
 ## Próximos canales
