@@ -7,6 +7,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
+import { downloadFileWithRetry } from "./drive.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -28,7 +29,7 @@ const ENABLE_MULTIPROCESS_ON_LINUX =
 const REMOTION_BROWSER_EXECUTABLE = process.env.REMOTION_BROWSER_EXECUTABLE;
 const REMOTION_BINARIES_DIRECTORY = process.env.REMOTION_BINARIES_DIRECTORY;
 
-// Videos de 1-2 GB (y más) deben caber. 5 GB de margen por defecto.
+// Videos de 1-3 GB deben caber (subida directa). 5 GB de margen por defecto.
 const MAX_UPLOAD_BYTES = Number(
   process.env.MAX_UPLOAD_BYTES ?? 5 * 1024 * 1024 * 1024,
 );
@@ -42,6 +43,13 @@ const RENDER_TIMEOUT_MINUTES = Number(
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS ?? 7);
 const CLEANUP_INTERVAL_HOURS = Number(
   process.env.CLEANUP_INTERVAL_HOURS ?? 6,
+);
+// Reintentos para la descarga desde Google Drive.
+const DRIVE_DOWNLOAD_MAX_ATTEMPTS = Number(
+  process.env.DRIVE_DOWNLOAD_MAX_ATTEMPTS ?? 3,
+);
+const DRIVE_DOWNLOAD_WAIT_MS = Number(
+  process.env.DRIVE_DOWNLOAD_WAIT_MS ?? 5000,
 );
 
 // Códecs de video que el Chromium que usa Remotion decodifica de forma
@@ -99,7 +107,13 @@ const resolveCompositorFfprobe = () => {
   throw new Error("No se encontró ningún @remotion/compositor-* instalado.");
 };
 
-const probeVideoCodec = async (filePath) => {
+/**
+ * Códec del video y su duración real, en una sola pasada de ffprobe. La
+ * duración la calcula siempre el servidor (nunca se confía en lo que
+ * mande el cliente) — necesario para el flujo de Drive, donde nadie la
+ * escribe a mano, y más fiable también para la subida directa.
+ */
+const probeVideoInfo = async (filePath) => {
   const ffprobePath = resolveCompositorFfprobe();
   const env =
     process.platform === "darwin"
@@ -114,18 +128,33 @@ const probeVideoCodec = async (filePath) => {
       "v:0",
       "-show_entries",
       "stream=codec_name",
+      "-show_entries",
+      "format=duration",
       "-of",
-      "default=nw=1:nk=1",
+      "default=nw=1",
       filePath,
     ],
     { env },
   );
-  return stdout.trim();
+  const fields = Object.fromEntries(
+    stdout
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const idx = line.indexOf("=");
+        return [line.slice(0, idx), line.slice(idx + 1)];
+      }),
+  );
+  return {
+    codec: fields.codec_name,
+    durationSeconds: fields.duration ? Number(fields.duration) : null,
+  };
 };
 
 /**
  * Cola simple de renders: como mucho RENDER_CONCURRENCY trabajos de
- * render a la vez (pensado para 4 CPU / 6 GB — ver docker-stack.yml).
+ * render a la vez (pensado para los recursos del VPS — ver docker-stack.yml).
  *
  * El estado de cada job se guarda también en disco (en el volumen
  * persistente), no solo en memoria: si el contenedor se reinicia a mitad
@@ -137,6 +166,7 @@ const jobs = new Map(); // jobId -> { status, error, createdAt, updatedAt }
 const queue = [];
 let active = 0;
 
+const jobFilePath = (jobId) => path.join(UPLOADS_JOBS_DIR, `${jobId}.json`);
 const statusFilePath = (jobId) =>
   path.join(UPLOADS_JOBS_DIR, `${jobId}.status.json`);
 
@@ -157,7 +187,11 @@ const recoverJobsFromDisk = () => {
     try {
       const raw = fs.readFileSync(path.join(UPLOADS_JOBS_DIR, file), "utf8");
       const status = JSON.parse(raw);
-      if (status.status === "queued" || status.status === "rendering") {
+      if (
+        status.status === "queued" ||
+        status.status === "downloading" ||
+        status.status === "rendering"
+      ) {
         status.status = "error";
         status.error =
           "El servicio se reinició mientras este trabajo estaba en curso. Vuelve a enviarlo.";
@@ -245,23 +279,69 @@ const runRender = (jobId) =>
     });
   });
 
+/**
+ * Si el trabajo vino con una referencia de Drive (en vez de un archivo ya
+ * subido), lo descarga ahora: streaming a disco, con reintentos y
+ * verificación de tamaño/MD5. Si ya tiene `baseVideo` (subida directa),
+ * no hace nada.
+ */
+const resolveJobInput = async (jobId, job) => {
+  if (job.input.type !== "recorded-video" || job.input.baseVideo) {
+    return job;
+  }
+  if (!job.input.driveFileId) {
+    throw new Error(
+      'input.type es "recorded-video": falta "baseVideo" (subida directa) o "driveFileId" (Drive).',
+    );
+  }
+
+  writeStatus(jobId, { status: "downloading" });
+  console.log(`[job ${jobId}] descargando de Drive: ${job.input.driveFileId}`);
+
+  const destPath = path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`);
+  const partPath = `${destPath}.part`;
+
+  await downloadFileWithRetry(job.input.driveFileId, partPath, {
+    maxAttempts: DRIVE_DOWNLOAD_MAX_ATTEMPTS,
+    waitMs: DRIVE_DOWNLOAD_WAIT_MS,
+  });
+
+  const info = await probeVideoInfo(partPath);
+  if (!ALLOWED_VIDEO_CODECS.has(info.codec)) {
+    await fsp.unlink(partPath).catch(() => {});
+    throw new Error(
+      `Códec de video "${info.codec}" no soportado (se necesita H.264/VP8/VP9/AV1, no HEVC/H.265). Convierte el video antes de subirlo a Drive.`,
+    );
+  }
+
+  await safeRename(partPath, destPath);
+  job.input.baseVideo = `uploads/videos/${jobId}.mp4`;
+  job.input.durationInSeconds = info.durationSeconds;
+  delete job.input.driveFileId;
+  await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
+
+  return job;
+};
+
 const processQueue = () => {
   if (active >= RENDER_CONCURRENCY || queue.length === 0) {
     return;
   }
   const jobId = queue.shift();
   active += 1;
-  writeStatus(jobId, { status: "rendering" });
 
-  console.log(`[render ${jobId}] iniciando (active=${active})`);
+  (async () => {
+    console.log(`[job ${jobId}] iniciando (active=${active})`);
+    const job = JSON.parse(await fsp.readFile(jobFilePath(jobId), "utf8"));
+    await resolveJobInput(jobId, job);
 
-  runRender(jobId)
-    .then(() => {
-      console.log(`[render ${jobId}] terminado OK`);
-      writeStatus(jobId, { status: "done" });
-    })
+    writeStatus(jobId, { status: "rendering" });
+    await runRender(jobId);
+    console.log(`[render ${jobId}] terminado OK`);
+    writeStatus(jobId, { status: "done" });
+  })()
     .catch((err) => {
-      console.log(`[render ${jobId}] terminó con error:`, err.message ?? err);
+      console.log(`[job ${jobId}] terminó con error:`, err.message ?? err);
       writeStatus(jobId, { status: "error", error: String(err.message ?? err) });
     })
     .finally(() => {
@@ -278,7 +358,7 @@ const enqueue = (jobId) => {
 
 /**
  * Borra entradas y salidas de trabajos ya terminados (done/error) más
- * viejos que RETENTION_DAYS. Nunca toca un trabajo en cola o en render.
+ * viejos que RETENTION_DAYS. Nunca toca un trabajo en cola o en proceso.
  */
 const cleanupOldFiles = async () => {
   const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -292,7 +372,7 @@ const cleanupOldFiles = async () => {
     for (const file of [
       path.join(OUTPUTS_DIR, `${jobId}.mp4`),
       path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`),
-      path.join(UPLOADS_JOBS_DIR, `${jobId}.json`),
+      jobFilePath(jobId),
       statusFilePath(jobId),
     ]) {
       try {
@@ -311,6 +391,8 @@ const cleanupOldFiles = async () => {
 };
 
 const app = express();
+app.use(express.json({ limit: "2mb" }));
+
 const upload = multer({
   dest: "/tmp/fabrica-videos-uploads",
   limits: {
@@ -327,51 +409,52 @@ app.post("/jobs", upload.single("video"), async (req, res) => {
   const jobId = crypto.randomUUID();
 
   try {
-    if (!req.body.job) {
-      return res.status(400).json({ error: 'Falta el campo "job" (JSON).' });
-    }
-    const job = JSON.parse(req.body.job);
+    // Dos formas de llamar a este endpoint:
+    //  - multipart/form-data con el archivo en "video" y el job (JSON) en
+    //    el campo de texto "job" (subida directa, como hasta ahora).
+    //  - application/json con el job completo como cuerpo, e
+    //    `input.driveFileId` en vez de un archivo (lo descarga el motor).
+    const job = req.is("application/json") ? req.body : JSON.parse(req.body.job ?? "null");
 
-    if (!job.channel || !job.destination || !job.input || !job.input.type) {
+    if (!job || !job.channel || !job.destination || !job.input || !job.input.type) {
+      await fsp.unlink(req.file?.path ?? "").catch(() => {});
       return res.status(400).json({
         error: "El job debe traer channel, destination e input.type.",
       });
     }
 
     if (job.input.type === "recorded-video") {
-      if (!req.file) {
+      if (req.file) {
+        const info = await probeVideoInfo(req.file.path).catch((probeErr) => {
+          throw new Error(`No se pudo verificar el video subido: ${probeErr.message}`);
+        });
+        if (!ALLOWED_VIDEO_CODECS.has(info.codec)) {
+          await fsp.unlink(req.file.path).catch(() => {});
+          return res.status(422).json({
+            error: `Códec de video "${info.codec}" no soportado (se necesita H.264/VP8/VP9/AV1, no HEVC/H.265). Convierte el video antes de subirlo.`,
+          });
+        }
+
+        const videoDest = path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`);
+        await safeRename(req.file.path, videoDest);
+        job.input.baseVideo = `uploads/videos/${jobId}.mp4`;
+        job.input.durationInSeconds = info.durationSeconds;
+      } else if (!job.input.driveFileId) {
         return res.status(400).json({
-          error: 'input.type es "recorded-video": falta el archivo "video".',
+          error:
+            'input.type es "recorded-video": falta el archivo "video" (subida directa) o "input.driveFileId" (Drive).',
         });
       }
-
-      let codec;
-      try {
-        codec = await probeVideoCodec(req.file.path);
-      } catch (probeErr) {
-        await fsp.unlink(req.file.path).catch(() => {});
-        return res.status(500).json({
-          error: `No se pudo verificar el códec del video subido: ${probeErr.message}`,
-        });
-      }
-      if (!ALLOWED_VIDEO_CODECS.has(codec)) {
-        await fsp.unlink(req.file.path).catch(() => {});
-        return res.status(422).json({
-          error: `Códec de video "${codec}" no soportado (se necesita H.264/VP8/VP9/AV1, no HEVC/H.265). Convierte el video antes de subirlo.`,
-        });
-      }
-
-      const videoDest = path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`);
-      await safeRename(req.file.path, videoDest);
-      job.input.baseVideo = `uploads/videos/${jobId}.mp4`;
+      // Si vino driveFileId, la descarga pasa en la cola (resolveJobInput),
+      // no aquí — así el POST responde al instante aunque el archivo pese GBs.
     }
 
-    const jobFilePath = path.join(UPLOADS_JOBS_DIR, `${jobId}.json`);
-    await fsp.writeFile(jobFilePath, JSON.stringify(job, null, 2));
+    await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
 
     enqueue(jobId);
     res.status(202).json({ jobId });
   } catch (err) {
+    await fsp.unlink(req.file?.path ?? "").catch(() => {});
     res.status(500).json({ error: String(err.message ?? err) });
   }
 });
@@ -413,7 +496,8 @@ app.listen(PORT, () => {
   console.log(`  uploads/videos -> ${UPLOADS_VIDEOS_DIR}`);
   console.log(`  outputs        -> ${OUTPUTS_DIR}`);
   console.log(`  concurrencia de renders -> ${RENDER_CONCURRENCY}`);
-  console.log(`  tope de subida -> ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB`);
+  console.log(`  tope de subida directa -> ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB`);
   console.log(`  timeout de render -> ${RENDER_TIMEOUT_MINUTES} min`);
   console.log(`  retención -> ${RETENTION_DAYS} días (limpieza cada ${CLEANUP_INTERVAL_HOURS}h)`);
+  console.log(`  credenciales de Drive -> ${process.env.GOOGLE_APPLICATION_CREDENTIALS ? "configuradas" : "NO configuradas"}`);
 });

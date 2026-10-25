@@ -15,11 +15,17 @@ services:
       OUTPUTS_DIR: "/data/outputs"
       UPLOADS_JOBS_DIR: "/app/public/uploads/jobs"
       UPLOADS_VIDEOS_DIR: "/app/public/uploads/videos"
+      # Credencial de la cuenta de servicio de Google Drive (acceso de
+      # solo lectura a la carpeta compartida). El archivo nunca está en
+      # el repo/imagen: lo monta Swarm desde el secreto de abajo.
+      GOOGLE_APPLICATION_CREDENTIALS: "/run/secrets/drive_service_account_json"
     volumes:
       - fabrica_videos_inputs:/app/public/uploads
       - fabrica_videos_outputs:/data/outputs
     networks:
       - aipowergrowthrpa
+    secrets:
+      - drive_service_account_json
     deploy:
       replicas: 1
       resources:
@@ -40,4 +46,10 @@ volumes:
 
 networks:
   aipowergrowthrpa:
+    external: true
+
+secrets:
+  # Creado a mano en Portainer -> Secrets (nunca en este repo). Debe
+  # llamarse exactamente así, o ajustar el nombre de arriba también.
+  drive_service_account_json:
     external: true

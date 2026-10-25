@@ -1,0 +1,186 @@
+{
+  "name": "Fábrica de videos — Drive → motor (A mí no me cuadra)",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PEGA_AQUI_EL_ID_DE_LA_CARPETA"
+        },
+        "event": "fileCreated"
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [-400, 0],
+      "id": "drive-trigger",
+      "name": "Nuevo video en Drive",
+      "credentials": {
+        "googleApi": {
+          "id": "",
+          "name": "Google Service Account (fabrica-videos)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://fabrica-videos-engine:3001/jobs",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: \"a-mi-no-me-cuadra\", destination: \"youtube-16-9\", input: { type: \"recorded-video\", driveFileId: $json.id }, overlays: [], captions: [] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 0],
+      "id": "enviar-job",
+      "name": "Enviar trabajo al motor"
+    },
+    {
+      "parameters": {
+        "amount": 1,
+        "unit": "minutes"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [80, 0],
+      "id": "esperar",
+      "name": "Esperar",
+      "webhookId": "esperar-webhook-id"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://fabrica-videos-engine:3001/jobs/{{ $('Enviar trabajo al motor').item.json.jobId }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [320, 0],
+      "id": "consultar-estado",
+      "name": "Consultar estado"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-done",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "done",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [560, 0],
+      "id": "esta-listo",
+      "name": "¿Está listo?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-error",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "error",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [560, 220],
+      "id": "fallo",
+      "name": "¿Falló?"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://fabrica-videos-engine:3001/jobs/{{ $('Enviar trabajo al motor').item.json.jobId }}/download",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [800, -80],
+      "id": "descargar-mp4",
+      "name": "Descargar MP4"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [800, 220],
+      "id": "trabajo-fallido",
+      "name": "Trabajo falló (revisar $json.error)"
+    }
+  ],
+  "connections": {
+    "Nuevo video en Drive": {
+      "main": [[{ "node": "Enviar trabajo al motor", "type": "main", "index": 0 }]]
+    },
+    "Enviar trabajo al motor": {
+      "main": [[{ "node": "Esperar", "type": "main", "index": 0 }]]
+    },
+    "Esperar": {
+      "main": [[{ "node": "Consultar estado", "type": "main", "index": 0 }]]
+    },
+    "Consultar estado": {
+      "main": [[{ "node": "¿Está listo?", "type": "main", "index": 0 }]]
+    },
+    "¿Está listo?": {
+      "main": [
+        [{ "node": "Descargar MP4", "type": "main", "index": 0 }],
+        [{ "node": "¿Falló?", "type": "main", "index": 0 }]
+      ]
+    },
+    "¿Falló?": {
+      "main": [
+        [{ "node": "Trabajo falló (revisar $json.error)", "type": "main", "index": 0 }],
+        [{ "node": "Esperar", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
