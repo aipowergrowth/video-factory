@@ -38,6 +38,24 @@ for (const dir of [UPLOADS_JOBS_DIR, UPLOADS_VIDEOS_DIR, OUTPUTS_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+/**
+ * Mueve un archivo incluso cuando origen y destino están en volúmenes
+ * Docker distintos (p.ej. el directorio temporal de multer vs. un volumen
+ * montado): ahí `fs.rename` falla con EXDEV porque no es un simple rename
+ * de inodo, así que en ese caso se copia y se borra el original.
+ */
+const safeRename = async (src, dest) => {
+  try {
+    await fsp.rename(src, dest);
+  } catch (err) {
+    if (err.code !== "EXDEV") {
+      throw err;
+    }
+    await fsp.copyFile(src, dest);
+    await fsp.unlink(src);
+  }
+};
+
 const resolveCompositorFfprobe = () => {
   if (REMOTION_BINARIES_DIRECTORY) {
     const bin = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
@@ -233,7 +251,7 @@ app.post("/jobs", upload.single("video"), async (req, res) => {
       }
 
       const videoDest = path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`);
-      await fsp.rename(req.file.path, videoDest);
+      await safeRename(req.file.path, videoDest);
       job.input.baseVideo = `uploads/videos/${jobId}.mp4`;
     }
 
