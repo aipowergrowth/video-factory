@@ -6,7 +6,7 @@ version: "3.8"
 
 services:
   fabrica-videos-engine:
-    image: ghcr.io/TU-USUARIO-GITHUB/fabrica-videos-engine:latest
+    image: ghcr.io/aipowergrowth/fabrica-videos-engine:latest
     environment:
       PORT: "3001"
       RENDER_CONCURRENCY: "1"
