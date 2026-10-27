@@ -8,6 +8,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { downloadFileWithRetry } from "./drive.mjs";
+import { transcribeVideo } from "./transcribe.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -51,6 +52,10 @@ const DRIVE_DOWNLOAD_MAX_ATTEMPTS = Number(
 const DRIVE_DOWNLOAD_WAIT_MS = Number(
   process.env.DRIVE_DOWNLOAD_WAIT_MS ?? 5000,
 );
+// Transcripción automática (Etapa 1). whisper.cpp ya viene compilado en la
+// imagen (ver Dockerfile); aquí solo se usa.
+const WHISPER_DIR = path.join(PROJECT_ROOT, "whisper.cpp");
+const WHISPER_MODEL = process.env.WHISPER_MODEL ?? "small";
 
 // Códecs de video que el Chromium que usa Remotion decodifica de forma
 // fiable. HEVC/H.265 (típico de grabaciones de iPhone) NO funciona — hay
@@ -80,9 +85,9 @@ const safeRename = async (src, dest) => {
   }
 };
 
-const resolveCompositorFfprobe = () => {
+const resolveCompositorBinary = (name) => {
+  const bin = process.platform === "win32" ? `${name}.exe` : name;
   if (REMOTION_BINARIES_DIRECTORY) {
-    const bin = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
     return path.join(REMOTION_BINARIES_DIRECTORY, bin);
   }
 
@@ -98,7 +103,6 @@ const resolveCompositorFfprobe = () => {
   for (const pkg of candidates) {
     try {
       const mod = require(pkg);
-      const bin = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
       return path.join(mod.dir, bin);
     } catch {
       // Paquete no instalado para esta plataforma/arquitectura; probar el siguiente.
@@ -106,6 +110,16 @@ const resolveCompositorFfprobe = () => {
   }
   throw new Error("No se encontró ningún @remotion/compositor-* instalado.");
 };
+
+const resolveCompositorFfprobe = () => resolveCompositorBinary("ffprobe");
+const resolveCompositorFfmpeg = () => resolveCompositorBinary("ffmpeg");
+
+/** macOS (solo desarrollo local) necesita esta variable para encontrar
+ * los .dylib que viven junto al binario; en Linux no hace falta. */
+const binaryEnv = (binaryPath) =>
+  process.platform === "darwin"
+    ? { ...process.env, DYLD_LIBRARY_PATH: path.dirname(binaryPath) }
+    : process.env;
 
 /**
  * Códec del video y su duración real, en una sola pasada de ffprobe. La
@@ -115,10 +129,7 @@ const resolveCompositorFfprobe = () => {
  */
 const probeVideoInfo = async (filePath) => {
   const ffprobePath = resolveCompositorFfprobe();
-  const env =
-    process.platform === "darwin"
-      ? { ...process.env, DYLD_LIBRARY_PATH: path.dirname(ffprobePath) }
-      : process.env;
+  const env = binaryEnv(ffprobePath);
   const { stdout } = await execFileAsync(
     ffprobePath,
     [
@@ -190,6 +201,7 @@ const recoverJobsFromDisk = () => {
       if (
         status.status === "queued" ||
         status.status === "downloading" ||
+        status.status === "transcribing" ||
         status.status === "rendering"
       ) {
         status.status = "error";
@@ -323,6 +335,53 @@ const resolveJobInput = async (jobId, job) => {
   return job;
 };
 
+/**
+ * Transcribe automáticamente (Etapa 1) si el job no trae ya subtítulos
+ * propios y no pidió saltarse este paso (`job.skipTranscription`). Mide
+ * tiempo y memoria del contenedor — se registra en el log del servidor.
+ */
+const transcribeJobIfNeeded = async (jobId, job) => {
+  if (job.input.type !== "recorded-video") return job;
+  if (job.skipTranscription) return job;
+  if (Array.isArray(job.captions) && job.captions.length > 0) return job;
+
+  writeStatus(jobId, { status: "transcribing" });
+  console.log(`[job ${jobId}] transcribiendo...`);
+
+  const correctionsPath = path.join(
+    PROJECT_ROOT,
+    "public/channels",
+    job.channel,
+    "corrections.json",
+  );
+  const corrections = await fsp
+    .readFile(correctionsPath, "utf8")
+    .then(JSON.parse)
+    .catch(() => []);
+
+  const ffmpegPath = resolveCompositorFfmpeg();
+  const result = await transcribeVideo({
+    videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
+    corrections,
+    ffmpegPath,
+    ffmpegEnv: binaryEnv(ffmpegPath),
+    whisperDir: WHISPER_DIR,
+    model: WHISPER_MODEL,
+    onLog: (msg) => console.log(`[job ${jobId}] ${msg}`),
+  });
+
+  console.log(
+    `[job ${jobId}] transcripción lista: idioma=${result.detectedLanguage} ${result.metrics.lineCount} líneas en ${(result.metrics.elapsedMs / 1000).toFixed(1)}s` +
+      (result.metrics.containerMemoryBytes.duringOrAfter
+        ? ` memoria_contenedor=${(result.metrics.containerMemoryBytes.duringOrAfter / 1024 / 1024).toFixed(0)}MB`
+        : ""),
+  );
+
+  job.captions = result.captions;
+  await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
+  return job;
+};
+
 const processQueue = () => {
   if (active >= RENDER_CONCURRENCY || queue.length === 0) {
     return;
@@ -334,6 +393,7 @@ const processQueue = () => {
     console.log(`[job ${jobId}] iniciando (active=${active})`);
     const job = JSON.parse(await fsp.readFile(jobFilePath(jobId), "utf8"));
     await resolveJobInput(jobId, job);
+    await transcribeJobIfNeeded(jobId, job);
 
     writeStatus(jobId, { status: "rendering" });
     await runRender(jobId);
