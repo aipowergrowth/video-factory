@@ -111,6 +111,31 @@ export type RecordedVideoInput = {
 export type EngineInput = RecordedVideoInput; // | ScriptAudioImagesInput (futuro)
 
 /**
+ * Un corte: tramo del video ORIGINAL que se elimina de la salida. Igual que
+ * `overlays`/`captions`, se piensa en el tiempo del original — el motor
+ * recalcula dónde cae todo lo demás tras quitarlo (ver `engine/timeline.ts`).
+ */
+export type Cut = {
+  id: string;
+  startSeconds: number;
+  endSeconds: number;
+};
+
+/**
+ * Un "punch-in" tipo Ken Burns sobre el video base, en el tiempo del
+ * ORIGINAL. `fromScale`/`toScale` son factores de escala (1 = sin zoom).
+ * `origin` es el punto focal como fracción del cuadro (0-1, 0.5/0.5 = centro).
+ */
+export type ZoomKeyframe = {
+  id: string;
+  startSeconds: number;
+  endSeconds: number;
+  fromScale: number;
+  toScale: number;
+  origin?: { x: number; y: number };
+};
+
+/**
  * Un "trabajo" para el motor: qué canal, a qué formato de salida y con qué
  * entrada, más las inserciones (overlays) y subtítulos ya decididos.
  */
@@ -123,6 +148,10 @@ export type EngineJob = {
   overlays: Overlay[];
   /** Subtítulos sincronizados. Estructura lista; puede ir vacío. */
   captions?: Caption[];
+  /** Tramos a eliminar del video base. Vacío o ausente = sin cortes. */
+  cuts?: Cut[];
+  /** Zooms tipo Ken Burns sobre el video base. */
+  zooms?: ZoomKeyframe[];
 };
 
 /** Perfil editorial de un canal — vive fuera del código, en public/channels. */
