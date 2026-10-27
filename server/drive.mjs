@@ -4,7 +4,14 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 
-const SCOPES = ["https://www.googleapis.com/auth/drive.readonly"];
+// `drive.file` (además del readonly que ya había) alcanza para subir el
+// MP4 final a una carpeta que se compartió explícitamente con esta cuenta
+// de servicio con permiso de Editor -- no hace falta el scope completo
+// `drive` (acceso a todo Drive) para esto.
+const SCOPES = [
+  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/drive.file",
+];
 
 let cachedClient = null;
 let testClientFactory = null;
@@ -39,6 +46,24 @@ const getDriveClient = () => {
   const auth = new GoogleAuth({ keyFile, scopes: SCOPES });
   cachedClient = driveApi({ version: "v3", auth });
   return cachedClient;
+};
+
+/**
+ * Sube un archivo (el MP4 final) a una carpeta de Drive. La carpeta debe
+ * estar compartida de antemano con el email de esta cuenta de servicio
+ * con permiso de Editor (igual que la carpeta de origen se compartió como
+ * Viewer para las descargas) -- si no, Drive devuelve un error 403/404
+ * claro, no uno silencioso.
+ */
+export const uploadFile = async ({ filePath, fileName, folderId, mimeType = "video/mp4" }) => {
+  const client = getDriveClient();
+  const { data } = await client.files.create({
+    requestBody: { name: fileName, parents: [folderId] },
+    media: { mimeType, body: fs.createReadStream(filePath) },
+    fields: "id,name,webViewLink",
+    supportsAllDrives: true,
+  });
+  return data;
 };
 
 export const getFileMetadata = async (fileId) => {

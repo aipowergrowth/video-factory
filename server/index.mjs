@@ -7,7 +7,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
-import { downloadFileWithRetry } from "./drive.mjs";
+import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
 import { planEdit } from "./editorial.mjs";
 
@@ -62,6 +62,13 @@ const DRIVE_DOWNLOAD_MAX_ATTEMPTS = Number(
 const DRIVE_DOWNLOAD_WAIT_MS = Number(
   process.env.DRIVE_DOWNLOAD_WAIT_MS ?? 5000,
 );
+// Si se configura, el MP4 final se sube a esta carpeta de Drive al
+// terminar cada job (para poder verlo/aprobarlo sin acceso al VPS). La
+// carpeta debe compartirse de antemano con el email de la cuenta de
+// servicio con permiso de Editor (la de origen solo necesita Viewer).
+// Sin esto configurado, el motor sigue funcionando igual, simplemente
+// sin subir nada -- no es un requisito para que un job termine bien.
+const DRIVE_OUTPUT_FOLDER_ID = process.env.DRIVE_OUTPUT_FOLDER_ID;
 // Transcripción automática (Etapa 1). whisper.cpp ya viene compilado en la
 // imagen (ver Dockerfile); aquí solo se usa.
 const WHISPER_DIR = path.join(PROJECT_ROOT, "whisper.cpp");
@@ -148,7 +155,7 @@ const probeVideoInfo = async (filePath) => {
       "-select_streams",
       "v:0",
       "-show_entries",
-      "stream=codec_name",
+      "stream=codec_name,width,height",
       "-show_entries",
       "format=duration",
       "-of",
@@ -169,6 +176,8 @@ const probeVideoInfo = async (filePath) => {
   );
   return {
     codec: fields.codec_name,
+    width: fields.width ? Number(fields.width) : null,
+    height: fields.height ? Number(fields.height) : null,
     durationSeconds: fields.duration ? Number(fields.duration) : null,
   };
 };
@@ -510,6 +519,53 @@ const planEditIfNeeded = async (jobId, job) => {
   return job;
 };
 
+/**
+ * Verifica técnicamente el MP4 final (duración/resolución/códec) y, si
+ * hay una carpeta de Drive configurada, lo sube ahí -- para poder
+ * revisarlo/aprobarlo sin acceso al VPS. Lo llama automáticamente
+ * processQueue al terminar un render, pero también se puede llamar a
+ * mano (POST /jobs/:id/finalize) para un job que ya terminó antes de que
+ * existiera esto, o si la subida falló la primera vez y se quiere
+ * reintentar. Mira el ARCHIVO en disco, no el status guardado -- un job
+ * puede haber renderizado bien y el status haber quedado mal (p.ej. por
+ * un reinicio justo después) sin que eso invalide el MP4 ya escrito.
+ */
+const finalizeJobOutput = async (jobId) => {
+  const outputPath = path.join(OUTPUTS_DIR, `${jobId}.mp4`);
+
+  const outputInfo = await probeVideoInfo(outputPath).catch((err) => {
+    console.log(`[job ${jobId}] no se pudo verificar el MP4 final:`, err.message ?? err);
+    return null;
+  });
+  if (outputInfo) {
+    console.log(
+      `[job ${jobId}] salida verificada: ${outputInfo.width}x${outputInfo.height}, ` +
+        `códec=${outputInfo.codec}, duración=${outputInfo.durationSeconds?.toFixed(2)}s`,
+    );
+  }
+
+  let driveOutput;
+  if (DRIVE_OUTPUT_FOLDER_ID) {
+    try {
+      console.log(`[job ${jobId}] subiendo el MP4 final a Drive...`);
+      const uploaded = await uploadFile({
+        filePath: outputPath,
+        fileName: `${jobId}.mp4`,
+        folderId: DRIVE_OUTPUT_FOLDER_ID,
+      });
+      driveOutput = { fileId: uploaded.id, webViewLink: uploaded.webViewLink };
+      console.log(`[job ${jobId}] subido a Drive: ${uploaded.webViewLink}`);
+    } catch (err) {
+      console.log(`[job ${jobId}] no se pudo subir a Drive:`, err.message ?? err);
+    }
+  }
+
+  return writeStatus(jobId, {
+    output: outputInfo ?? undefined,
+    drive: driveOutput,
+  });
+};
+
 const processQueue = () => {
   if (active >= RENDER_CONCURRENCY || queue.length === 0) {
     return;
@@ -528,6 +584,8 @@ const processQueue = () => {
     writeStatus(jobId, { status: "rendering" });
     await runRender(jobId);
     console.log(`[render ${jobId}] terminado OK`);
+
+    await finalizeJobOutput(jobId);
     writeStatus(jobId, { status: "done" });
   })()
     .catch((err) => {
@@ -655,12 +713,40 @@ app.post("/jobs", upload.single("video"), async (req, res) => {
   }
 });
 
+/** Lista todos los jobs conocidos (los que sobrevivieron la limpieza automática), más recientes primero. */
+app.get("/jobs", (req, res) => {
+  const all = [...jobs.entries()]
+    .map(([jobId, status]) => ({ jobId, ...status }))
+    .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+  res.json(all);
+});
+
 app.get("/jobs/:id", (req, res) => {
   const status = jobs.get(req.params.id);
   if (!status) {
     return res.status(404).json({ error: "jobId desconocido." });
   }
   res.json({ jobId: req.params.id, ...status });
+});
+
+/**
+ * Verifica (ffprobe) y sube a Drive (si está configurado) el MP4 de un
+ * job, aunque ya haya terminado hace rato -- para un job que corrió
+ * antes de que existiera esto, o si la subida falló y se quiere
+ * reintentar. Solo necesita que el ARCHIVO exista en disco, no que el
+ * status diga "done" (ver finalizeJobOutput).
+ */
+app.post("/jobs/:id/finalize", async (req, res) => {
+  const jobId = req.params.id;
+  if (!fs.existsSync(path.join(OUTPUTS_DIR, `${jobId}.mp4`))) {
+    return res.status(404).json({ error: "No hay un MP4 de salida en disco para este job." });
+  }
+  try {
+    const updated = await finalizeJobOutput(jobId);
+    res.json({ jobId, ...updated });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message ?? err) });
+  }
 });
 
 /**
@@ -755,5 +841,6 @@ app.listen(PORT, () => {
   console.log(`  timeout de render -> ${RENDER_TIMEOUT_MINUTES} min`);
   console.log(`  retención -> ${RETENTION_DAYS} días (limpieza cada ${CLEANUP_INTERVAL_HOURS}h)`);
   console.log(`  credenciales de Drive -> ${process.env.GOOGLE_APPLICATION_CREDENTIALS ? "configuradas" : "NO configuradas"}`);
+  console.log(`  subida del MP4 final a Drive -> ${DRIVE_OUTPUT_FOLDER_ID ? `carpeta ${DRIVE_OUTPUT_FOLDER_ID}` : "NO configurada (se omite)"}`);
   logCpuFeatures();
 });

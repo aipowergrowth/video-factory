@@ -23,6 +23,12 @@ services:
       # la credencial de Drive: nunca en texto plano, siempre desde un
       # secreto de Swarm.
       ANTHROPIC_API_KEY_FILE: "/run/secrets/anthropic_api_key"
+      # Carpeta de Drive donde se sube el MP4 final de cada job, para
+      # poder revisarlo/aprobarlo sin acceso al VPS. No es una credencial
+      # (el control de acceso lo da haber compartido la carpeta como
+      # Editor con la cuenta de servicio, no conocer este ID), por eso va
+      # en texto plano aquí y no como secreto.
+      DRIVE_OUTPUT_FOLDER_ID: "1i7IBC_bCeNN9J7efE2IUfWdIZ9IZ4k0Z"
     volumes:
       - fabrica_videos_inputs:/app/public/uploads
       - fabrica_videos_outputs:/data/outputs

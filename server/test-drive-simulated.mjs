@@ -10,6 +10,7 @@ import crypto from "node:crypto";
 import { Readable } from "node:stream";
 import {
   downloadFileWithRetry,
+  uploadFile,
   __setDriveClientForTesting,
 } from "./drive.mjs";
 
@@ -19,9 +20,32 @@ const md5 = crypto.createHash("md5").update(content).digest("hex");
 
 let scenario = "ok";
 let attemptsSoFar = 0;
+let uploadScenario = "ok";
+let lastUploadRequestBody = null;
 
 const fakeClient = {
   files: {
+    create: async ({ requestBody, media }) => {
+      lastUploadRequestBody = requestBody;
+      // Drenar el stream de entrada, igual que haría la librería real.
+      for await (const _chunk of media.body) {
+        // no-op
+      }
+      if (uploadScenario === "no-permission") {
+        const err = new Error(
+          "The user does not have sufficient permissions for this file.",
+        );
+        err.code = 403;
+        throw err;
+      }
+      return {
+        data: {
+          id: "fake-uploaded-id",
+          name: requestBody.name,
+          webViewLink: "https://drive.google.com/file/d/fake-uploaded-id/view",
+        },
+      };
+    },
     get: async (params, opts) => {
       if (params.alt === "media") {
         attemptsSoFar += 1;
@@ -108,6 +132,37 @@ try {
 assert(threw, "fallo permanente: downloadFileWithRetry rechaza después de agotar intentos");
 assert(attemptsSoFar === 3, "fallo permanente: respetó maxAttempts=3, ni más ni menos");
 assert(!fs.existsSync(dest3), "fallo permanente: no queda ningún archivo parcial en disco");
+
+// --- Escenario 4: subida del MP4 final a Drive -- caso feliz ---
+uploadScenario = "ok";
+const uploadSrc = path.join(dir, "para-subir.mp4");
+await fsp.writeFile(uploadSrc, content);
+const uploaded = await uploadFile({
+  filePath: uploadSrc,
+  fileName: "video-final.mp4",
+  folderId: "fake-folder-id",
+});
+assert(uploaded.id === "fake-uploaded-id", "subida: devuelve el id del archivo creado");
+assert(uploaded.webViewLink?.includes("fake-uploaded-id"), "subida: devuelve un link para abrirlo");
+assert(lastUploadRequestBody.parents?.[0] === "fake-folder-id", "subida: lo coloca en la carpeta correcta");
+
+// --- Escenario 5: la carpeta no tiene permiso de Editor para la cuenta de servicio ---
+uploadScenario = "no-permission";
+let uploadThrew = false;
+try {
+  await uploadFile({
+    filePath: uploadSrc,
+    fileName: "video-final.mp4",
+    folderId: "fake-folder-id-sin-permiso",
+  });
+} catch (err) {
+  uploadThrew = true;
+  assert(
+    err.message.includes("permission"),
+    "subida sin permiso: el error dice claramente que es de permisos, no uno genérico",
+  );
+}
+assert(uploadThrew, "subida sin permiso: uploadFile rechaza en vez de fallar en silencio");
 
 await fsp.rm(dir, { recursive: true, force: true });
 
