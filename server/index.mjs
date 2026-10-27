@@ -186,6 +186,25 @@ const probeVideoInfo = async (filePath) => {
 const jobs = new Map(); // jobId -> { status, error, createdAt, updatedAt }
 const queue = [];
 let active = 0;
+// Para cancelar: el proceso hijo de render en curso (si lo hay) por job,
+// y el set de jobs cuya cancelación se pidió mientras no hay un proceso
+// que matar (descargando/transcribiendo/planeando) -- esas etapas
+// chequean este set en sus puntos naturales y abortan solas.
+const runningChildren = new Map(); // jobId -> ChildProcess
+const cancelledJobIds = new Set();
+
+class CancelledError extends Error {
+  constructor(jobId) {
+    super(`El trabajo ${jobId} fue cancelado.`);
+    this.name = "CancelledError";
+  }
+}
+
+const throwIfCancelled = (jobId) => {
+  if (cancelledJobIds.has(jobId)) {
+    throw new CancelledError(jobId);
+  }
+};
 
 const jobFilePath = (jobId) => path.join(UPLOADS_JOBS_DIR, `${jobId}.json`);
 const statusFilePath = (jobId) =>
@@ -213,6 +232,7 @@ const recoverJobsFromDisk = () => {
         status.status === "downloading" ||
         status.status === "transcribing" ||
         status.status === "planning" ||
+        status.status === "cancelling" ||
         status.status === "rendering"
       ) {
         status.status = "error";
@@ -263,6 +283,7 @@ const runRender = (jobId) =>
       cwd: PROJECT_ROOT,
       env: process.env,
     });
+    runningChildren.set(jobId, child);
 
     let stderrTail = "";
     let timedOut = false;
@@ -282,8 +303,11 @@ const runRender = (jobId) =>
 
     child.on("exit", (code, signal) => {
       clearTimeout(timeoutTimer);
+      runningChildren.delete(jobId);
       console.log(`[render ${jobId}] proceso hijo salió: code=${code} signal=${signal}`);
-      if (timedOut) {
+      if (cancelledJobIds.has(jobId)) {
+        reject(new CancelledError(jobId));
+      } else if (timedOut) {
         reject(new Error(`El render superó el límite de ${RENDER_TIMEOUT_MINUTES} minutos.`));
       } else if (code === 0) {
         resolve();
@@ -297,6 +321,7 @@ const runRender = (jobId) =>
     });
     child.on("error", (err) => {
       clearTimeout(timeoutTimer);
+      runningChildren.delete(jobId);
       console.log(`[render ${jobId}] error al lanzar el proceso:`, err);
       reject(err);
     });
@@ -309,6 +334,7 @@ const runRender = (jobId) =>
  * no hace nada.
  */
 const resolveJobInput = async (jobId, job) => {
+  throwIfCancelled(jobId);
   if (job.input.type !== "recorded-video" || job.input.baseVideo) {
     return job;
   }
@@ -352,6 +378,7 @@ const resolveJobInput = async (jobId, job) => {
  * tiempo y memoria del contenedor — se registra en el log del servidor.
  */
 const transcribeJobIfNeeded = async (jobId, job) => {
+  throwIfCancelled(jobId);
   if (job.input.type !== "recorded-video") return job;
   if (job.skipTranscription) return job;
   if (Array.isArray(job.captions) && job.captions.length > 0) return job;
@@ -389,6 +416,9 @@ const transcribeJobIfNeeded = async (jobId, job) => {
   );
 
   job.captions = result.captions;
+  // Palabra por palabra -- la usa planEditIfNeeded para cortar con
+  // precisión; no la usa el motor de render (eso sigue con `captions`).
+  job.transcriptWords = result.words;
   await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
   return job;
 };
@@ -401,6 +431,7 @@ const transcribeJobIfNeeded = async (jobId, job) => {
  * `cuts`/`zooms` sigue funcionando exactamente igual que hoy.
  */
 const planEditIfNeeded = async (jobId, job) => {
+  throwIfCancelled(jobId);
   if (job.input.type !== "recorded-video") return job;
   if (job.skipEditorialAI) return job;
   if ((job.cuts && job.cuts.length > 0) || (job.zooms && job.zooms.length > 0)) {
@@ -434,6 +465,7 @@ const planEditIfNeeded = async (jobId, job) => {
   try {
     plan = await planEdit({
       captions: job.captions,
+      transcriptWords: job.transcriptWords,
       guidelines,
       durationInSeconds: job.input.durationInSeconds,
       destination: job.destination,
@@ -491,6 +523,7 @@ const processQueue = () => {
     await resolveJobInput(jobId, job);
     await transcribeJobIfNeeded(jobId, job);
     await planEditIfNeeded(jobId, job);
+    throwIfCancelled(jobId);
 
     writeStatus(jobId, { status: "rendering" });
     await runRender(jobId);
@@ -498,10 +531,16 @@ const processQueue = () => {
     writeStatus(jobId, { status: "done" });
   })()
     .catch((err) => {
-      console.log(`[job ${jobId}] terminó con error:`, err.message ?? err);
-      writeStatus(jobId, { status: "error", error: String(err.message ?? err) });
+      if (err instanceof CancelledError) {
+        console.log(`[job ${jobId}] cancelado.`);
+        writeStatus(jobId, { status: "cancelled" });
+      } else {
+        console.log(`[job ${jobId}] terminó con error:`, err.message ?? err);
+        writeStatus(jobId, { status: "error", error: String(err.message ?? err) });
+      }
     })
     .finally(() => {
+      cancelledJobIds.delete(jobId);
       active -= 1;
       processQueue();
     });
@@ -622,6 +661,43 @@ app.get("/jobs/:id", (req, res) => {
     return res.status(404).json({ error: "jobId desconocido." });
   }
   res.json({ jobId: req.params.id, ...status });
+});
+
+/**
+ * Cancela un trabajo. Si todavía está en cola (no empezó), lo saca y ya
+ * — no corrió nada. Si está en curso, mata el proceso de render si lo
+ * hay y pide a las demás etapas (descarga/transcripción/plan editorial)
+ * que aborten en su próximo punto de chequeo; el estado final queda en
+ * "cancelled" cuando la etapa en curso efectivamente se detiene (no es
+ * instantáneo salvo que esté en cola o rendering).
+ */
+app.post("/jobs/:id/cancel", (req, res) => {
+  const jobId = req.params.id;
+  const status = jobs.get(jobId);
+  if (!status) {
+    return res.status(404).json({ error: "jobId desconocido." });
+  }
+  if (["done", "error", "cancelled"].includes(status.status)) {
+    return res.status(409).json({ error: `El trabajo ya está en estado "${status.status}", no se puede cancelar.` });
+  }
+
+  const queueIndex = queue.indexOf(jobId);
+  if (queueIndex !== -1) {
+    queue.splice(queueIndex, 1);
+    const next = writeStatus(jobId, { status: "cancelled" });
+    console.log(`[job ${jobId}] cancelado (estaba en cola, no había empezado).`);
+    return res.json({ jobId, ...next });
+  }
+
+  cancelledJobIds.add(jobId);
+  const child = runningChildren.get(jobId);
+  if (child) {
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 10_000);
+  }
+  const next = writeStatus(jobId, { status: "cancelling" });
+  console.log(`[job ${jobId}] cancelación pedida (en curso: ${status.status}).`);
+  res.json({ jobId, ...next });
 });
 
 app.get("/jobs/:id/download", (req, res) => {

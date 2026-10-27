@@ -77,6 +77,11 @@ export const transcribeVideo = async ({
 
     return {
       captions: lines,
+      // Palabra por palabra, con sus tiempos exactos -- lo usa la IA
+      // editorial (Etapa 2) para poder cortar en CUALQUIER palabra, no
+      // solo entre líneas agrupadas. No se usa para mostrar subtítulos
+      // (para eso siguen las líneas agrupadas de arriba).
+      words,
       detectedLanguage: whisperOutput?.result?.language ?? null,
       metrics: {
         elapsedMs,

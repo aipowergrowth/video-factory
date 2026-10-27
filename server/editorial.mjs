@@ -43,15 +43,30 @@ export const __setAnthropicClientForTesting = (fakeClient) => {
   client = fakeClient;
 };
 
-const transcriptAsText = (captions) =>
-  captions
+const transcriptAsText = (entries) =>
+  entries
     .map(
       (c) =>
         `[${(c.startMs / 1000).toFixed(2)}-${(c.endMs / 1000).toFixed(2)}] ${c.text}`,
     )
     .join("\n");
 
-const buildPrompt = ({ guidelines, captions, durationInSeconds, destination }) => `Eres un editor de video profesional. Analiza esta transcripción real (con tiempos en segundos) y decide cortes y zooms con criterio editorial genuino — no los apliques mecánicamente, piensa como lo haría un editor humano cuidadoso.
+/**
+ * Con `transcriptWords` (tiempos por PALABRA, de whisper) los cortes
+ * pueden caer entre dos palabras cualesquiera -- precisión real. Sin eso
+ * (un job con captions manuales, sin pasar por la transcripción
+ * automática) solo hay límites entre líneas agrupadas, mucho más
+ * gruesos: un titubeo o repetición a mitad de una línea ya no se puede
+ * cortar. Se le dice al modelo la verdad sobre qué puede hacer en cada
+ * caso -- nunca ofrecerle una precisión que no tiene.
+ */
+const buildPrompt = ({ guidelines, transcript, granularity, durationInSeconds, destination }) => {
+  const cutPrecisionInstruction =
+    granularity === "word"
+      ? "Los cortes deben caer EXACTAMENTE en el límite entre dos palabras consecutivas de la transcripción (el final de una palabra o el inicio de la siguiente) -- nunca a la mitad de una palabra. Como la transcripción es palabra por palabra, puedes cortar un titubeo o una repetición puntual aunque esté en medio de una frase."
+      : "Los cortes deben caer EXACTAMENTE en los límites entre líneas de la transcripción (el final de una línea o el inicio de la siguiente) -- nunca a la mitad de una línea. Esta transcripción solo viene agrupada en líneas (no palabra por palabra), así que un titubeo o repetición a mitad de una línea no se puede aislar: en ese caso no lo cortes.";
+
+  return `Eres un editor de video profesional. Analiza esta transcripción real (con tiempos en segundos) y decide cortes y zooms con criterio editorial genuino — no los apliques mecánicamente, piensa como lo haría un editor humano cuidadoso.
 
 Duración total del video original: ${durationInSeconds.toFixed(2)} segundos.
 Formato de salida: ${destination}.
@@ -60,9 +75,13 @@ Formato de salida: ${destination}.
 
 ${guidelines}
 
-## Transcripción (una línea por entrada, con su rango de tiempo)
+## Precisión de los cortes
 
-${transcriptAsText(captions)}
+${cutPrecisionInstruction}
+
+## Transcripción (${granularity === "word" ? "una palabra" : "una línea"} por entrada, con su rango de tiempo)
+
+${transcriptAsText(transcript)}
 
 ## Formato de respuesta
 
@@ -79,6 +98,7 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
 }
 
 Si no hay nada que cortar o ningún momento que merezca zoom, devuelve arrays vacíos — no inventes ediciones solo por rellenar.`;
+};
 
 const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
 
@@ -168,13 +188,24 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
  */
 export const planEdit = async ({
   captions,
+  // Opcional: tiempos por palabra (de whisper). Si viene, se usa en vez
+  // de `captions` para poder cortar en cualquier palabra, no solo entre
+  // líneas agrupadas -- ver buildPrompt.
+  transcriptWords,
   guidelines,
   durationInSeconds,
   destination,
   model = DEFAULT_MODEL,
   onLog = () => {},
 }) => {
-  const prompt = buildPrompt({ guidelines, captions, durationInSeconds, destination });
+  const useWords = Array.isArray(transcriptWords) && transcriptWords.length > 0;
+  const prompt = buildPrompt({
+    guidelines,
+    transcript: useWords ? transcriptWords : captions,
+    granularity: useWords ? "word" : "line",
+    durationInSeconds,
+    destination,
+  });
 
   onLog(`pidiendo plan de edición a ${model}...`);
   const startedAt = Date.now();

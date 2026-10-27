@@ -2,7 +2,9 @@
 // falso para probar la lógica real de construcción de prompt, parseo y
 // validación de server/editorial.mjs contra varias respuestas de modelo
 // (una buena, una con JSON envuelto en bloque de código, una con un corte
-// inválido mezclado con uno válido, y una que no es JSON en absoluto).
+// inválido mezclado con uno válido, una que no es JSON en absoluto, y que
+// el prompt pida la precisión de corte correcta según si hay tiempos por
+// palabra o solo por línea agrupada).
 import assert from "node:assert/strict";
 import {
   planEdit,
@@ -53,6 +55,62 @@ const check = (label, cond) => {
   check("respuesta válida: 1 zoom", plan.zooms.length === 1);
   check("respuesta válida: notes presente", plan.notes.length > 0);
   check("respuesta válida: métricas con tokens", plan.metrics.inputTokens === 123 && plan.metrics.outputTokens === 45);
+}
+
+// 1b. Con `transcriptWords` (palabra por palabra), el prompt debe pedir
+// precisión de PALABRA, no de línea -- y usar las palabras, no las líneas
+// agrupadas, como transcripción.
+{
+  const fakeWords = [
+    { text: "Hola", startMs: 0, endMs: 300, timestampMs: null, confidence: null },
+    { text: "cuerpo", startMs: 300, endMs: 600, timestampMs: null, confidence: null },
+    { text: "cuerpo", startMs: 600, endMs: 900, timestampMs: null, confidence: null },
+  ];
+  let capturedPrompt = "";
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        capturedPrompt = params.messages[0].content;
+        return {
+          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], notes: "" }) }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        };
+      },
+    },
+  });
+  await planEdit({
+    captions: fakeCaptions,
+    transcriptWords: fakeWords,
+    guidelines: "guía de prueba",
+    durationInSeconds: 8,
+    destination: "youtube-16-9",
+  });
+  check("con transcriptWords: el prompt pide precisión de palabra", capturedPrompt.includes("límite entre dos palabras consecutivas"));
+  check("con transcriptWords: usa las palabras, no las líneas agrupadas", capturedPrompt.includes("[0.30-0.60] cuerpo") && !capturedPrompt.includes("Eh, este, hoy vamos a hablar"));
+}
+
+// 1c. Sin `transcriptWords` (job con captions manuales, sin transcripción automática): vuelve al modo línea, honesto sobre su propia precisión.
+{
+  let capturedPrompt = "";
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        capturedPrompt = params.messages[0].content;
+        return {
+          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], notes: "" }) }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        };
+      },
+    },
+  });
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    durationInSeconds: 8,
+    destination: "youtube-16-9",
+  });
+  check("sin transcriptWords: el prompt pide precisión de línea", capturedPrompt.includes("límites entre líneas"));
+  check("sin transcriptWords: usa las líneas agrupadas", capturedPrompt.includes("Eh, este, hoy vamos a hablar"));
 }
 
 // 2. JSON envuelto en bloque de código markdown (el modelo no debería hacerlo, pero puede pasar).

@@ -23,10 +23,6 @@ No cortes:
 - Pausas breves que son parte natural del ritmo de habla.
 - Nada que cambie lo que el presentador quiso decir.
 
-Los cortes deben caer EXACTAMENTE en los límites entre líneas de la
-transcripción que te doy (el final de una línea o el inicio de la
-siguiente) — nunca a la mitad de una línea.
-
 ## Zooms (Ken Burns)
 
 Punch-ins sutiles (escala 1.0 a 1.15–1.25, nunca más agresivo) en remates

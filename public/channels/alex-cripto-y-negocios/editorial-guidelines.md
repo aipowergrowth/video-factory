@@ -2,9 +2,9 @@
 
 Video de análisis de cripto/finanzas grabado a cámara. Mismas reglas que
 "A mí no me cuadra" (rostro y voz del presentador siempre presentes,
-cortes en silencios/muletillas/tomas falsas, cortes solo en límites entre
-líneas de la transcripción, zooms sutiles y poco frecuentes como énfasis)
-más esta regla adicional, que pesa más que cualquier otra:
+cortes en silencios/muletillas/tomas falsas, zooms sutiles y poco
+frecuentes como énfasis) más esta regla adicional, que pesa más que
+cualquier otra:
 
 ## Nunca tocar datos financieros
 
