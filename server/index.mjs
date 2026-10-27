@@ -647,6 +647,28 @@ recoverJobsFromDisk();
 cleanupOldFiles();
 setInterval(cleanupOldFiles, CLEANUP_INTERVAL_HOURS * 60 * 60 * 1000);
 
+/**
+ * Se registra una sola vez al arrancar: los binarios que se compilan en el
+ * build (whisper.cpp) hornean las instrucciones de CPU del runner de CI, no
+ * las de donde terminan corriendo. Esto deja ver en los logs de Portainer
+ * qué CPU real tiene el host (los contenedores no virtualizan el set de
+ * instrucciones) sin necesitar acceso por terminal al VPS.
+ */
+const logCpuFeatures = () => {
+  try {
+    const cpuinfo = fs.readFileSync("/proc/cpuinfo", "utf8");
+    const model = cpuinfo.match(/model name\s*:\s*(.+)/)?.[1]?.trim() ?? "?";
+    const flags = cpuinfo.match(/^flags\s*:\s*(.+)/m)?.[1] ?? "";
+    const has = (flag) => flags.split(" ").includes(flag);
+    console.log(`  CPU host -> ${model}`);
+    console.log(
+      `  instrucciones -> avx=${has("avx")} avx2=${has("avx2")} fma=${has("fma")} f16c=${has("f16c")} avx512f=${has("avx512f")}`,
+    );
+  } catch {
+    // No es Linux (p.ej. probando esto en macOS) — no hay /proc/cpuinfo.
+  }
+};
+
 app.listen(PORT, () => {
   console.log(`fabrica-videos API escuchando en :${PORT}`);
   console.log(`  uploads/jobs   -> ${UPLOADS_JOBS_DIR}`);
@@ -657,4 +679,5 @@ app.listen(PORT, () => {
   console.log(`  timeout de render -> ${RENDER_TIMEOUT_MINUTES} min`);
   console.log(`  retención -> ${RETENTION_DAYS} días (limpieza cada ${CLEANUP_INTERVAL_HOURS}h)`);
   console.log(`  credenciales de Drive -> ${process.env.GOOGLE_APPLICATION_CREDENTIALS ? "configuradas" : "NO configuradas"}`);
+  logCpuFeatures();
 });
