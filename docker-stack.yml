@@ -36,7 +36,8 @@ services:
       - aipowergrowthrpa
     secrets:
       - drive_service_account_json
-      - anthropic_api_key
+      - source: vfanthropic_api_key
+        target: anthropic_api_key
     deploy:
       replicas: 1
       resources:
@@ -61,10 +62,14 @@ networks:
 
 secrets:
   # Creados a mano en Portainer -> Secrets (nunca en este repo). Deben
-  # llamarse exactamente así, o ajustar el nombre de arriba también.
+  # llamarse exactamente así (son los nombres reales en el Portainer de
+  # Alex), o ajustar el mapeo de arriba también.
   drive_service_account_json:
     external: true
   # Contenido: solo la clave (sk-ant-...), sin comillas ni nombre de
-  # variable delante.
-  anthropic_api_key:
+  # variable delante. El secreto en Portainer se llama "vfanthropic_api_key"
+  # (no "anthropic_api_key") -- el "source"/"target" de arriba hace que
+  # igual quede montado en /run/secrets/anthropic_api_key, que es lo que
+  # espera ANTHROPIC_API_KEY_FILE.
+  vfanthropic_api_key:
     external: true
