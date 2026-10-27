@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { downloadFileWithRetry } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
+import { planEdit } from "./editorial.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -211,6 +212,7 @@ const recoverJobsFromDisk = () => {
         status.status === "queued" ||
         status.status === "downloading" ||
         status.status === "transcribing" ||
+        status.status === "planning" ||
         status.status === "rendering"
       ) {
         status.status = "error";
@@ -391,6 +393,91 @@ const transcribeJobIfNeeded = async (jobId, job) => {
   return job;
 };
 
+/**
+ * IA editorial (Etapa 2): si el job ya trae su transcripción pero no trae
+ * decisión de corte/zoom propia, le pide a Claude un plan y lo aplica. Se
+ * salta solo (sin romper el job) si no hay guía editorial para el canal o
+ * si no hay transcripción todavía — así un job manual con sus propios
+ * `cuts`/`zooms` sigue funcionando exactamente igual que hoy.
+ */
+const planEditIfNeeded = async (jobId, job) => {
+  if (job.input.type !== "recorded-video") return job;
+  if (job.skipEditorialAI) return job;
+  if ((job.cuts && job.cuts.length > 0) || (job.zooms && job.zooms.length > 0)) {
+    return job;
+  }
+  if (!Array.isArray(job.captions) || job.captions.length === 0) return job;
+
+  const guidelinesPath = path.join(
+    PROJECT_ROOT,
+    "public/channels",
+    job.channel,
+    "editorial-guidelines.md",
+  );
+  const guidelines = await fsp.readFile(guidelinesPath, "utf8").catch(() => null);
+  if (!guidelines) {
+    console.log(
+      `[job ${jobId}] sin guía editorial para el canal "${job.channel}" — se omite la IA editorial.`,
+    );
+    return job;
+  }
+
+  writeStatus(jobId, { status: "planning" });
+  console.log(`[job ${jobId}] pidiendo plan de edición...`);
+
+  // La IA editorial es una capa sobre el render, no un requisito para que
+  // el render funcione: si falla por lo que sea (falta la clave, el
+  // modelo no respondió JSON válido, rate limit, red), se registra bien
+  // claro y el trabajo sigue sin cortes/zoom automáticos en vez de
+  // fallar entero — igual que antes de que existiera esta etapa.
+  let plan;
+  try {
+    plan = await planEdit({
+      captions: job.captions,
+      guidelines,
+      durationInSeconds: job.input.durationInSeconds,
+      destination: job.destination,
+      onLog: (msg) => console.log(`[job ${jobId}] ${msg}`),
+    });
+  } catch (err) {
+    console.log(
+      `[job ${jobId}] la IA editorial falló, se continúa sin cortes/zoom automáticos: ${err.message ?? err}`,
+    );
+    return job;
+  }
+
+  console.log(
+    `[job ${jobId}] plan de edición listo: ${plan.cuts.length} corte(s), ${plan.zooms.length} zoom(s), ` +
+      `${(plan.metrics.elapsedMs / 1000).toFixed(1)}s, modelo=${plan.metrics.model}, ` +
+      `tokens=${plan.metrics.inputTokens ?? "?"}in/${plan.metrics.outputTokens ?? "?"}out`,
+  );
+  if (plan.notes) {
+    console.log(`[job ${jobId}] notas del editor IA: ${plan.notes}`);
+  }
+  for (const cut of plan.cuts) {
+    console.log(
+      `[job ${jobId}]   corte ${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s: ${cut.reason ?? "(sin razón)"}`,
+    );
+  }
+  for (const zoom of plan.zooms) {
+    console.log(
+      `[job ${jobId}]   zoom ${zoom.startSeconds.toFixed(2)}-${zoom.endSeconds.toFixed(2)}s (${zoom.fromScale}x->${zoom.toScale}x): ${zoom.reason ?? "(sin razón)"}`,
+    );
+  }
+
+  job.cuts = plan.cuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
+  job.zooms = plan.zooms.map(({ id, startSeconds, endSeconds, fromScale, toScale, origin }) => ({
+    id,
+    startSeconds,
+    endSeconds,
+    fromScale,
+    toScale,
+    origin,
+  }));
+  await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
+  return job;
+};
+
 const processQueue = () => {
   if (active >= RENDER_CONCURRENCY || queue.length === 0) {
     return;
@@ -403,6 +490,7 @@ const processQueue = () => {
     const job = JSON.parse(await fsp.readFile(jobFilePath(jobId), "utf8"));
     await resolveJobInput(jobId, job);
     await transcribeJobIfNeeded(jobId, job);
+    await planEditIfNeeded(jobId, job);
 
     writeStatus(jobId, { status: "rendering" });
     await runRender(jobId);

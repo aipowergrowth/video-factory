@@ -34,57 +34,27 @@ descarga sin necesitar ninguna contraseña.
 para crear un token y añadir el registro con credenciales en Portainer —
 son 3-4 clics más.)*
 
-## Paso 2 — Crear el stack en Portainer
+## Paso 2 — Crear los secretos y el stack en Portainer
+
+Dos secretos (nunca van en el repo ni en el YAML del stack):
+
+1. Menú lateral → **Secrets** → **+ Add secret**.
+   - **Name**: `drive_service_account_json`. **Content**: pega el JSON
+     completo de la cuenta de servicio de Google Drive.
+2. Otra vez **+ Add secret**.
+   - **Name**: `anthropic_api_key`. **Content**: solo la clave
+     (`sk-ant-...`), sin comillas ni nombre de variable delante.
+
+Ahora el stack:
 
 1. Entra a tu Portainer → elige tu entorno (el que tiene la red
    `aipowergrowthrpa`).
 2. Menú lateral → **Stacks** → **+ Add stack**.
 3. **Name**: `fabrica-videos-engine`.
 4. **Build method**: `Web editor`.
-5. Pega exactamente este contenido en el editor:
-
-```yaml
-version: "3.8"
-
-services:
-  fabrica-videos-engine:
-    image: ghcr.io/aipowergrowth/fabrica-videos-engine:latest
-    environment:
-      PORT: "3001"
-      RENDER_CONCURRENCY: "1"
-      REMOTION_CONCURRENCY: "2"
-      ENABLE_MULTIPROCESS_ON_LINUX: "true"
-      OUTPUTS_DIR: "/data/outputs"
-      UPLOADS_JOBS_DIR: "/app/public/uploads/jobs"
-      UPLOADS_VIDEOS_DIR: "/app/public/uploads/videos"
-    volumes:
-      - fabrica_videos_inputs:/app/public/uploads
-      - fabrica_videos_outputs:/data/outputs
-    networks:
-      - aipowergrowthrpa
-    deploy:
-      replicas: 1
-      resources:
-        limits:
-          cpus: "4"
-          memory: 6G
-        reservations:
-          cpus: "1"
-          memory: 2G
-      restart_policy:
-        condition: on-failure
-      update_config:
-        order: stop-first
-
-volumes:
-  fabrica_videos_inputs:
-  fabrica_videos_outputs:
-
-networks:
-  aipowergrowthrpa:
-    external: true
-```
-
+5. Pega exactamente el contenido de [`docker-stack.yml`](docker-stack.yml)
+   (vive en la raíz del repo; se mantiene ahí para no duplicarlo y que
+   nunca quede desactualizado aquí).
 6. Baja y clic en **Deploy the stack**.
 
 ## Paso 3 — Qué vas a ver si salió bien

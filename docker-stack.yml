@@ -19,6 +19,10 @@ services:
       # solo lectura a la carpeta compartida). El archivo nunca está en
       # el repo/imagen: lo monta Swarm desde el secreto de abajo.
       GOOGLE_APPLICATION_CREDENTIALS: "/run/secrets/drive_service_account_json"
+      # Clave de API de Claude (Etapa 2, IA editorial). Mismo patrón que
+      # la credencial de Drive: nunca en texto plano, siempre desde un
+      # secreto de Swarm.
+      ANTHROPIC_API_KEY_FILE: "/run/secrets/anthropic_api_key"
     volumes:
       - fabrica_videos_inputs:/app/public/uploads
       - fabrica_videos_outputs:/data/outputs
@@ -26,6 +30,7 @@ services:
       - aipowergrowthrpa
     secrets:
       - drive_service_account_json
+      - anthropic_api_key
     deploy:
       replicas: 1
       resources:
@@ -49,7 +54,11 @@ networks:
     external: true
 
 secrets:
-  # Creado a mano en Portainer -> Secrets (nunca en este repo). Debe
+  # Creados a mano en Portainer -> Secrets (nunca en este repo). Deben
   # llamarse exactamente así, o ajustar el nombre de arriba también.
   drive_service_account_json:
+    external: true
+  # Contenido: solo la clave (sk-ant-...), sin comillas ni nombre de
+  # variable delante.
+  anthropic_api_key:
     external: true
