@@ -22,7 +22,16 @@ const UPLOADS_VIDEOS_DIR =
   path.join(PROJECT_ROOT, "public/uploads/videos");
 const OUTPUTS_DIR = process.env.OUTPUTS_DIR ?? "/data/outputs";
 const RENDER_CONCURRENCY = Number(process.env.RENDER_CONCURRENCY ?? 1);
-const REMOTION_CONCURRENCY = process.env.REMOTION_CONCURRENCY ?? "2";
+// Medido con el video real de 12 min (dopamina): con concurrencia por
+// defecto (varias pestañas de Chrome decodificando el MISMO video base en
+// paralelo), el 86% del tiempo de render se iba en "seeks" caros porque las
+// pestañas saltan constantemente entre posiciones distintas del archivo.
+// Con concurrency=1 los seeks bajaron de 730 a 17 (en el mismo tramo de 60s)
+// y el render total bajó un 35%. Para trabajos dominados por un solo video
+// base (el caso actual) 1 es más rápido que el paralelismo; si en el futuro
+// hay trabajos con mucho overlay/gráficos pesados en CPU, puede valer la
+// pena subir esto vía la variable de entorno.
+const REMOTION_CONCURRENCY = process.env.REMOTION_CONCURRENCY ?? "1";
 const ENABLE_MULTIPROCESS_ON_LINUX =
   (process.env.ENABLE_MULTIPROCESS_ON_LINUX ?? "true") === "true";
 // Solo necesarios fuera de Linux (p.ej. probando esto en macOS). En el
