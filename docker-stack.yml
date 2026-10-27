@@ -10,7 +10,7 @@ services:
     environment:
       PORT: "3001"
       RENDER_CONCURRENCY: "1"
-      REMOTION_CONCURRENCY: "2"
+      REMOTION_CONCURRENCY: "1"
       ENABLE_MULTIPROCESS_ON_LINUX: "true"
       OUTPUTS_DIR: "/data/outputs"
       UPLOADS_JOBS_DIR: "/app/public/uploads/jobs"
