@@ -125,7 +125,7 @@ const makeSequencedFakeClient = (responses) => {
     client: {
       messages: {
         create: async (params) => {
-          calls.push({ maxTokens: params.max_tokens });
+          calls.push({ maxTokens: params.max_tokens, thinking: params.thinking });
           const response = responses[Math.min(callIndex, responses.length - 1)];
           callIndex += 1;
           return response;
@@ -154,6 +154,12 @@ const makeSequencedFakeClient = (responses) => {
   });
   check("respuesta vacía por max_tokens: reintenta exactamente una vez (2 llamadas)", calls.length === 2);
   check("respuesta vacía por max_tokens: el reintento pide más max_tokens que el primer intento", calls[1].maxTokens > calls[0].maxTokens);
+  // Bug real: el razonamiento interno competía por el mismo presupuesto
+  // que max_tokens y a veces se lo comía entero (respuesta vacía en
+  // producción). Confirmado con la API real que desactivarlo arregla
+  // esto sin perder calidad editorial -- este chequeo evita que alguien
+  // lo reactive sin querer en el futuro.
+  check("ambos intentos piden el razonamiento desactivado", calls.every((c) => c.thinking?.type === "disabled"));
   check("respuesta vacía por max_tokens: el plan final es el del reintento", plan.notes === "ok en el reintento");
   check("respuesta vacía por max_tokens: metrics.retried=true", plan.metrics.retried === true);
   check("respuesta vacía por max_tokens: metrics.stopReason es del último intento", plan.metrics.stopReason === "end_turn");

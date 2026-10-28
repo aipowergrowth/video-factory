@@ -96,10 +96,10 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
 
 {
   "cuts": [
-    { "startSeconds": number, "endSeconds": number, "reason": "string breve" }
+    { "startSeconds": number, "endSeconds": number, "reason": "máximo 12 palabras" }
   ],
   "zooms": [
-    { "startSeconds": number, "endSeconds": number, "fromScale": number, "toScale": number, "origin": { "x": number, "y": number }, "reason": "string breve" }
+    { "startSeconds": number, "endSeconds": number, "fromScale": number, "toScale": number, "origin": { "x": number, "y": number }, "reason": "máximo 12 palabras" }
   ],
   "notes": "resumen breve de tu criterio editorial para que un humano lo revise"
 }
@@ -193,6 +193,15 @@ const callModel = async ({ anthropic, prompt, model, maxTokens }) => {
   const response = await anthropic.messages.create({
     model,
     max_tokens: maxTokens,
+    // Confirmado con una llamada real: el razonamiento interno compite
+    // por el mismo presupuesto que `max_tokens` y su tamaño varía de una
+    // llamada a otra -- en una prueba se comió 12368 de 16000 tokens
+    // (quedó justo), y en el VPS se comió los 16000 enteros (texto
+    // vacío). La tarea (devolver un plan JSON con reglas ya explícitas en
+    // el prompt) no necesita razonamiento extendido para salir bien;
+    // desactivarlo elimina esta fuente de fallos no determinista en vez
+    // de solo subir el presupuesto y confiar en tener suerte.
+    thinking: { type: "disabled" },
     messages: [{ role: "user", content: prompt }],
   });
   const text = response.content
@@ -204,6 +213,11 @@ const callModel = async ({ anthropic, prompt, model, maxTokens }) => {
     stopReason: response.stop_reason ?? null,
     inputTokens: response.usage?.input_tokens ?? null,
     outputTokens: response.usage?.output_tokens ?? null,
+    // Cuánto de output_tokens se fue en razonamiento interno (no texto
+    // visible) -- es la pieza que explicó el bug real: con el razonamiento
+    // activado por defecto, podía comerse TODO el presupuesto antes de
+    // escribir una sola palabra del JSON.
+    thinkingTokens: response.usage?.output_tokens_details?.thinking_tokens ?? null,
   };
 };
 
@@ -247,8 +261,9 @@ export const planEdit = async ({
   let maxTokensUsed = FIRST_MAX_TOKENS;
   let retried = false;
   onLog(
-    `respuesta: stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out, ` +
-      `max_tokens=${maxTokensUsed}, texto=${attempt.text.trim().length} caracteres`,
+    `respuesta: stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out ` +
+      `(razonamiento=${attempt.thinkingTokens ?? "?"}), max_tokens=${maxTokensUsed}, ` +
+      `texto=${attempt.text.trim().length} caracteres`,
   );
 
   const seemsTruncated = attempt.stopReason === "max_tokens" || attempt.text.trim().length === 0;
@@ -260,8 +275,9 @@ export const planEdit = async ({
     );
     attempt = await callModel({ anthropic, prompt, model, maxTokens: RETRY_MAX_TOKENS });
     onLog(
-      `respuesta del reintento: stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out, ` +
-        `max_tokens=${maxTokensUsed}, texto=${attempt.text.trim().length} caracteres`,
+      `respuesta del reintento: stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out ` +
+        `(razonamiento=${attempt.thinkingTokens ?? "?"}), max_tokens=${maxTokensUsed}, ` +
+        `texto=${attempt.text.trim().length} caracteres`,
     );
   }
 
@@ -276,6 +292,7 @@ export const planEdit = async ({
       stopReason: attempt.stopReason,
       inputTokens: attempt.inputTokens,
       outputTokens: attempt.outputTokens,
+      thinkingTokens: attempt.thinkingTokens,
       maxTokens: maxTokensUsed,
       retried,
     },
