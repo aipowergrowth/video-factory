@@ -71,9 +71,26 @@ const getUploadDriveClient = () => {
       "Falta DRIVE_OAUTH_CREDENTIALS_FILE (secreto de Portainer con client_id/client_secret/refresh_token para subir a Drive).",
     );
   }
-  const { client_id, client_secret, refresh_token } = JSON.parse(
-    fs.readFileSync(credsFile, "utf8"),
-  );
+  const raw = fs.readFileSync(credsFile, "utf8");
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Nunca el contenido crudo en el mensaje -- podría ser casi el JSON
+    // correcto con un valor real adentro.
+    throw new Error(
+      "El secreto OAuth de Drive (DRIVE_OAUTH_CREDENTIALS_FILE) no es un JSON válido. Debe ser una sola línea como " +
+        '{"client_id":"...","client_secret":"...","refresh_token":"..."} -- ver DEPLOY.md.',
+    );
+  }
+  for (const field of ["client_id", "client_secret", "refresh_token"]) {
+    if (typeof parsed[field] !== "string" || parsed[field].length === 0) {
+      throw new Error(
+        `El secreto OAuth de Drive (DRIVE_OAUTH_CREDENTIALS_FILE) no trae "${field}" (o está vacío). Ver DEPLOY.md.`,
+      );
+    }
+  }
+  const { client_id, client_secret, refresh_token } = parsed;
   const oauth2Client = new OAuth2Client({ clientId: client_id, clientSecret: client_secret });
   oauth2Client.setCredentials({ refresh_token });
   cachedUploadClient = driveApi({ version: "v3", auth: oauth2Client });

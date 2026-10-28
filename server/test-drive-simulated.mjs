@@ -188,6 +188,46 @@ assert(uploadThrew, "subida sin permiso: uploadFile rechaza en vez de fallar en 
   __setUploadDriveClientForTesting(() => fakeClient);
 }
 
+// --- Escenario 7: el secreto OAuth existe pero no es JSON válido -> dice EXACTAMENTE eso, sin mostrar el contenido ---
+{
+  __setUploadDriveClientForTesting(null);
+  const previousFile = process.env.DRIVE_OAUTH_CREDENTIALS_FILE;
+  const badJsonFile = path.join(dir, "oauth-malformado.txt");
+  await fsp.writeFile(badJsonFile, "esto no es json{{{");
+  process.env.DRIVE_OAUTH_CREDENTIALS_FILE = badJsonFile;
+  let threw = false;
+  try {
+    await uploadFile({ filePath: uploadSrc, fileName: "x.mp4", folderId: "fake" });
+  } catch (err) {
+    threw = true;
+    assert(err.message.includes("no es un JSON válido"), "secreto OAuth malformado: dice en palabras que no es JSON válido");
+    assert(!err.message.includes("esto no es json"), "secreto OAuth malformado: el error NUNCA repite el contenido crudo del secreto");
+  }
+  assert(threw, "secreto OAuth malformado: uploadFile rechaza");
+  if (previousFile) process.env.DRIVE_OAUTH_CREDENTIALS_FILE = previousFile;
+  __setUploadDriveClientForTesting(() => fakeClient);
+}
+
+// --- Escenario 8: el secreto OAuth es JSON válido pero le falta refresh_token -> dice EXACTAMENTE qué campo falta ---
+{
+  __setUploadDriveClientForTesting(null);
+  const previousFile = process.env.DRIVE_OAUTH_CREDENTIALS_FILE;
+  const incompleteFile = path.join(dir, "oauth-incompleto.json");
+  await fsp.writeFile(incompleteFile, JSON.stringify({ client_id: "abc", client_secret: "def" }));
+  process.env.DRIVE_OAUTH_CREDENTIALS_FILE = incompleteFile;
+  let threw = false;
+  try {
+    await uploadFile({ filePath: uploadSrc, fileName: "x.mp4", folderId: "fake" });
+  } catch (err) {
+    threw = true;
+    assert(err.message.includes('"refresh_token"'), "secreto OAuth incompleto: dice exactamente qué campo falta (refresh_token)");
+    assert(!err.message.includes("abc") && !err.message.includes("def"), "secreto OAuth incompleto: el error NUNCA muestra los valores presentes");
+  }
+  assert(threw, "secreto OAuth incompleto: uploadFile rechaza");
+  if (previousFile) process.env.DRIVE_OAUTH_CREDENTIALS_FILE = previousFile;
+  __setUploadDriveClientForTesting(() => fakeClient);
+}
+
 await fsp.rm(dir, { recursive: true, force: true });
 
 if (process.exitCode === 1) {

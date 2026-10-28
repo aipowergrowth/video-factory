@@ -44,7 +44,8 @@ services:
       - drive_service_account_json
       - source: vfanthropic_api_key
         target: anthropic_api_key
-      - drive_oauth_credentials_json
+      - source: drive_oauth_v2
+        target: drive_oauth_credentials_json
     deploy:
       replicas: 1
       resources:
@@ -82,6 +83,9 @@ secrets:
     external: true
   # Contenido: un JSON de una sola línea, exactamente
   # {"client_id":"...","client_secret":"...","refresh_token":"..."}
-  # (ver DEPLOY.md para cómo generarlo).
-  drive_oauth_credentials_json:
+  # (ver DEPLOY.md para cómo generarlo). El secreto en Portainer se
+  # llama "drive_oauth_v2" -- el "source"/"target" de arriba lo monta
+  # igual en /run/secrets/drive_oauth_credentials_json, que es lo que
+  # espera DRIVE_OAUTH_CREDENTIALS_FILE.
+  drive_oauth_v2:
     external: true

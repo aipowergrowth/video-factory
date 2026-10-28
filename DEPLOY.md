@@ -46,8 +46,8 @@ Tres secretos (nunca van en el repo ni en el YAML del stack):
    - **Name**: `vfanthropic_api_key`. **Content**: solo la clave
      (`sk-ant-...`), sin comillas ni nombre de variable delante.
 3. Otra vez **+ Add secret**.
-   - **Name**: `drive_oauth_credentials_json`. **Content**: lo que
-     genera el Paso 2a de abajo — hazlo antes de crear este secreto.
+   - **Name**: `drive_oauth_v2`. **Content**: lo que genera el Paso 2a
+     de abajo — hazlo antes de crear este secreto.
 
 ### Paso 2a — Autorizar la subida del MP4 final a tu Drive (una sola vez, sin terminal)
 
@@ -110,7 +110,7 @@ Refresh token), arma este JSON en una sola línea (reemplaza cada `...`):
 {"client_id":"...","client_secret":"...","refresh_token":"..."}
 ```
 
-Pega ese JSON como contenido del secreto `drive_oauth_credentials_json`
+Pega ese JSON como contenido del secreto `drive_oauth_v2`
 (Paso 2, punto 3, arriba).
 
 Ahora el stack:
