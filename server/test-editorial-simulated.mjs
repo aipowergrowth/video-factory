@@ -113,6 +113,74 @@ const check = (label, cond) => {
   check("sin transcriptWords: usa las líneas agrupadas", capturedPrompt.includes("Eh, este, hoy vamos a hablar"));
 }
 
+// Bug real: con la transcripción palabra por palabra de un video largo,
+// el modelo devolvió una respuesta VACÍA (consistente con haber agotado
+// max_tokens antes de escribir el JSON). Estos casos reproducen eso sin
+// necesitar un video real ni la API real.
+const makeSequencedFakeClient = (responses) => {
+  let callIndex = 0;
+  const calls = [];
+  return {
+    calls,
+    client: {
+      messages: {
+        create: async (params) => {
+          calls.push({ maxTokens: params.max_tokens });
+          const response = responses[Math.min(callIndex, responses.length - 1)];
+          callIndex += 1;
+          return response;
+        },
+      },
+    },
+  };
+};
+
+// 1d. Primera respuesta vacía con stop_reason="max_tokens" -> reintenta UNA vez con más max_tokens, y esa segunda sí sirve.
+{
+  const { client, calls } = makeSequencedFakeClient([
+    { content: [], stop_reason: "max_tokens", usage: { input_tokens: 9000, output_tokens: 4096 } },
+    {
+      content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], notes: "ok en el reintento" }) }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 9000, output_tokens: 300 },
+    },
+  ]);
+  __setAnthropicClientForTesting(client);
+  const plan = await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    durationInSeconds: 8,
+    destination: "youtube-16-9",
+  });
+  check("respuesta vacía por max_tokens: reintenta exactamente una vez (2 llamadas)", calls.length === 2);
+  check("respuesta vacía por max_tokens: el reintento pide más max_tokens que el primer intento", calls[1].maxTokens > calls[0].maxTokens);
+  check("respuesta vacía por max_tokens: el plan final es el del reintento", plan.notes === "ok en el reintento");
+  check("respuesta vacía por max_tokens: metrics.retried=true", plan.metrics.retried === true);
+  check("respuesta vacía por max_tokens: metrics.stopReason es del último intento", plan.metrics.stopReason === "end_turn");
+}
+
+// 1e. Si el reintento TAMBIÉN sale vacío, no hay un tercer intento -- falla con un error claro (no silencioso).
+{
+  const { client, calls } = makeSequencedFakeClient([
+    { content: [], stop_reason: "max_tokens", usage: { input_tokens: 9000, output_tokens: 4096 } },
+    { content: [], stop_reason: "max_tokens", usage: { input_tokens: 9000, output_tokens: 32000 } },
+  ]);
+  __setAnthropicClientForTesting(client);
+  let threw = false;
+  try {
+    await planEdit({
+      captions: fakeCaptions,
+      guidelines: "guía de prueba",
+      durationInSeconds: 8,
+      destination: "youtube-16-9",
+    });
+  } catch {
+    threw = true;
+  }
+  check("reintento también vacío: no hay un tercer intento (solo 2 llamadas en total)", calls.length === 2);
+  check("reintento también vacío: planEdit lanza error en vez de devolver un plan vacío silenciosamente", threw);
+}
+
 // 2. JSON envuelto en bloque de código markdown (el modelo no debería hacerlo, pero puede pasar).
 {
   const fenced = "```json\n" + JSON.stringify({ cuts: [], zooms: [], notes: "nada que cortar" }) + "\n```";

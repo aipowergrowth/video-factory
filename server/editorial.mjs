@@ -8,7 +8,14 @@ import fs from "node:fs";
 import Anthropic from "@anthropic-ai/sdk";
 
 const DEFAULT_MODEL = process.env.EDITORIAL_MODEL ?? "claude-sonnet-5";
-const MAX_OUTPUT_TOKENS = 4096;
+// Bug real en producción: con la transcripción palabra por palabra de un
+// video de 12 min (mucho más texto que la versión agrupada en líneas),
+// el modelo devolvió una respuesta vacía -- consistente con haber
+// agotado max_tokens (4096 era demasiado poco para un plan editorial
+// con muchos cortes, cada uno con su razón). Subido bastante y con un
+// reintento con más margen todavía si hace falta (ver planEdit).
+const FIRST_MAX_TOKENS = Number(process.env.EDITORIAL_MAX_TOKENS ?? 16000);
+const RETRY_MAX_TOKENS = Number(process.env.EDITORIAL_RETRY_MAX_TOKENS ?? 32000);
 
 let client = null;
 
@@ -182,9 +189,34 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
   };
 };
 
+const callModel = async ({ anthropic, prompt, model, maxTokens }) => {
+  const response = await anthropic.messages.create({
+    model,
+    max_tokens: maxTokens,
+    messages: [{ role: "user", content: prompt }],
+  });
+  const text = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+  return {
+    text,
+    stopReason: response.stop_reason ?? null,
+    inputTokens: response.usage?.input_tokens ?? null,
+    outputTokens: response.usage?.output_tokens ?? null,
+  };
+};
+
 /**
  * Le pide a Claude un plan de edición para este trabajo. No toca el job
  * directamente — quien llama decide si aplica `cuts`/`zooms` al job.
+ *
+ * Si la respuesta viene vacía o cortada (stop_reason="max_tokens" --
+ * típicamente el modelo agotó el presupuesto pensando, antes de llegar a
+ * escribir el JSON), reintenta UNA vez con bastante más margen antes de
+ * darse por vencido. Registra siempre stop_reason y tokens de
+ * entrada/salida, incluso cuando todo sale bien -- así un fallo similar
+ * se diagnostica de inmediato la próxima vez, sin adivinar.
  */
 export const planEdit = async ({
   captions,
@@ -207,30 +239,45 @@ export const planEdit = async ({
     destination,
   });
 
-  onLog(`pidiendo plan de edición a ${model}...`);
-  const startedAt = Date.now();
   const anthropic = getClient();
-  const response = await anthropic.messages.create({
-    model,
-    max_tokens: MAX_OUTPUT_TOKENS,
-    messages: [{ role: "user", content: prompt }],
-  });
+  const startedAt = Date.now();
+
+  onLog(`pidiendo plan de edición a ${model} (max_tokens=${FIRST_MAX_TOKENS})...`);
+  let attempt = await callModel({ anthropic, prompt, model, maxTokens: FIRST_MAX_TOKENS });
+  let maxTokensUsed = FIRST_MAX_TOKENS;
+  let retried = false;
+  onLog(
+    `respuesta: stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out, ` +
+      `max_tokens=${maxTokensUsed}, texto=${attempt.text.trim().length} caracteres`,
+  );
+
+  const seemsTruncated = attempt.stopReason === "max_tokens" || attempt.text.trim().length === 0;
+  if (seemsTruncated) {
+    retried = true;
+    maxTokensUsed = RETRY_MAX_TOKENS;
+    onLog(
+      `la respuesta parece cortada -- reintentando una vez con más margen (max_tokens=${RETRY_MAX_TOKENS})...`,
+    );
+    attempt = await callModel({ anthropic, prompt, model, maxTokens: RETRY_MAX_TOKENS });
+    onLog(
+      `respuesta del reintento: stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out, ` +
+        `max_tokens=${maxTokensUsed}, texto=${attempt.text.trim().length} caracteres`,
+    );
+  }
+
   const elapsedMs = Date.now() - startedAt;
-
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("");
-
-  const plan = parseEditorialResponse(text, durationInSeconds);
+  const plan = parseEditorialResponse(attempt.text, durationInSeconds);
 
   return {
     ...plan,
     metrics: {
       elapsedMs,
       model,
-      inputTokens: response.usage?.input_tokens ?? null,
-      outputTokens: response.usage?.output_tokens ?? null,
+      stopReason: attempt.stopReason,
+      inputTokens: attempt.inputTokens,
+      outputTokens: attempt.outputTokens,
+      maxTokens: maxTokensUsed,
+      retried,
     },
   };
 };

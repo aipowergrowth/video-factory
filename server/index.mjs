@@ -465,11 +465,11 @@ const planEditIfNeeded = async (jobId, job) => {
   writeStatus(jobId, { status: "planning" });
   console.log(`[job ${jobId}] pidiendo plan de edición...`);
 
-  // La IA editorial es una capa sobre el render, no un requisito para que
-  // el render funcione: si falla por lo que sea (falta la clave, el
-  // modelo no respondió JSON válido, rate limit, red), se registra bien
-  // claro y el trabajo sigue sin cortes/zoom automáticos en vez de
-  // fallar entero — igual que antes de que existiera esta etapa.
+  // Un video de 2 horas renderizado sin edición real no sirve de nada --
+  // si la IA editorial falla, el job se detiene en "error" por defecto.
+  // Solo sigue sin cortes/zoom si el job lo pide EXPLÍCITAMENTE
+  // (job.allowRenderWithoutEditorialPlan === true), para no bloquear a
+  // quien de verdad quiere ese comportamiento (p.ej. pruebas manuales).
   let plan;
   try {
     plan = await planEdit({
@@ -481,16 +481,22 @@ const planEditIfNeeded = async (jobId, job) => {
       onLog: (msg) => console.log(`[job ${jobId}] ${msg}`),
     });
   } catch (err) {
-    console.log(
-      `[job ${jobId}] la IA editorial falló, se continúa sin cortes/zoom automáticos: ${err.message ?? err}`,
-    );
-    return job;
+    const message = `La IA editorial falló: ${err.message ?? err}`;
+    if (job.allowRenderWithoutEditorialPlan === true) {
+      console.log(
+        `[job ${jobId}] ${message} -- allowRenderWithoutEditorialPlan=true, se continúa sin cortes/zoom automáticos.`,
+      );
+      return job;
+    }
+    console.log(`[job ${jobId}] ${message} -- deteniendo el job (no se renderiza sin edición).`);
+    throw new Error(message);
   }
 
   console.log(
     `[job ${jobId}] plan de edición listo: ${plan.cuts.length} corte(s), ${plan.zooms.length} zoom(s), ` +
       `${(plan.metrics.elapsedMs / 1000).toFixed(1)}s, modelo=${plan.metrics.model}, ` +
-      `tokens=${plan.metrics.inputTokens ?? "?"}in/${plan.metrics.outputTokens ?? "?"}out`,
+      `stop_reason=${plan.metrics.stopReason}, max_tokens=${plan.metrics.maxTokens}, ` +
+      `reintentó=${plan.metrics.retried}, tokens=${plan.metrics.inputTokens ?? "?"}in/${plan.metrics.outputTokens ?? "?"}out`,
   );
   if (plan.notes) {
     console.log(`[job ${jobId}] notas del editor IA: ${plan.notes}`);
