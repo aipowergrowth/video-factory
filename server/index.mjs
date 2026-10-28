@@ -538,9 +538,12 @@ const finalizeJobOutput = async (jobId) => {
     return null;
   });
   if (outputInfo) {
+    const sizeBytes = await fsp.stat(outputPath).then((s) => s.size).catch(() => null);
+    outputInfo.sizeBytes = sizeBytes;
     console.log(
       `[job ${jobId}] salida verificada: ${outputInfo.width}x${outputInfo.height}, ` +
-        `códec=${outputInfo.codec}, duración=${outputInfo.durationSeconds?.toFixed(2)}s`,
+        `códec=${outputInfo.codec}, duración=${outputInfo.durationSeconds?.toFixed(2)}s, ` +
+        `tamaño=${sizeBytes ? (sizeBytes / 1024 / 1024).toFixed(1) + "MB" : "?"}`,
     );
   }
 

@@ -25,10 +25,16 @@ services:
       ANTHROPIC_API_KEY_FILE: "/run/secrets/anthropic_api_key"
       # Carpeta de Drive donde se sube el MP4 final de cada job, para
       # poder revisarlo/aprobarlo sin acceso al VPS. No es una credencial
-      # (el control de acceso lo da haber compartido la carpeta como
-      # Editor con la cuenta de servicio, no conocer este ID), por eso va
-      # en texto plano aquí y no como secreto.
+      # (el control de acceso lo da el permiso de la cuenta que autorizó
+      # el OAuth de abajo, no conocer este ID), por eso va en texto plano
+      # aquí y no como secreto.
       DRIVE_OUTPUT_FOLDER_ID: "1i7IBC_bCeNN9J7efE2IUfWdIZ9IZ4k0Z"
+      # Las cuentas de servicio no pueden subir a un Drive personal (no
+      # tienen cuota propia) -- la subida se hace con el OAuth del propio
+      # Alex. El secreto es un JSON con client_id/client_secret/
+      # refresh_token (ver DEPLOY.md para cómo se genera, una sola vez,
+      # sin terminal).
+      DRIVE_OAUTH_CREDENTIALS_FILE: "/run/secrets/drive_oauth_credentials_json"
     volumes:
       - fabrica_videos_inputs:/app/public/uploads
       - fabrica_videos_outputs:/data/outputs
@@ -38,6 +44,7 @@ services:
       - drive_service_account_json
       - source: vfanthropic_api_key
         target: anthropic_api_key
+      - drive_oauth_credentials_json
     deploy:
       replicas: 1
       resources:
@@ -72,4 +79,9 @@ secrets:
   # igual quede montado en /run/secrets/anthropic_api_key, que es lo que
   # espera ANTHROPIC_API_KEY_FILE.
   vfanthropic_api_key:
+    external: true
+  # Contenido: un JSON de una sola línea, exactamente
+  # {"client_id":"...","client_secret":"...","refresh_token":"..."}
+  # (ver DEPLOY.md para cómo generarlo).
+  drive_oauth_credentials_json:
     external: true

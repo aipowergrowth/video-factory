@@ -12,6 +12,7 @@ import {
   downloadFileWithRetry,
   uploadFile,
   __setDriveClientForTesting,
+  __setUploadDriveClientForTesting,
 } from "./drive.mjs";
 
 const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "drive-sim-"));
@@ -84,6 +85,9 @@ const fakeClient = {
 };
 
 __setDriveClientForTesting(() => fakeClient);
+// La subida ahora pasa por un cliente OAuth separado (no la cuenta de
+// servicio) -- mismo objeto falso, inyectado en el hook correcto.
+__setUploadDriveClientForTesting(() => fakeClient);
 
 const assert = (cond, msg) => {
   if (!cond) {
@@ -163,6 +167,26 @@ try {
   );
 }
 assert(uploadThrew, "subida sin permiso: uploadFile rechaza en vez de fallar en silencio");
+
+// --- Escenario 6: sin DRIVE_OAUTH_CREDENTIALS_FILE (ni cliente falso inyectado) -> error claro, no uno críptico del SDK ---
+{
+  __setUploadDriveClientForTesting(null);
+  const previousFile = process.env.DRIVE_OAUTH_CREDENTIALS_FILE;
+  delete process.env.DRIVE_OAUTH_CREDENTIALS_FILE;
+  let threw = false;
+  try {
+    await uploadFile({ filePath: uploadSrc, fileName: "x.mp4", folderId: "fake" });
+  } catch (err) {
+    threw = true;
+    assert(
+      err.message.includes("DRIVE_OAUTH_CREDENTIALS_FILE"),
+      "sin credenciales OAuth: el mensaje dice exactamente qué falta",
+    );
+  }
+  assert(threw, "sin credenciales OAuth: uploadFile lanza error en vez de fallar en silencio");
+  if (previousFile) process.env.DRIVE_OAUTH_CREDENTIALS_FILE = previousFile;
+  __setUploadDriveClientForTesting(() => fakeClient);
+}
 
 await fsp.rm(dir, { recursive: true, force: true });
 

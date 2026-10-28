@@ -36,14 +36,82 @@ son 3-4 clics más.)*
 
 ## Paso 2 — Crear los secretos y el stack en Portainer
 
-Dos secretos (nunca van en el repo ni en el YAML del stack):
+Tres secretos (nunca van en el repo ni en el YAML del stack):
 
 1. Menú lateral → **Secrets** → **+ Add secret**.
    - **Name**: `drive_service_account_json`. **Content**: pega el JSON
-     completo de la cuenta de servicio de Google Drive.
+     completo de la cuenta de servicio de Google Drive (solo lectura —
+     esta cuenta lee los videos de origen, no sube nada).
 2. Otra vez **+ Add secret**.
-   - **Name**: `anthropic_api_key`. **Content**: solo la clave
+   - **Name**: `vfanthropic_api_key`. **Content**: solo la clave
      (`sk-ant-...`), sin comillas ni nombre de variable delante.
+3. Otra vez **+ Add secret**.
+   - **Name**: `drive_oauth_credentials_json`. **Content**: lo que
+     genera el Paso 2a de abajo — hazlo antes de crear este secreto.
+
+### Paso 2a — Autorizar la subida del MP4 final a tu Drive (una sola vez, sin terminal)
+
+Las cuentas de servicio no tienen cuota de almacenamiento propia y no
+pueden escribir en un Drive personal (lo confirmamos en producción: el
+error exacto es *"Service Accounts do not have storage quota"*). Por
+eso la subida usa tu propio permiso de Google (OAuth), no la cuenta de
+servicio. Todo esto se hace en el navegador, sin instalar nada ni abrir
+una terminal.
+
+**En Google Cloud Console** (el mismo proyecto donde ya está la cuenta
+de servicio de Drive):
+
+1. **APIs & Services → OAuth consent screen**.
+   - Si no existe todavía: **User Type**: `External` (tu cuenta es
+     personal, no Workspace). Completa nombre de la app y tu email.
+   - **Scopes** → **Add or remove scopes** → agrega
+     `https://www.googleapis.com/auth/drive.file` → **Update**.
+   - **Test users** → agrega tu propio email.
+   - Guarda. Por ahora queda en estado **Testing** — eso es a propósito,
+     lo cambiamos en el Paso 2a.4 de abajo.
+2. **APIs & Services → Credentials → + Create Credentials → OAuth client ID**.
+   - **Application type**: `Desktop app`.
+   - Nombre: el que quieras (p.ej. `fabrica-videos-oauth`).
+   - Clic en **Create**. Te muestra un **Client ID** y un **Client
+     secret** — los vas a necesitar en el próximo paso. No hace falta
+     que me los pases a mí; van directo al secreto de Portainer.
+3. Vuelve a **OAuth consent screen** → botón **PUBLISH APP** → confirma.
+
+   **Esto es lo que evita que el permiso caduque a los 7 días.** Mientras
+   la app está en "Testing", Google revoca el refresh token automáticamente
+   a la semana. En "In production" no caduca (hasta que lo revoques vos o
+   pasen 6 meses sin usarse). Como el scope `drive.file` es "sensible" y no
+   "restringido", y sos el único usuario, Google te deja publicar sin pasar
+   por su proceso de verificación — vas a ver una advertencia de "app no
+   verificada" cada vez que autorices, es normal y esperado, no significa
+   que algo esté mal configurado.
+
+**Generar el refresh token** (100% en el navegador, en
+[developers.google.com/oauthplayground](https://developers.google.com/oauthplayground)):
+
+4. Entra al OAuth Playground. Clic en el ícono de engranaje ⚙️ (arriba a
+   la derecha) → marca **Use your own OAuth credentials** → pega el
+   **Client ID** y **Client secret** del paso 2.
+5. En la columna izquierda, en el campo de texto de scopes, pega:
+   `https://www.googleapis.com/auth/drive.file` → **Authorize APIs**.
+6. Inicia sesión con tu cuenta de Google (la misma donde está la
+   carpeta `video-factory-salidas`). Vas a ver una pantalla de Google
+   advirtiendo que la app no está verificada — clic en **Advanced** /
+   **Avanzado** → **Go to [nombre de tu app] (unsafe)** → **Allow** /
+   **Permitir**.
+7. De vuelta en el Playground, clic en **Exchange authorization code
+   for tokens**.
+8. Aparece un campo **Refresh token** — ese es el valor que necesitás.
+
+**Armar el secreto:** con esos 3 valores (Client ID, Client secret,
+Refresh token), arma este JSON en una sola línea (reemplaza cada `...`):
+
+```json
+{"client_id":"...","client_secret":"...","refresh_token":"..."}
+```
+
+Pega ese JSON como contenido del secreto `drive_oauth_credentials_json`
+(Paso 2, punto 3, arriba).
 
 Ahora el stack:
 

@@ -1,17 +1,14 @@
 import { drive as driveApi } from "@googleapis/drive";
-import { GoogleAuth } from "google-auth-library";
+import { GoogleAuth, OAuth2Client } from "google-auth-library";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import crypto from "node:crypto";
 
-// `drive.file` (además del readonly que ya había) alcanza para subir el
-// MP4 final a una carpeta que se compartió explícitamente con esta cuenta
-// de servicio con permiso de Editor -- no hace falta el scope completo
-// `drive` (acceso a todo Drive) para esto.
-const SCOPES = [
-  "https://www.googleapis.com/auth/drive.readonly",
-  "https://www.googleapis.com/auth/drive.file",
-];
+// Para LEER (carpeta de origen, compartida como Viewer con esta cuenta
+// de servicio). Las cuentas de servicio no tienen cuota de almacenamiento
+// propia -- no pueden SUBIR a un Drive personal (ver getUploadDriveClient
+// más abajo, que usa OAuth del propio usuario para eso).
+const SCOPES = ["https://www.googleapis.com/auth/drive.readonly"];
 
 let cachedClient = null;
 let testClientFactory = null;
@@ -48,15 +45,49 @@ const getDriveClient = () => {
   return cachedClient;
 };
 
+let cachedUploadClient = null;
+let testUploadClientFactory = null;
+
+/** Igual que __setDriveClientForTesting pero para el cliente de SUBIDA (OAuth). */
+export const __setUploadDriveClientForTesting = (factory) => {
+  testUploadClientFactory = factory;
+  cachedUploadClient = null;
+};
+
 /**
- * Sube un archivo (el MP4 final) a una carpeta de Drive. La carpeta debe
- * estar compartida de antemano con el email de esta cuenta de servicio
- * con permiso de Editor (igual que la carpeta de origen se compartió como
- * Viewer para las descargas) -- si no, Drive devuelve un error 403/404
- * claro, no uno silencioso.
+ * Cliente de Drive autenticado como el propio usuario (OAuth, no cuenta
+ * de servicio) -- necesario porque las cuentas de servicio no pueden
+ * subir archivos a un Drive personal ("Service Accounts do not have
+ * storage quota"). El refresh token no vence a los 7 días siempre que la
+ * pantalla de consentimiento de OAuth esté en "In production" (no solo
+ * "Testing") -- ver DEPLOY.md para la guía paso a paso de cómo se generó.
+ */
+const getUploadDriveClient = () => {
+  if (testUploadClientFactory) return testUploadClientFactory();
+  if (cachedUploadClient) return cachedUploadClient;
+  const credsFile = process.env.DRIVE_OAUTH_CREDENTIALS_FILE;
+  if (!credsFile) {
+    throw new Error(
+      "Falta DRIVE_OAUTH_CREDENTIALS_FILE (secreto de Portainer con client_id/client_secret/refresh_token para subir a Drive).",
+    );
+  }
+  const { client_id, client_secret, refresh_token } = JSON.parse(
+    fs.readFileSync(credsFile, "utf8"),
+  );
+  const oauth2Client = new OAuth2Client({ clientId: client_id, clientSecret: client_secret });
+  oauth2Client.setCredentials({ refresh_token });
+  cachedUploadClient = driveApi({ version: "v3", auth: oauth2Client });
+  return cachedUploadClient;
+};
+
+/**
+ * Sube un archivo (el MP4 final) a una carpeta de Drive, usando el
+ * permiso del propio usuario (OAuth, ver getUploadDriveClient) -- no el
+ * de la cuenta de servicio, que no puede escribir en un Drive personal.
+ * La carpeta ya debe existir y ser accesible para ese usuario.
  */
 export const uploadFile = async ({ filePath, fileName, folderId, mimeType = "video/mp4" }) => {
-  const client = getDriveClient();
+  const client = getUploadDriveClient();
   const { data } = await client.files.create({
     requestBody: { name: fileName, parents: [folderId] },
     media: { mimeType, body: fs.createReadStream(filePath) },
