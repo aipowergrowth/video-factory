@@ -759,6 +759,52 @@ app.post("/jobs/:id/finalize", async (req, res) => {
 });
 
 /**
+ * Vuelve a pedirle un plan de edición a la IA editorial para un job que
+ * YA tiene su transcripción guardada -- sin re-transcribir ni renderizar
+ * nada. Pensado para probar un cambio en el prompt/modelo contra una
+ * transcripción real sin gastar una corrida completa: no escribe nada en
+ * el job ni en su estado, solo devuelve el plan. No usa `job.cuts`/
+ * `job.zooms` existentes como atajo -- siempre llama al modelo.
+ */
+app.post("/jobs/:id/replan", async (req, res) => {
+  const jobId = req.params.id;
+  let job;
+  try {
+    job = JSON.parse(await fsp.readFile(jobFilePath(jobId), "utf8"));
+  } catch {
+    return res.status(404).json({ error: "jobId desconocido (sin archivo de job en disco)." });
+  }
+  if (!Array.isArray(job.captions) || job.captions.length === 0) {
+    return res.status(409).json({ error: "Este job no tiene transcripción guardada todavía." });
+  }
+
+  const guidelinesPath = path.join(
+    PROJECT_ROOT,
+    "public/channels",
+    job.channel,
+    "editorial-guidelines.md",
+  );
+  const guidelines = await fsp.readFile(guidelinesPath, "utf8").catch(() => null);
+  if (!guidelines) {
+    return res.status(409).json({ error: `Sin guía editorial para el canal "${job.channel}".` });
+  }
+
+  try {
+    const plan = await planEdit({
+      captions: job.captions,
+      transcriptWords: job.transcriptWords,
+      guidelines,
+      durationInSeconds: job.input.durationInSeconds,
+      destination: job.destination,
+      onLog: (msg) => console.log(`[replan ${jobId}] ${msg}`),
+    });
+    res.json({ jobId, ...plan });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message ?? err) });
+  }
+});
+
+/**
  * Cancela un trabajo. Si todavía está en cola (no empezó), lo saca y ya
  * — no corrió nada. Si está en curso, mata el proceso de render si lo
  * hay y pide a las demás etapas (descarga/transcripción/plan editorial)
