@@ -440,6 +440,31 @@ const transcribeJobIfNeeded = async (jobId, job) => {
  * si no hay transcripción todavía — así un job manual con sus propios
  * `cuts`/`zooms` sigue funcionando exactamente igual que hoy.
  */
+/**
+ * Guía editorial, perfil de recursos e historial de correcciones de un
+ * canal -- compartido entre el flujo normal (planEditIfNeeded) y
+ * POST /jobs/:id/replan, para que ambos elijan el archivo de guía de la
+ * misma forma (ver job.layout) y no se desincronicen con el tiempo.
+ */
+const loadChannelEditorialContext = async (channel, layout) => {
+  const channelDir = path.join(PROJECT_ROOT, "public/channels", channel);
+  const guidelines =
+    (layout &&
+      (await fsp
+        .readFile(path.join(channelDir, `editorial-guidelines.${layout}.md`), "utf8")
+        .catch(() => null))) ??
+    (await fsp.readFile(path.join(channelDir, "editorial-guidelines.md"), "utf8").catch(() => null));
+  const resourceProfile = await fsp
+    .readFile(path.join(channelDir, "editorial-profile.json"), "utf8")
+    .then(JSON.parse)
+    .catch(() => null);
+  const correctionsHistory = await fsp
+    .readFile(path.join(channelDir, "editorial-corrections.json"), "utf8")
+    .then(JSON.parse)
+    .catch(() => []);
+  return { guidelines, resourceProfile, correctionsHistory };
+};
+
 const planEditIfNeeded = async (jobId, job) => {
   throwIfCancelled(jobId);
   if (job.input.type !== "recorded-video") return job;
@@ -449,31 +474,16 @@ const planEditIfNeeded = async (jobId, job) => {
   }
   if (!Array.isArray(job.captions) || job.captions.length === 0) return job;
 
-  const channelDir = path.join(PROJECT_ROOT, "public/channels", job.channel);
-  // Si el canal tiene formatos distintos (p.ej. pantalla compartida vs.
-  // cámara en "Alex Cripto y Negocios"), job.layout elige qué guía usar.
-  // Sin layout o sin el archivo específico, se usa la de siempre -- un
-  // job sin layout se comporta exactamente igual que antes de esto.
-  const guidelines =
-    (job.layout &&
-      (await fsp.readFile(path.join(channelDir, `editorial-guidelines.${job.layout}.md`), "utf8").catch(() => null))) ??
-    (await fsp.readFile(path.join(channelDir, "editorial-guidelines.md"), "utf8").catch(() => null));
+  const { guidelines, resourceProfile, correctionsHistory } = await loadChannelEditorialContext(
+    job.channel,
+    job.layout,
+  );
   if (!guidelines) {
     console.log(
       `[job ${jobId}] sin guía editorial para el canal "${job.channel}" — se omite la IA editorial.`,
     );
     return job;
   }
-  // Ambos opcionales: si no existen, planEdit sigue funcionando igual
-  // (perfil de recursos sin restricciones extra, sin historial previo).
-  const resourceProfile = await fsp
-    .readFile(path.join(channelDir, "editorial-profile.json"), "utf8")
-    .then(JSON.parse)
-    .catch(() => null);
-  const correctionsHistory = await fsp
-    .readFile(path.join(channelDir, "editorial-corrections.json"), "utf8")
-    .then(JSON.parse)
-    .catch(() => []);
 
   writeStatus(jobId, { status: "planning" });
   console.log(`[job ${jobId}] pidiendo plan de edición...`);
@@ -507,9 +517,15 @@ const planEditIfNeeded = async (jobId, job) => {
     throw new Error(message);
   }
 
+  // Ojo: "llamada=Xs" es cuánto tardó la llamada a la API (tiempo de
+  // reloj), NO la suma de lo que se corta del video -- van aparte y
+  // etiquetados a propósito, porque mezclarlos sin etiqueta ya generó
+  // una confusión real (se leyó como si fuera la duración total
+  // recortada, que es un número completamente distinto).
+  const totalCutSeconds = plan.cuts.reduce((sum, c) => sum + (c.endSeconds - c.startSeconds), 0);
   console.log(
-    `[job ${jobId}] plan de edición listo: ${plan.cuts.length} corte(s), ${plan.zooms.length} zoom(s), ` +
-      `${(plan.metrics.elapsedMs / 1000).toFixed(1)}s, modelo=${plan.metrics.model}, ` +
+    `[job ${jobId}] plan de edición listo: ${plan.cuts.length} corte(s) (${totalCutSeconds.toFixed(1)}s en total), ` +
+      `${plan.zooms.length} zoom(s), llamada=${(plan.metrics.elapsedMs / 1000).toFixed(1)}s, modelo=${plan.metrics.model}, ` +
       `stop_reason=${plan.metrics.stopReason}, max_tokens=${plan.metrics.maxTokens}, ` +
       `reintentó=${plan.metrics.retried}, tokens=${plan.metrics.inputTokens ?? "?"}in/${plan.metrics.outputTokens ?? "?"}out`,
   );
@@ -848,15 +864,16 @@ app.post("/jobs/:id/replan", async (req, res) => {
     return res.status(409).json({ error: "Este job no tiene transcripción guardada todavía." });
   }
 
-  const guidelinesPath = path.join(
-    PROJECT_ROOT,
-    "public/channels",
+  // El layout a usar: el que venga en el body de esta llamada (para
+  // comparar perfiles sin tocar el job guardado), si no el que ya traía
+  // el job guardado, si no ninguno (guía base del canal).
+  const layout = (req.is("application/json") && req.body?.layout) || job.layout;
+  const { guidelines, resourceProfile, correctionsHistory } = await loadChannelEditorialContext(
     job.channel,
-    "editorial-guidelines.md",
+    layout,
   );
-  const guidelines = await fsp.readFile(guidelinesPath, "utf8").catch(() => null);
   if (!guidelines) {
-    return res.status(409).json({ error: `Sin guía editorial para el canal "${job.channel}".` });
+    return res.status(409).json({ error: `Sin guía editorial para el canal "${job.channel}"${layout ? ` (layout "${layout}")` : ""}.` });
   }
 
   try {
@@ -864,11 +881,13 @@ app.post("/jobs/:id/replan", async (req, res) => {
       captions: job.captions,
       transcriptWords: job.transcriptWords,
       guidelines,
+      resourceProfile,
+      correctionsHistory,
       durationInSeconds: job.input.durationInSeconds,
       destination: job.destination,
       onLog: (msg) => console.log(`[replan ${jobId}] ${msg}`),
     });
-    res.json({ jobId, ...plan });
+    res.json({ jobId, layout: layout ?? null, ...plan });
   } catch (err) {
     res.status(500).json({ error: String(err.message ?? err) });
   }
