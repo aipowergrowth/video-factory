@@ -142,6 +142,8 @@ Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que lo
 
 "must-be-real" en "veracityRequirement" es una instrucción para quien busque y valide el recurso después (debe ser auténtico, no generado) -- NO es una afirmación tuya de que ya lo verificaste, y tampoco implica automáticamente que el recurso sea obligatorio para el video: usa el campo "essential" para eso, por separado, y resérvalo para lo verdaderamente imprescindible (la mayoría de los recursos no lo son).
 
+El presentador puede pedir like/suscripción/compartir en cualquier momento del video -- al inicio, en medio del desarrollo, o al cierre, no solo al final. Si detectas una de estas invitaciones en la transcripción, es válido acompañarla con un gráfico o animación breve (type: "graphic" o "text-highlight") sincronizado con ese momento exacto, si encaja con el perfil del canal. NUNCA inventes una invitación que el presentador no hizo, y nunca rechaces o reubiques una de estas invitaciones solo por dónde cae en el tiempo -- su ubicación temporal la decide el presentador, no vos.
+
 ## Formato de respuesta
 
 Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, sin bloque de código markdown. Forma exacta:
