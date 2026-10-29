@@ -19,17 +19,26 @@ una imagen o gráfico generado como si fuera un gráfico financiero real —
 en este formato el gráfico ya visible en pantalla es la evidencia, no una
 ilustración.
 
-## Recursos: `resources: []` es el resultado esperado
+## Recursos: `resources: []` es el resultado por DEFECTO, no una prohibición
 
 El gráfico de mercado que ya está en pantalla es el recurso visual
-principal — no hace falta agregar nada más. La gran mayoría de estos
-videos no necesitan ningún recurso adicional. Agrega uno SOLO si aporta
-evidencia real y verificable que el gráfico en pantalla no muestra (p.ej.
-una cifra macroeconómica externa que el presentador cita pero no está en
-su pantalla). Nunca B-roll decorativo — no hay "ambiente" que ilustrar,
-el contenido ya es visual. Las llamadas a la acción (like/suscríbete/
-compartir) siguen la regla general del canal: se pueden acompañar con un
-gráfico o texto breve si el presentador las pide, en cualquier momento.
+principal — la gran mayoría de estos videos no necesitan nada más.
+`resources: []` es exactamente lo que se espera la mayoría de las veces.
+Dos excepciones, ambas reales:
+
+- **Evidencia externa real**: un recurso SOLO si aporta evidencia real y
+  verificable que el gráfico en pantalla no muestra (p.ej. una cifra
+  macroeconómica externa que el presentador cita pero no está en su
+  pantalla). Nunca una captura redundante de un gráfico, cifra o
+  documento que ya está visible en el video — eso no aporta nada nuevo.
+- **Llamadas a la acción**: si el presentador pide like, suscripción o
+  compartir —al inicio, durante el desarrollo o al cierre, donde sea que
+  lo diga— es válido proponer un gráfico breve de CTA sincronizado con
+  ese momento, igual que en el resto del canal. No lo inventes si no lo
+  pide, y que no tape información importante del gráfico o la cámara.
+
+Fuera de estas dos excepciones, nunca B-roll decorativo — no hay
+"ambiente" que ilustrar, el contenido ya es visual.
 
 ## Sin zoom en este formato
 
