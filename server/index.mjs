@@ -450,7 +450,14 @@ const planEditIfNeeded = async (jobId, job) => {
   if (!Array.isArray(job.captions) || job.captions.length === 0) return job;
 
   const channelDir = path.join(PROJECT_ROOT, "public/channels", job.channel);
-  const guidelines = await fsp.readFile(path.join(channelDir, "editorial-guidelines.md"), "utf8").catch(() => null);
+  // Si el canal tiene formatos distintos (p.ej. pantalla compartida vs.
+  // cámara en "Alex Cripto y Negocios"), job.layout elige qué guía usar.
+  // Sin layout o sin el archivo específico, se usa la de siempre -- un
+  // job sin layout se comporta exactamente igual que antes de esto.
+  const guidelines =
+    (job.layout &&
+      (await fsp.readFile(path.join(channelDir, `editorial-guidelines.${job.layout}.md`), "utf8").catch(() => null))) ??
+    (await fsp.readFile(path.join(channelDir, "editorial-guidelines.md"), "utf8").catch(() => null));
   if (!guidelines) {
     console.log(
       `[job ${jobId}] sin guía editorial para el canal "${job.channel}" — se omite la IA editorial.`,
