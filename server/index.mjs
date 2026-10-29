@@ -10,7 +10,8 @@ import { createRequire } from "node:module";
 import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
 import { planEdit, mergeNearbyGaplessCuts } from "./editorial.mjs";
-import { buildTimeline, remapRangeToOutput } from "./timeline.mjs";
+import { buildTimeline } from "./timeline.mjs";
+import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee } from "./cta-guarantee.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -446,6 +447,11 @@ const transcribeJobIfNeeded = async (jobId, job) => {
  * POST /jobs/:id/replan, para que ambos elijan el archivo de guía de la
  * misma forma (ver job.layout) y no se desincronicen con el tiempo.
  */
+// relocateToNearestSurvivingInterval y remapResourcesWithCtaGuarantee
+// viven en ./cta-guarantee.mjs (extraídas para poder testearlas sin
+// levantar este servidor Express) -- compartidas entre el flujo normal
+// (planEditIfNeeded) y POST /jobs/:id/replan.
+
 const loadChannelEditorialContext = async (channel, layout) => {
   const channelDir = path.join(PROJECT_ROOT, "public/channels", channel);
   const guidelines =
@@ -576,39 +582,35 @@ const planEditIfNeeded = async (jobId, job) => {
 
   // Los recursos se pensaron en tiempo del video ORIGINAL, igual que los
   // cortes -- se traducen acá a la línea temporal FINAL (ya con los
-  // cortes aplicados) con el mismo mecanismo que usa el motor para
-  // overlays/captions. Si el intervalo de un recurso cae entero dentro de
-  // un corte, desaparece (con registro); si un corte lo partió en dos
-  // pedazos que sobreviven, se resuelven como dos recursos separados en
-  // vez de inventar continuidad entre ellos.
+  // cortes aplicados y fusionados) con el mismo mecanismo que usa el
+  // motor para overlays/captions. Los CTA obligatorios (ctaPosition)
+  // nunca desaparecen en silencio -- ver remapResourcesWithCtaGuarantee.
   const timeline = buildTimeline(job.input.durationInSeconds, job.cuts);
-  const remappedResources = [];
-  let resourcesDroppedByCuts = 0;
-  for (const resource of plan.resources) {
-    const ranges = remapRangeToOutput(timeline, {
-      startSeconds: resource.startSeconds,
-      endSeconds: resource.endSeconds,
-    });
-    if (ranges.length === 0) {
-      resourcesDroppedByCuts += 1;
-      console.log(
-        `[job ${jobId}]   recurso descartado (su intervalo completo cayó dentro de un corte): ${resource.description}`,
-      );
-      continue;
-    }
-    ranges.forEach((range, index) => {
-      remappedResources.push({
-        ...resource,
-        id: ranges.length > 1 ? `${resource.id}-${index}` : resource.id,
-        startSeconds: range.startSeconds,
-        endSeconds: range.endSeconds,
-      });
-    });
+  const { resources: remappedResources, droppedCount, ctaIssues } = remapResourcesWithCtaGuarantee({
+    resources: plan.resources,
+    timeline,
+    log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
+    existingCtaIssues: plan.ctaIssues,
+  });
+  if (droppedCount > 0) {
+    console.log(`[job ${jobId}] ${droppedCount} recurso(s) descartado(s) por caer dentro de un corte.`);
   }
-  if (resourcesDroppedByCuts > 0) {
-    console.log(`[job ${jobId}] ${resourcesDroppedByCuts} recurso(s) descartado(s) por caer dentro de un corte.`);
+  if (ctaIssues.length > 0) {
+    console.log(`[job ${jobId}] *** ${ctaIssues.length} PROBLEMA(S) CON LOS CTA OBLIGATORIOS ***`);
+    for (const issue of ctaIssues) {
+      console.log(`[job ${jobId}]   ${issue}`);
+    }
+  }
+  console.log(`[job ${jobId}] duración editada: ${timeline.outputDurationInSeconds.toFixed(2)}s`);
+  for (const r of remappedResources) {
+    if (r.ctaPosition) {
+      console.log(
+        `[job ${jobId}]   CTA "${r.ctaPosition}" en ${r.editedSeconds}s (${r.editedPercent}% de la duración editada): ${r.description}`,
+      );
+    }
   }
   job.resources = remappedResources;
+  job.ctaIssues = ctaIssues;
 
   await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
   return job;
@@ -901,7 +903,46 @@ app.post("/jobs/:id/replan", async (req, res) => {
       destination: job.destination,
       onLog: (msg) => console.log(`[replan ${jobId}] ${msg}`),
     });
-    res.json({ jobId, layout: layout ?? null, ...plan });
+
+    // Mismo post-procesamiento que el flujo normal (fusión de cortes
+    // casi contiguos + CTA que nunca desaparecen en silencio) -- para
+    // que /replan refleje la línea temporal FINAL, no el plan crudo del
+    // modelo. No se persiste nada del job -- es solo para revisar.
+    const { cuts: mergedCuts, mergeLog } = mergeNearbyGaplessCuts(plan.cuts, job.transcriptWords);
+    for (const line of mergeLog) {
+      console.log(`[replan ${jobId}]   ${line}`);
+    }
+    const timeline = buildTimeline(job.input.durationInSeconds, mergedCuts);
+    const { resources, droppedCount, ctaIssues } = remapResourcesWithCtaGuarantee({
+      resources: plan.resources,
+      timeline,
+      log: (msg) => console.log(`[replan ${jobId}]   ${msg}`),
+      existingCtaIssues: plan.ctaIssues,
+    });
+    if (ctaIssues.length > 0) {
+      console.log(`[replan ${jobId}] *** ${ctaIssues.length} PROBLEMA(S) CON LOS CTA OBLIGATORIOS ***`);
+      for (const issue of ctaIssues) {
+        console.log(`[replan ${jobId}]   ${issue}`);
+      }
+    }
+    for (const r of resources) {
+      if (r.ctaPosition) {
+        console.log(
+          `[replan ${jobId}]   CTA "${r.ctaPosition}" en ${r.editedSeconds}s (${r.editedPercent}% de la duración editada): ${r.description}`,
+        );
+      }
+    }
+
+    res.json({
+      jobId,
+      layout: layout ?? null,
+      ...plan,
+      cuts: mergedCuts,
+      resources,
+      ctaIssues,
+      editedDurationInSeconds: Number(timeline.outputDurationInSeconds.toFixed(2)),
+      resourcesDroppedByCuts: droppedCount,
+    });
   } catch (err) {
     res.status(500).json({ error: String(err.message ?? err) });
   }

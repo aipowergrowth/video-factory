@@ -41,4 +41,7 @@ ayuda a entender un dato o argumento concreto, no se usa.
 - **Transición**: discreta, solo entre bloques temáticos claramente
   distintos (p.ej. pasar de un activo a otro).
 - **Cierre**: vuelve al presentador; sin recursos nuevos salvo un dato de
-  cierre real y ya verificado por el presentador en el propio discurso.
+  cierre real y ya verificado por el presentador en el propio discurso,
+  o el llamado a la acción obligatorio de cierre (ver más abajo, aplica
+  a todos los canales) — ese sí respeta la regla de nunca tocar datos
+  financieros.

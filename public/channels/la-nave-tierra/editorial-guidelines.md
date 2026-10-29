@@ -37,6 +37,14 @@ distintos rompe la ilusión documental.
   y "esto pretende ser evidencia de un hecho" debe quedar clara en el
   plan.
 
+## Llamado a la acción
+
+Este canal no tiene presentador que lo pida en voz alta — el llamado a
+la acción obligatorio de inicio/mitad/cierre (regla global del sistema)
+se adapta al formato: un gráfico o texto en pantalla sincronizado con el
+ritmo de la narración, consistente con el estilo visual del canal, no
+una animación ajena a lo que ya se ve.
+
 ## Fuera de alcance
 
 Todo lo demás (tipo de entrada, integración real) espera a una etapa

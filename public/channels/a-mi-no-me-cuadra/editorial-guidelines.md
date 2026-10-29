@@ -57,4 +57,6 @@ evidencia concreta, nunca para rellenar o dar sensación de movimiento.
 - **Transición**: breve, discreta, solo si ayuda a separar dos bloques
   temáticos claramente distintos. No es obligatoria entre cada tema.
 - **Cierre**: vuelve al presentador, sin recursos nuevos salvo que el
-  remate final lo pida explícitamente (p.ej. un dato que resume todo).
+  remate final lo pida explícitamente (p.ej. un dato que resume todo) o
+  el llamado a la acción obligatorio de cierre (ver más abajo, aplica a
+  todos los canales).

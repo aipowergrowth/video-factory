@@ -183,12 +183,19 @@ presentador lo pide": en la mitad del video, el recordatorio visual es
 OBLIGATORIO aunque el presentador no diga nada ahí.
 
 - **Inicio**: si el presentador hace el llamado verbalmente cerca del
-  inicio, acompañalo con un recurso sincronizado con ese momento exacto.
+  inicio, acompañalo con un recurso sincronizado con ese momento exacto,
+  con "ctaPosition": "start".
 - **Cierre**: proponé un recurso de CTA cerca del final SIEMPRE, exista o
   no una invitación verbal ahí -- si existe, sincronizalo con ella; si no
-  existe, igual tiene que aparecer un recordatorio visual breve.
+  existe, igual tiene que aparecer un recordatorio visual breve. Marcalo
+  con "ctaPosition": "end".
 - **Mitad**: no te pido que lo decidas vos en este paso -- eso se
   resuelve aparte, después de que definas los cortes (ver más abajo).
+
+El campo "ctaPosition" (string: "start" | "end", opcional) identifica
+cuál de los CTA obligatorios es cada recurso -- se usa después para
+garantizar que nunca desaparezcan en silencio. Los demás recursos
+(evidencia, contexto, etc.) no llevan este campo.
 
 Si el presentador hace un llamado a la acción en CUALQUIER otro momento
 del video (no solo inicio/cierre), tratalo igual que siempre: acompañalo
@@ -219,7 +226,8 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
       "intensity": "${INTENSITIES.join('" | "')}",
       "veracityRequirement": "${VERACITY_REQUIREMENTS.join('" | "')}",
       "essential": boolean,
-      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras"
+      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras",
+      "ctaPosition": "start" | "end" | null
     }
   ],
   "notes": "resumen breve de tu criterio editorial para que un humano lo revise"
@@ -376,6 +384,9 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
       // Por defecto false: la mayoría de los recursos son prescindibles.
       essential: resource.essential === true,
       provenanceNotes: typeof resource.provenanceNotes === "string" ? resource.provenanceNotes : undefined,
+      // Identifica cuál de los CTA obligatorios es (si lo es) -- se usa
+      // después para garantizar que nunca desaparezcan en silencio.
+      ctaPosition: ["start", "end", "middle"].includes(resource.ctaPosition) ? resource.ctaPosition : undefined,
     });
   });
 
@@ -609,7 +620,7 @@ const planMiddleCta = async ({
     return { resource: null, metrics: attempt };
   }
   return {
-    resource: { ...parsed.resources[0], id: "ai-resource-middle-cta" },
+    resource: { ...parsed.resources[0], id: "ai-resource-middle-cta", ctaPosition: "middle" },
     metrics: attempt,
   };
 };
@@ -684,6 +695,11 @@ export const planEdit = async ({
 
   // CTA obligatorio de mitad de video (Decisión 6 del auditor) -- capa
   // aparte sobre el plan principal, nunca bloquea el resto si falla.
+  // El auditor fue explícito: el plan NUNCA puede salir sin el CTA de
+  // mitad sin que quede registrado de forma visible -- nunca una
+  // omisión en silencio, ni siquiera cuando la causa es que la llamada
+  // falló o el modelo decidió no proponer nada.
+  const ctaIssues = [];
   let middleCtaMetrics = null;
   try {
     const { resource, metrics } = await planMiddleCta({
@@ -700,13 +716,19 @@ export const planEdit = async ({
     middleCtaMetrics = metrics;
     if (resource) {
       plan.resources.push(resource);
+    } else {
+      ctaIssues.push(
+        "Falta el CTA obligatorio de \"middle\": el modelo no propuso ninguno en el fragmento alrededor del punto medio.",
+      );
     }
   } catch (err) {
     onLog(`CTA de mitad de video falló (${err.message ?? err}) -- se omite, no bloquea el resto del plan.`);
+    ctaIssues.push(`Falta el CTA obligatorio de "middle": la llamada falló (${err.message ?? err}).`);
   }
 
   return {
     ...plan,
+    ctaIssues,
     metrics: {
       elapsedMs,
       model,
