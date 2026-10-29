@@ -27,6 +27,14 @@ const MIN_CUT_SECONDS = Number(process.env.EDITORIAL_MIN_CUT_SECONDS ?? 0.15);
 // mergeNearbyGaplessCuts(). Mismo valor que MIN_CUT_SECONDS por ahora,
 // pero es una constante aparte a propósito: miden cosas distintas.
 const CUT_MERGE_GAP_SECONDS = Number(process.env.EDITORIAL_CUT_MERGE_GAP_SECONDS ?? 0.15);
+// Tope de duración para los 3 CTA obligatorios (corrida real sobre el
+// job ff69b475, layout screen-share): el modelo propuso CTA de 53-54s
+// -- todo el tramo del discurso, no el llamado puntual -- en vez de los
+// 2-15s de corridas anteriores. El prompt ya pedía brevedad y no bastó
+// (ver buildPrompt/buildMiddleCtaPrompt); este tope en código es la
+// garantía determinística de que la duración del CTA sea siempre
+// verificable sin depender de que el modelo lo respete.
+const CTA_MAX_DURATION_SECONDS = { start: 15, end: 15, middle: 8 };
 
 let client = null;
 
@@ -174,23 +182,27 @@ Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que lo
 
 "essential" tiene una consecuencia real: si un recurso esencial no se consigue, el sistema DETIENE el video entero en vez de continuar sin él -- por eso tiene que reflejar la verdad, ni más ni menos. La pregunta correcta es una sola, por cada recurso: "¿sin este recurso específico, el argumento del video pierde sentido o se vuelve engañoso?". Si sí, essential=true -- no lo evites por precaución, esa es justamente la situación para la que existe el campo. Si la respuesta es no (el recurso ayuda, ilustra, o es una captura real de algo ya mostrado, pero el argumento se sostiene igual sin él), essential=false. No apuntes a ningún número en particular -- ni "casi nunca" ni "varios por video" -- juzga cada recurso por separado con esa pregunta.
 
-## Llamados a la acción (CTA): obligatorios al inicio, a la mitad y al cierre
+## Llamados a la acción (CTA): tu responsabilidad es inicio y cierre, NADA de mitad
 
 Regla global, para todos los canales: todo video debe llevar un llamado a
 la acción (like/suscripción/compartir, o seguir al presentador en otra
-red) en TRES momentos -- inicio, mitad y cierre. No es solo "si el
-presentador lo pide": en la mitad del video, el recordatorio visual es
-OBLIGATORIO aunque el presentador no diga nada ahí.
+red) en TRES momentos -- inicio, mitad y cierre. De esos tres, en este
+paso SOLO te pido inicio y cierre. El de mitad lo genera un paso
+completamente aparte, automático, DESPUÉS de este -- no es tarea tuya:
+no propongas ningún recurso para cubrirlo, ni siquiera un recordatorio
+genérico "por si acaso". Si lo hacés, se duplica con el que genera ese
+otro paso y el sistema lo descarta.
 
 - **Inicio**: si el presentador hace el llamado verbalmente cerca del
   inicio, acompañalo con un recurso sincronizado con ese momento exacto,
-  con "ctaPosition": "start".
+  con "ctaPosition": "start". Que dure solo lo que dura la invitación
+  verbal (unos pocos segundos) -- nunca el resto del discurso que sigue
+  después.
 - **Cierre**: proponé un recurso de CTA cerca del final SIEMPRE, exista o
-  no una invitación verbal ahí -- si existe, sincronizalo con ella; si no
-  existe, igual tiene que aparecer un recordatorio visual breve. Marcalo
-  con "ctaPosition": "end".
-- **Mitad**: no te pido que lo decidas vos en este paso -- eso se
-  resuelve aparte, después de que definas los cortes (ver más abajo).
+  no una invitación verbal ahí -- si existe, sincronizalo con ella y que
+  dure lo que dura esa invitación; si no existe, que sea un recordatorio
+  visual breve (unos pocos segundos), nunca un recurso que cubra todo el
+  cierre del video. Marcalo con "ctaPosition": "end".
 
 El campo "ctaPosition" (string: "start" | "end", opcional) identifica
 cuál de los CTA obligatorios es cada recurso -- se usa después para
@@ -237,6 +249,28 @@ Si no hay nada que cortar, ningún momento que merezca zoom, o ningún recurso q
 };
 
 const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
+
+/**
+ * Recorta un recurso de CTA que se excedió del tope de duración de
+ * CTA_MAX_DURATION_SECONDS (ver constante arriba) -- nunca lo descarta,
+ * solo acorta su `endSeconds` conservando el `startSeconds` (el momento
+ * en que empieza el llamado es lo que importa, no cuánto siga hablando
+ * el presentador de otra cosa después). Se usa tanto para "start"/"end"
+ * (autoetiquetados por el modelo en la llamada principal) como para
+ * "middle" (forzado por planMiddleCta después de parsear).
+ */
+export const clampCtaDuration = (resource) => {
+  if (!resource.ctaPosition) return { resource, adjusted: false };
+  const cap = CTA_MAX_DURATION_SECONDS[resource.ctaPosition];
+  const duration = resource.endSeconds - resource.startSeconds;
+  if (duration <= cap) return { resource, adjusted: false };
+  return {
+    resource: { ...resource, endSeconds: resource.startSeconds + cap },
+    adjusted: true,
+    originalDuration: duration,
+    cappedDuration: cap,
+  };
+};
 
 const stripCodeFence = (text) => {
   const trimmed = text.trim();
@@ -330,6 +364,7 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
     }));
 
   const resourceIssues = [];
+  const ctaDurationAdjustments = [];
   const rawResources = Array.isArray(parsed.resources) ? parsed.resources : [];
   const resources = [];
   rawResources.forEach((resource, index) => {
@@ -368,7 +403,7 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
       );
       return;
     }
-    resources.push({
+    const { resource: clamped, adjusted, originalDuration, cappedDuration } = clampCtaDuration({
       id: `ai-resource-${index}`,
       startSeconds: resource.startSeconds,
       endSeconds: resource.endSeconds,
@@ -388,6 +423,12 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
       // después para garantizar que nunca desaparezcan en silencio.
       ctaPosition: ["start", "end", "middle"].includes(resource.ctaPosition) ? resource.ctaPosition : undefined,
     });
+    if (adjusted) {
+      ctaDurationAdjustments.push(
+        `CTA de "${clamped.ctaPosition}" recortado: duraba ${originalDuration.toFixed(2)}s, se acortó a ${cappedDuration.toFixed(2)}s (tope editorial, conservando el inicio en ${clamped.startSeconds.toFixed(2)}s).`,
+      );
+    }
+    resources.push(clamped);
   });
 
   return {
@@ -396,6 +437,7 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
     zooms,
     resources,
     resourceIssues,
+    ctaDurationAdjustments,
     notes: typeof parsed.notes === "string" ? parsed.notes : "",
   };
 };
@@ -537,7 +579,7 @@ ${transcriptAsText(excerpt)}
 
 ## Tu tarea
 
-Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado en este fragmento, lo más cerca posible de ${midpointSourceSeconds.toFixed(2)}s sin interrumpir una explicación en curso -- podés moverlo unos segundos antes o después dentro de este fragmento si hace falta. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial, independiente de lo que se diga en este tramo puntual. Que sea breve y discreto -- no tape información importante. NUNCA inventes un @usuario, enlace o nombre de perfil que no esté en la transcripción.
+Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado en este fragmento, lo más cerca posible de ${midpointSourceSeconds.toFixed(2)}s sin interrumpir una explicación en curso -- podés moverlo unos segundos antes o después dentro de este fragmento si hace falta. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial, independiente de lo que se diga en este tramo puntual. Que sea breve y discreto: unos pocos segundos (no más de 8), un recordatorio puntual, nunca un tramo largo del discurso -- no tape información importante. NUNCA inventes un @usuario, enlace o nombre de perfil que no esté en la transcripción.
 
 ## Formato de respuesta
 
@@ -619,8 +661,18 @@ const planMiddleCta = async ({
     onLog("CTA de mitad de video: el modelo no propuso ninguno en este fragmento -- se omite.");
     return { resource: null, metrics: attempt };
   }
+  const { resource: clamped, adjusted, originalDuration, cappedDuration } = clampCtaDuration({
+    ...parsed.resources[0],
+    id: "ai-resource-middle-cta",
+    ctaPosition: "middle",
+  });
+  if (adjusted) {
+    onLog(
+      `CTA de mitad de video recortado: duraba ${originalDuration.toFixed(2)}s, se acortó a ${cappedDuration.toFixed(2)}s (tope editorial, conservando el inicio en ${clamped.startSeconds.toFixed(2)}s).`,
+    );
+  }
   return {
-    resource: { ...parsed.resources[0], id: "ai-resource-middle-cta", ctaPosition: "middle" },
+    resource: clamped,
     metrics: attempt,
   };
 };
@@ -692,6 +744,21 @@ export const planEdit = async ({
       onLog(`  ${issue}`);
     }
   }
+
+  if (plan.ctaDurationAdjustments.length > 0) {
+    for (const adjustment of plan.ctaDurationAdjustments) {
+      onLog(adjustment);
+    }
+  }
+
+  // Defecto real en una corrida sobre job ff69b475: la llamada principal
+  // propuso su propio recurso (sin ctaPosition) como recordatorio de
+  // mitad de video, duplicando el que genera planMiddleCta más abajo.
+  // No hay forma confiable de distinguir ese duplicado de un recurso
+  // legítimo sin la etiqueta -- adivinar arriesga descartar algo real en
+  // silencio, justo lo que esta garantía quiere evitar. La corrección es
+  // en el prompt (ver buildPrompt): ya no se le pide nada sobre la
+  // mitad, así que no debería volver a proponer uno.
 
   // CTA obligatorio de mitad de video (Decisión 6 del auditor) -- capa
   // aparte sobre el plan principal, nunca bloquea el resto si falla.

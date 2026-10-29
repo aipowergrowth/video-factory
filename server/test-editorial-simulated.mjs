@@ -10,6 +10,7 @@ import {
   planEdit,
   parseEditorialResponse,
   mergeNearbyGaplessCuts,
+  clampCtaDuration,
   __setAnthropicClientForTesting,
 } from "./editorial.mjs";
 
@@ -374,6 +375,50 @@ const makeSequencedFakeClient = (responses) => {
   check("CTA de mitad: queda registrado aparte en metrics.middleCta", plan.metrics.middleCta?.inputTokens === 20);
 }
 
+// CTA de mitad excedido de duración (defecto real de la corrida sobre
+// ff69b475: 29s en vez de un recordatorio puntual) -- planMiddleCta()
+// debe recortarlo al tope de 8s igual que si viniera de la llamada
+// principal, y seguir tageándolo "middle" normalmente.
+{
+  let callIndex = 0;
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async () => {
+        callIndex += 1;
+        if (callIndex === 1) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 100, output_tokens: 50 },
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            cuts: [],
+            zooms: [],
+            // Duración 8.5s -- excede el tope de 8s pero sigue dentro de
+            // los 10s totales del video de prueba (si no, se descartaría
+            // antes de llegar al clamp por tiempos fuera de rango).
+            resources: [{
+              startSeconds: 1.0, endSeconds: 9.5,
+              type: "text-highlight", description: "like y suscríbete, todo el bloque",
+              editorialGoal: "emphasis", segment: "development",
+              intensity: "subtle", veracityRequirement: "illustrative-ok", essential: false,
+            }],
+            notes: "",
+          }) }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 20, output_tokens: 10 },
+        };
+      },
+    },
+  });
+  const plan = await planEdit({ captions: fakeCaptions, guidelines: "guía", durationInSeconds: 10, destination: "youtube-16-9" });
+  const middleCta = plan.resources.find((r) => r.ctaPosition === "middle");
+  check("CTA de mitad excedido (8.5s) vía planMiddleCta: se recorta al tope de 8s", middleCta && middleCta.endSeconds - middleCta.startSeconds === 8);
+  check("CTA de mitad recortado vía planMiddleCta: conserva su startSeconds (1.0)", middleCta && middleCta.startSeconds === 1.0);
+}
+
 // Si el modelo no propone ningún CTA de mitad (p.ej. no encaja en ese tramo), no se agrega nada y el resto del plan sigue intacto.
 {
   let callIndex = 0;
@@ -477,6 +522,60 @@ const makeSequencedFakeClient = (responses) => {
   });
   const plan = parseEditorialResponse(extreme, 8);
   check("zoom extremo se recorta a 2x en vez de descartarse", plan.zooms.length === 1 && plan.zooms[0].toScale === 2);
+}
+
+// 4b. CTA que se excede del tope de duración se recorta, no se descarta
+// (defecto real observado en la corrida sobre el job ff69b475: CTA de
+// 53-54s en vez de un recordatorio puntual).
+{
+  const longCta = JSON.stringify({
+    cuts: [],
+    zooms: [],
+    resources: [
+      {
+        startSeconds: 10,
+        endSeconds: 63,
+        type: "graphic",
+        description: "recordatorio de suscripción",
+        editorialGoal: "emphasis",
+        segment: "intro",
+        ctaPosition: "start",
+      },
+      {
+        startSeconds: 100,
+        endSeconds: 105,
+        type: "graphic",
+        description: "CTA de cierre ya breve",
+        editorialGoal: "emphasis",
+        segment: "closing",
+        ctaPosition: "end",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(longCta, 200);
+  const startCta = plan.resources.find((r) => r.ctaPosition === "start");
+  const endCta = plan.resources.find((r) => r.ctaPosition === "end");
+  check("CTA de inicio excedido (53s): se recorta al tope de 15s", startCta && startCta.endSeconds - startCta.startSeconds === 15);
+  check("CTA de inicio recortado: conserva su startSeconds original (10)", startCta && startCta.startSeconds === 10);
+  check("CTA de cierre ya breve (5s): no se toca", endCta && endCta.endSeconds - endCta.startSeconds === 5);
+  check("CTA de inicio excedido: queda registrado en ctaDurationAdjustments", plan.ctaDurationAdjustments.some((a) => a.includes('"start"')));
+  check("CTA de cierre ya breve: no genera ajuste", !plan.ctaDurationAdjustments.some((a) => a.includes('"end"')));
+}
+
+// 4c. clampCtaDuration() en forma aislada -- incluye el caso "middle"
+// (8s de tope), que no se autoetiqueta en la respuesta cruda del modelo
+// sino que lo fuerza planMiddleCta() después de parsear.
+{
+  const result = clampCtaDuration({ startSeconds: 50, endSeconds: 79, ctaPosition: "middle" });
+  check("CTA de mitad excedido (29s): se recorta al tope de 8s", result.adjusted && result.resource.endSeconds - result.resource.startSeconds === 8);
+  check("CTA de mitad recortado: conserva su startSeconds (50)", result.resource.startSeconds === 50);
+
+  const untouched = clampCtaDuration({ startSeconds: 50, endSeconds: 55, ctaPosition: "middle" });
+  check("CTA de mitad dentro del tope (5s): no se toca", !untouched.adjusted && untouched.resource.endSeconds === 55);
+
+  const noCta = clampCtaDuration({ startSeconds: 50, endSeconds: 200 });
+  check("recurso sin ctaPosition: clampCtaDuration no lo toca aunque sea muy largo", !noCta.adjusted && noCta.resource.endSeconds === 200);
 }
 
 // 5. Respuesta que no es JSON en absoluto: debe fallar con un error claro, no silenciosamente.
