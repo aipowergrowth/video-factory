@@ -1,0 +1,7 @@
+{
+  "channelId": "la-nave-tierra",
+  "_status": "preparado, no funcional todavia -- este canal no tiene presentador y su tipo de entrada (guion+audio+imagenes) aun no existe en el motor. Este perfil queda listo para cuando se construya esa entrada.",
+  "hasOnCameraPresenter": false,
+  "allowedResourceTypes": ["image", "graphic", "broll", "transition", "music", "sfx"],
+  "neverFabricate": []
+}

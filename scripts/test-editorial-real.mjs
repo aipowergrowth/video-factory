@@ -56,7 +56,7 @@ console.log(
   `Métricas: stop_reason=${plan.metrics.stopReason}, max_tokens=${plan.metrics.maxTokens}, ` +
     `reintentó=${plan.metrics.retried}, tokens=${plan.metrics.inputTokens}in/${plan.metrics.outputTokens}out`,
 );
-console.log(`Cortes: ${plan.cuts.length}. Zooms: ${plan.zooms.length}.`);
+console.log(`Cortes: ${plan.cuts.length}. Zooms: ${plan.zooms.length}. Recursos: ${plan.resources.length} (${plan.resourceIssues.length} descartado(s)).`);
 console.log(`\nNotas del editor:\n${plan.notes}\n`);
 
 if (plan.cuts.length > 0) {
@@ -73,6 +73,24 @@ if (plan.zooms.length > 0) {
     console.log(
       `  ${zoom.startSeconds.toFixed(2)}-${zoom.endSeconds.toFixed(2)}s (${zoom.fromScale}x->${zoom.toScale}x): ${zoom.reason ?? "(sin razón)"}`,
     );
+  }
+}
+
+if (plan.resources.length > 0) {
+  console.log("\nRecursos:");
+  for (const r of plan.resources) {
+    console.log(
+      `  [${r.segment}/${r.type}] ${r.startSeconds.toFixed(2)}-${r.endSeconds.toFixed(2)}s (${r.editorialGoal}, intensidad=${r.intensity}, esencial=${r.essential}, veracidad=${r.veracityRequirement})`,
+    );
+    console.log(`    descripción: ${r.description}`);
+    if (r.justification) console.log(`    justificación: ${r.justification}`);
+    if (r.provenanceNotes) console.log(`    procedencia/licencia: ${r.provenanceNotes}`);
+  }
+}
+if (plan.resourceIssues.length > 0) {
+  console.log("\nRecursos descartados:");
+  for (const issue of plan.resourceIssues) {
+    console.log(`  ${issue}`);
   }
 }
 

@@ -67,13 +67,52 @@ const transcriptAsText = (entries) =>
  * cortar. Se le dice al modelo la verdad sobre qué puede hacer en cada
  * caso -- nunca ofrecerle una precisión que no tiene.
  */
-const buildPrompt = ({ guidelines, transcript, granularity, durationInSeconds, destination }) => {
+const RESOURCE_TYPES = [
+  "broll",
+  "image",
+  "graphic",
+  "document-reference",
+  "text-highlight",
+  "transition",
+  "music",
+  "sfx",
+];
+const EDITORIAL_GOALS = ["evidence", "comprehension", "context", "emotion", "emphasis", "transition"];
+const SEGMENTS = ["intro", "development", "demonstration", "transition", "closing"];
+const INTENSITIES = ["subtle", "moderate", "prominent"];
+const VERACITY_REQUIREMENTS = ["must-be-real", "illustrative-ok"];
+
+const buildPrompt = ({
+  guidelines,
+  resourceProfile,
+  correctionsHistory,
+  transcript,
+  granularity,
+  durationInSeconds,
+  destination,
+}) => {
   const cutPrecisionInstruction =
     granularity === "word"
       ? "Los cortes deben caer EXACTAMENTE en el límite entre dos palabras consecutivas de la transcripción (el final de una palabra o el inicio de la siguiente) -- nunca a la mitad de una palabra. Como la transcripción es palabra por palabra, puedes cortar un titubeo o una repetición puntual aunque esté en medio de una frase."
       : "Los cortes deben caer EXACTAMENTE en los límites entre líneas de la transcripción (el final de una línea o el inicio de la siguiente) -- nunca a la mitad de una línea. Esta transcripción solo viene agrupada en líneas (no palabra por palabra), así que un titubeo o repetición a mitad de una línea no se puede aislar: en ese caso no lo cortes.";
 
-  return `Eres un editor de video profesional. Analiza esta transcripción real (con tiempos en segundos) y decide cortes y zooms con criterio editorial genuino — no los apliques mecánicamente, piensa como lo haría un editor humano cuidadoso.
+  const resourceProfileText = resourceProfile
+    ? `Tipos de recurso permitidos en este canal: ${resourceProfile.allowedResourceTypes?.join(", ") ?? "(todos)"}.` +
+      (resourceProfile.neverFabricate?.length
+        ? ` NUNCA inventes ni presentes como real: ${resourceProfile.neverFabricate.join(", ")}.`
+        : "")
+    : "";
+
+  const correctionsText =
+    Array.isArray(correctionsHistory) && correctionsHistory.length > 0
+      ? `## Correcciones editoriales previas aprobadas por Alex (referencia, no reglas obligatorias)\n\n` +
+        correctionsHistory
+          .map((c) => `- [${c.segment ?? "?"}/${c.resourceType ?? "?"}] ${c.reason}${c.example ? ` (ejemplo: ${c.example})` : ""}`)
+          .join("\n") +
+        "\n\nEstas son observaciones humanas pasadas, no reglas maestras del canal -- úsalas como orientación de criterio, no como mandato absoluto.\n"
+      : "";
+
+  return `Eres un editor de video profesional. Analiza esta transcripción real (con tiempos en segundos) y decide cortes, zooms y recursos audiovisuales con criterio editorial genuino — no los apliques mecánicamente, piensa como lo haría un editor humano cuidadoso.
 
 Duración total del video original: ${durationInSeconds.toFixed(2)} segundos.
 Formato de salida: ${destination}.
@@ -82,6 +121,9 @@ Formato de salida: ${destination}.
 
 ${guidelines}
 
+${resourceProfileText}
+
+${correctionsText}
 ## Precisión de los cortes
 
 ${cutPrecisionInstruction}
@@ -89,6 +131,16 @@ ${cutPrecisionInstruction}
 ## Transcripción (${granularity === "word" ? "una palabra" : "una línea"} por entrada, con su rango de tiempo)
 
 ${transcriptAsText(transcript)}
+
+## Recursos audiovisuales (B-roll, imágenes, gráficos, resaltados, transiciones, música, efectos)
+
+Decide qué recursos incorporar, si corresponde. Principio central: NO insertes recursos por intervalos fijos ni para aparentar dinamismo -- cada uno debe aportar valor real (evidencia, comprensión, contexto, emoción, énfasis o transición). Mantener la cámara estable o prescindir de un efecto es una decisión editorial tan válida como insertarlo. Un array "resources" vacío es un resultado perfectamente válido si el video no lo necesita -- no hay cantidad mínima ni máxima que cumplir.
+
+Para cada recurso, identifica a qué segmento del video pertenece (intro/development/demonstration/transition/closing) y sigue las reglas que la guía editorial de arriba da para ese segmento específico.
+
+Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que los cortes y zooms -- no intentes calcular tú la línea temporal final, el sistema se encarga de eso después de aplicar los cortes.
+
+"must-be-real" en "veracityRequirement" es una instrucción para quien busque y valide el recurso después (debe ser auténtico, no generado) -- NO es una afirmación tuya de que ya lo verificaste, y tampoco implica automáticamente que el recurso sea obligatorio para el video: usa el campo "essential" para eso, por separado, y resérvalo para lo verdaderamente imprescindible (la mayoría de los recursos no lo son).
 
 ## Formato de respuesta
 
@@ -101,10 +153,24 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
   "zooms": [
     { "startSeconds": number, "endSeconds": number, "fromScale": number, "toScale": number, "origin": { "x": number, "y": number }, "reason": "máximo 12 palabras" }
   ],
+  "resources": [
+    {
+      "startSeconds": number, "endSeconds": number,
+      "type": "${RESOURCE_TYPES.join('" | "')}",
+      "description": "qué buscar o generar, concreto, máximo 20 palabras",
+      "justification": "fragmento breve del discurso que lo justifica",
+      "editorialGoal": "${EDITORIAL_GOALS.join('" | "')}",
+      "segment": "${SEGMENTS.join('" | "')}",
+      "intensity": "${INTENSITIES.join('" | "')}",
+      "veracityRequirement": "${VERACITY_REQUIREMENTS.join('" | "')}",
+      "essential": boolean,
+      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras"
+    }
+  ],
   "notes": "resumen breve de tu criterio editorial para que un humano lo revise"
 }
 
-Si no hay nada que cortar o ningún momento que merezca zoom, devuelve arrays vacíos — no inventes ediciones solo por rellenar.`;
+Si no hay nada que cortar, ningún momento que merezca zoom, o ningún recurso que aporte valor real, devuelve arrays vacíos — no inventes ediciones ni recursos solo por rellenar.`;
 };
 
 const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
@@ -182,9 +248,69 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
       reason: typeof zoom.reason === "string" ? zoom.reason : undefined,
     }));
 
+  const resourceIssues = [];
+  const rawResources = Array.isArray(parsed.resources) ? parsed.resources : [];
+  const resources = [];
+  rawResources.forEach((resource, index) => {
+    const label = `recurso #${index + 1}`;
+    if (!resource || typeof resource !== "object") {
+      resourceIssues.push(`${label}: no es un objeto -- descartado.`);
+      return;
+    }
+    if (
+      !isFiniteNumber(resource.startSeconds) ||
+      !isFiniteNumber(resource.endSeconds) ||
+      resource.endSeconds <= resource.startSeconds ||
+      resource.startSeconds < 0 ||
+      resource.endSeconds > durationInSeconds + 0.5
+    ) {
+      resourceIssues.push(`${label}: tiempos inválidos (${resource.startSeconds}-${resource.endSeconds}) -- descartado.`);
+      return;
+    }
+    if (!RESOURCE_TYPES.includes(resource.type)) {
+      resourceIssues.push(`${label}: tipo "${resource.type}" no reconocido -- descartado.`);
+      return;
+    }
+    if (typeof resource.description !== "string" || resource.description.trim().length === 0) {
+      resourceIssues.push(`${label}: sin descripción -- descartado.`);
+      return;
+    }
+    const segment = SEGMENTS.includes(resource.segment) ? resource.segment : null;
+    const editorialGoal = EDITORIAL_GOALS.includes(resource.editorialGoal) ? resource.editorialGoal : null;
+    const intensity = INTENSITIES.includes(resource.intensity) ? resource.intensity : "moderate";
+    const veracityRequirement = VERACITY_REQUIREMENTS.includes(resource.veracityRequirement)
+      ? resource.veracityRequirement
+      : "illustrative-ok";
+    if (!segment || !editorialGoal) {
+      resourceIssues.push(
+        `${label}: segmento u objetivo editorial inválido (segment="${resource.segment}", editorialGoal="${resource.editorialGoal}") -- descartado.`,
+      );
+      return;
+    }
+    resources.push({
+      id: `ai-resource-${index}`,
+      startSeconds: resource.startSeconds,
+      endSeconds: resource.endSeconds,
+      type: resource.type,
+      description: resource.description,
+      justification: typeof resource.justification === "string" ? resource.justification : undefined,
+      editorialGoal,
+      segment,
+      intensity,
+      veracityRequirement,
+      // must-be-real NO implica esencial -- son dos preguntas distintas
+      // (¿tiene que ser auténtico? vs. ¿el video se detiene si falta?).
+      // Por defecto false: la mayoría de los recursos son prescindibles.
+      essential: resource.essential === true,
+      provenanceNotes: typeof resource.provenanceNotes === "string" ? resource.provenanceNotes : undefined,
+    });
+  });
+
   return {
     cuts,
     zooms,
+    resources,
+    resourceIssues,
     notes: typeof parsed.notes === "string" ? parsed.notes : "",
   };
 };
@@ -239,6 +365,13 @@ export const planEdit = async ({
   // líneas agrupadas -- ver buildPrompt.
   transcriptWords,
   guidelines,
+  // Opcional: contenido de editorial-profile.json del canal (tipos de
+  // recurso permitidos, qué nunca fabricar).
+  resourceProfile,
+  // Opcional: contenido de editorial-corrections.json del canal --
+  // observaciones humanas pasadas, nunca reglas que el sistema reescriba
+  // solo. Ver server/index.mjs.
+  correctionsHistory,
   durationInSeconds,
   destination,
   model = DEFAULT_MODEL,
@@ -247,6 +380,8 @@ export const planEdit = async ({
   const useWords = Array.isArray(transcriptWords) && transcriptWords.length > 0;
   const prompt = buildPrompt({
     guidelines,
+    resourceProfile,
+    correctionsHistory,
     transcript: useWords ? transcriptWords : captions,
     granularity: useWords ? "word" : "line",
     durationInSeconds,
@@ -283,6 +418,13 @@ export const planEdit = async ({
 
   const elapsedMs = Date.now() - startedAt;
   const plan = parseEditorialResponse(attempt.text, durationInSeconds);
+
+  if (plan.resourceIssues.length > 0) {
+    onLog(`${plan.resourceIssues.length} recurso(s) propuesto(s) se descartaron:`);
+    for (const issue of plan.resourceIssues) {
+      onLog(`  ${issue}`);
+    }
+  }
 
   return {
     ...plan,

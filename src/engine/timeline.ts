@@ -7,6 +7,10 @@
  *
  * Este módulo traduce ese tiempo original a tiempo de SALIDA (ya con los
  * cortes aplicados) para que el motor sepa dónde colocar cada `Sequence`.
+ *
+ * Existe un puerto en JS plano de esta misma lógica en
+ * server/timeline.mjs (el servidor corre con `node` directo y no puede
+ * importar un .ts) -- si cambia uno, cambia el otro igual.
  */
 
 export type TimeRange = {

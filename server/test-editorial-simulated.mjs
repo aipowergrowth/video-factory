@@ -187,6 +187,111 @@ const makeSequencedFakeClient = (responses) => {
   check("reintento también vacío: planEdit lanza error en vez de devolver un plan vacío silenciosamente", threw);
 }
 
+// Fase 2: planificación de recursos audiovisuales.
+
+// 1f. resources:[] es un resultado válido -- no se fuerza ningún mínimo.
+{
+  const empty = JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "nada que agregar, el video funciona solo" });
+  const plan = parseEditorialResponse(empty, 8);
+  check("resources vacío: se acepta sin error", Array.isArray(plan.resources) && plan.resources.length === 0);
+  check("resources vacío: sin issues", plan.resourceIssues.length === 0);
+}
+
+// 1g. Un recurso válido completo se parsea con todos sus campos.
+{
+  const good = JSON.stringify({
+    cuts: [],
+    zooms: [],
+    resources: [
+      {
+        startSeconds: 10,
+        endSeconds: 14,
+        type: "broll",
+        description: "Captura de pantalla del paper original de Cameron Sepah",
+        justification: "menciona el estudio de Sepah",
+        editorialGoal: "evidence",
+        segment: "development",
+        intensity: "moderate",
+        veracityRequirement: "must-be-real",
+        essential: false,
+        provenanceNotes: "licencia editorial o captura propia, no stock genérico",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(good, 20);
+  check("recurso válido: se acepta", plan.resources.length === 1);
+  check("recurso válido: conserva el tipo", plan.resources[0].type === "broll");
+  check("recurso válido: conserva segment/editorialGoal", plan.resources[0].segment === "development" && plan.resources[0].editorialGoal === "evidence");
+  check("recurso válido: must-be-real no fuerza essential=true por sí solo", plan.resources[0].veracityRequirement === "must-be-real" && plan.resources[0].essential === false);
+}
+
+// 1h. essential=true se respeta cuando el modelo lo pide explícitamente (independiente de veracityRequirement).
+{
+  const essentialOne = JSON.stringify({
+    cuts: [],
+    zooms: [],
+    resources: [
+      {
+        startSeconds: 1,
+        endSeconds: 2,
+        type: "graphic",
+        description: "Gráfico con la cifra citada en el minuto 1",
+        editorialGoal: "evidence",
+        segment: "development",
+        intensity: "moderate",
+        veracityRequirement: "illustrative-ok",
+        essential: true,
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(essentialOne, 8);
+  check("essential=true se conserva aunque veracityRequirement sea illustrative-ok (son independientes)", plan.resources[0].essential === true);
+}
+
+// 1i. Un recurso inválido (tipo no reconocido) se descarta CON razón registrada, sin tirar el resto del plan.
+{
+  const mixed = JSON.stringify({
+    cuts: [],
+    zooms: [],
+    resources: [
+      { startSeconds: 1, endSeconds: 2, type: "holograma-3d", description: "inventado", editorialGoal: "emphasis", segment: "intro" },
+      { startSeconds: 3, endSeconds: 4, type: "image", description: "foto real del lugar mencionado", editorialGoal: "context", segment: "development" },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(mixed, 8);
+  check("recurso con tipo inválido: se descarta, el válido sobrevive", plan.resources.length === 1 && plan.resources[0].type === "image");
+  check("recurso con tipo inválido: queda registrado en resourceIssues con su motivo", plan.resourceIssues.some((issue) => issue.includes("holograma-3d")));
+}
+
+// 1j. El perfil de recursos del canal (qué nunca fabricar) y el historial de correcciones llegan al prompt.
+{
+  let capturedPrompt = "";
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        capturedPrompt = params.messages[0].content;
+        return {
+          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        };
+      },
+    },
+  });
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    resourceProfile: { allowedResourceTypes: ["graphic"], neverFabricate: ["financial-data"] },
+    correctionsHistory: [{ segment: "intro", resourceType: "broll", reason: "B-roll excesivo en la introducción", example: "canal A, cap 3" }],
+    durationInSeconds: 8,
+    destination: "youtube-16-9",
+  });
+  check("perfil de recursos: el prompt incluye la restricción de nunca fabricar", capturedPrompt.includes("NUNCA inventes ni presentes como real: financial-data"));
+  check("historial de correcciones: el prompt lo incluye como referencia", capturedPrompt.includes("B-roll excesivo en la introducción"));
+}
+
 // 2. JSON envuelto en bloque de código markdown (el modelo no debería hacerlo, pero puede pasar).
 {
   const fenced = "```json\n" + JSON.stringify({ cuts: [], zooms: [], notes: "nada que cortar" }) + "\n```";

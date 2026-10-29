@@ -10,6 +10,7 @@ import { createRequire } from "node:module";
 import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
 import { planEdit } from "./editorial.mjs";
+import { buildTimeline, remapRangeToOutput } from "./timeline.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -448,19 +449,24 @@ const planEditIfNeeded = async (jobId, job) => {
   }
   if (!Array.isArray(job.captions) || job.captions.length === 0) return job;
 
-  const guidelinesPath = path.join(
-    PROJECT_ROOT,
-    "public/channels",
-    job.channel,
-    "editorial-guidelines.md",
-  );
-  const guidelines = await fsp.readFile(guidelinesPath, "utf8").catch(() => null);
+  const channelDir = path.join(PROJECT_ROOT, "public/channels", job.channel);
+  const guidelines = await fsp.readFile(path.join(channelDir, "editorial-guidelines.md"), "utf8").catch(() => null);
   if (!guidelines) {
     console.log(
       `[job ${jobId}] sin guía editorial para el canal "${job.channel}" — se omite la IA editorial.`,
     );
     return job;
   }
+  // Ambos opcionales: si no existen, planEdit sigue funcionando igual
+  // (perfil de recursos sin restricciones extra, sin historial previo).
+  const resourceProfile = await fsp
+    .readFile(path.join(channelDir, "editorial-profile.json"), "utf8")
+    .then(JSON.parse)
+    .catch(() => null);
+  const correctionsHistory = await fsp
+    .readFile(path.join(channelDir, "editorial-corrections.json"), "utf8")
+    .then(JSON.parse)
+    .catch(() => []);
 
   writeStatus(jobId, { status: "planning" });
   console.log(`[job ${jobId}] pidiendo plan de edición...`);
@@ -476,6 +482,8 @@ const planEditIfNeeded = async (jobId, job) => {
       captions: job.captions,
       transcriptWords: job.transcriptWords,
       guidelines,
+      resourceProfile,
+      correctionsHistory,
       durationInSeconds: job.input.durationInSeconds,
       destination: job.destination,
       onLog: (msg) => console.log(`[job ${jobId}] ${msg}`),
@@ -511,6 +519,13 @@ const planEditIfNeeded = async (jobId, job) => {
       `[job ${jobId}]   zoom ${zoom.startSeconds.toFixed(2)}-${zoom.endSeconds.toFixed(2)}s (${zoom.fromScale}x->${zoom.toScale}x): ${zoom.reason ?? "(sin razón)"}`,
     );
   }
+  console.log(`[job ${jobId}] recursos propuestos: ${plan.resources.length}`);
+  for (const resource of plan.resources) {
+    console.log(
+      `[job ${jobId}]   recurso [${resource.segment}/${resource.type}] ${resource.startSeconds.toFixed(2)}-${resource.endSeconds.toFixed(2)}s ` +
+        `(${resource.editorialGoal}, esencial=${resource.essential}): ${resource.description}`,
+    );
+  }
 
   job.cuts = plan.cuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
   job.zooms = plan.zooms.map(({ id, startSeconds, endSeconds, fromScale, toScale, origin }) => ({
@@ -521,6 +536,43 @@ const planEditIfNeeded = async (jobId, job) => {
     toScale,
     origin,
   }));
+
+  // Los recursos se pensaron en tiempo del video ORIGINAL, igual que los
+  // cortes -- se traducen acá a la línea temporal FINAL (ya con los
+  // cortes aplicados) con el mismo mecanismo que usa el motor para
+  // overlays/captions. Si el intervalo de un recurso cae entero dentro de
+  // un corte, desaparece (con registro); si un corte lo partió en dos
+  // pedazos que sobreviven, se resuelven como dos recursos separados en
+  // vez de inventar continuidad entre ellos.
+  const timeline = buildTimeline(job.input.durationInSeconds, job.cuts);
+  const remappedResources = [];
+  let resourcesDroppedByCuts = 0;
+  for (const resource of plan.resources) {
+    const ranges = remapRangeToOutput(timeline, {
+      startSeconds: resource.startSeconds,
+      endSeconds: resource.endSeconds,
+    });
+    if (ranges.length === 0) {
+      resourcesDroppedByCuts += 1;
+      console.log(
+        `[job ${jobId}]   recurso descartado (su intervalo completo cayó dentro de un corte): ${resource.description}`,
+      );
+      continue;
+    }
+    ranges.forEach((range, index) => {
+      remappedResources.push({
+        ...resource,
+        id: ranges.length > 1 ? `${resource.id}-${index}` : resource.id,
+        startSeconds: range.startSeconds,
+        endSeconds: range.endSeconds,
+      });
+    });
+  }
+  if (resourcesDroppedByCuts > 0) {
+    console.log(`[job ${jobId}] ${resourcesDroppedByCuts} recurso(s) descartado(s) por caer dentro de un corte.`);
+  }
+  job.resources = remappedResources;
+
   await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
   return job;
 };

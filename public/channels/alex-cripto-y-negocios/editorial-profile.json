@@ -1,0 +1,6 @@
+{
+  "channelId": "alex-cripto-y-negocios",
+  "hasOnCameraPresenter": true,
+  "allowedResourceTypes": ["graphic", "document-reference", "text-highlight", "broll", "image", "transition", "music", "sfx"],
+  "neverFabricate": ["financial-data"]
+}

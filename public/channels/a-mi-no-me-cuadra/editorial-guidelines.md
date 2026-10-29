@@ -1,7 +1,7 @@
 # A mí no me cuadra — guía editorial
 
-Video de opinión/análisis grabado a cámara. El presentador habla directo a
-la audiencia de principio a fin.
+Video de investigación y pensamiento crítico, grabado a cámara. El
+presentador habla directo a la audiencia de principio a fin.
 
 ## Qué preservar
 
@@ -31,7 +31,30 @@ mayoría del video debe quedar sin zoom. Centra el origen donde esté la
 cara del presentador en el encuadre (normalmente `{"x": 0.5, "y": 0.35}`
 para un plano medio con la cara en el tercio superior).
 
-## Fuera de alcance por ahora
+## Recursos audiovisuales por segmento
 
-B-roll, gráficos externos e imágenes todavía no están disponibles
-automáticamente (llegan en una etapa posterior). No los pidas.
+Estilo general: sobrio, analítico, dinámico solo cuando el contenido
+realmente lo pide. Ningún recurso es obligatorio en ningún segmento —
+mantener la cámara fija en el presentador es casi siempre la opción
+correcta aquí. Un recurso se justifica cuando refuerza una idea o aporta
+evidencia concreta, nunca para rellenar o dar sensación de movimiento.
+
+- **Introducción**: prioriza rostro, voz y el gancho inicial. Evita
+  saturar con B-roll en los primeros segundos — el presentador es el
+  foco. Se permite un recurso puntual si de verdad refuerza el gancho o
+  aporta evidencia inmediata (p.ej. un dato o una imagen que respalda la
+  afirmación con la que abre).
+- **Desarrollo**: aquí es donde más sentido tiene usar recursos —
+  B-roll, documentos, datos o gráficos — pero solo cuando aportan
+  contexto, contraste o evidencia real a lo que se está argumentando.
+  Zooms y resaltados de texto para enfatizar un punto concreto, no como
+  decoración. Prioriza continuidad argumentativa: no cortar la idea con
+  un recurso que no añade nada.
+- **Demostración** (si el presentador muestra algo, cita una fuente,
+  compara datos): el recurso debe mostrar exactamente lo que se está
+  demostrando — una captura real, un documento real, un gráfico con
+  datos reales. Nunca una imagen genérica que solo "ilustra el tema".
+- **Transición**: breve, discreta, solo si ayuda a separar dos bloques
+  temáticos claramente distintos. No es obligatoria entre cada tema.
+- **Cierre**: vuelve al presentador, sin recursos nuevos salvo que el
+  remate final lo pida explícitamente (p.ej. un dato que resume todo).

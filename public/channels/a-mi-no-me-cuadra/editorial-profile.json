@@ -1,0 +1,6 @@
+{
+  "channelId": "a-mi-no-me-cuadra",
+  "hasOnCameraPresenter": true,
+  "allowedResourceTypes": ["broll", "image", "graphic", "document-reference", "text-highlight", "transition", "music", "sfx"],
+  "neverFabricate": []
+}
