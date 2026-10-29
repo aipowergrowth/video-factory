@@ -642,6 +642,17 @@ const processQueue = () => {
     await planEditIfNeeded(jobId, job);
     throwIfCancelled(jobId);
 
+    // Para validar transcripción + plan editorial sin comprometerse a un
+    // render real (p.ej. un video largo nuevo, antes de confiar en el
+    // tiempo/costo que va a tomar) -- job.planOnly=true. Nunca renderiza,
+    // nunca genera MP4, nunca sube a Drive. Por defecto false: el
+    // comportamiento normal no cambia.
+    if (job.planOnly === true) {
+      console.log(`[job ${jobId}] planOnly=true -- transcripción y plan listos, sin renderizar (pedido explícito).`);
+      writeStatus(jobId, { status: "done" });
+      return;
+    }
+
     writeStatus(jobId, { status: "rendering" });
     await runRender(jobId);
     console.log(`[render ${jobId}] terminado OK`);
