@@ -91,3 +91,28 @@ export const remapRangeToOutput = (timeline, range) => {
   }
   return result;
 };
+
+/**
+ * El inverso de remapRangeToOutput, para un solo PUNTO: dado un instante
+ * en tiempo de SALIDA (ya editado), devuelve el instante equivalente en
+ * el video ORIGINAL. Se usa para el CTA obligatorio de mitad de video
+ * (Decisión 6 del auditor): "la mitad" tiene que calcularse sobre la
+ * duración YA EDITADA (que cambia según qué cortó el modelo), no sobre
+ * el original -- y como la IA edita pensando en tiempo original, hay que
+ * traducir ese punto medio de vuelta antes de dárselo.
+ *
+ * Solo server/timeline.mjs lo necesita hoy (el motor de Remotion nunca
+ * va de salida a original) -- no se duplicó en src/engine/timeline.ts a
+ * propósito, para no agregar algo sin un uso real del otro lado.
+ */
+export const mapOutputToSource = (timeline, outputSeconds) => {
+  for (const segment of timeline.segments) {
+    if (outputSeconds >= segment.outputStart - EPSILON && outputSeconds <= segment.outputEnd + EPSILON) {
+      return segment.sourceStart + (outputSeconds - segment.outputStart);
+    }
+  }
+  if (timeline.segments.length === 0) return 0;
+  return outputSeconds < timeline.segments[0].outputStart
+    ? timeline.segments[0].sourceStart
+    : timeline.segments[timeline.segments.length - 1].sourceEnd;
+};

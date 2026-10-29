@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import {
   planEdit,
   parseEditorialResponse,
+  mergeNearbyGaplessCuts,
   __setAnthropicClientForTesting,
 } from "./editorial.mjs";
 
@@ -18,14 +19,31 @@ const fakeCaptions = [
   { text: "hoy vamos a hablar de un tema importante.", startMs: 5000, endMs: 8000, timestampMs: null, confidence: null },
 ];
 
-const makeFakeClient = (responseText) => ({
-  messages: {
-    create: async () => ({
-      content: [{ type: "text", text: responseText }],
-      usage: { input_tokens: 123, output_tokens: 45 },
-    }),
-  },
-});
+// planEdit() ahora siempre hace una segunda llamada chica para el CTA
+// obligatorio de mitad de video (Decisión 6). Para no interferir con
+// pruebas que no son específicamente sobre esa función, la 2da llamada
+// en adelante devuelve "sin recurso, costo cero" -- el plan principal
+// queda exactamente como antes.
+const makeFakeClient = (responseText) => {
+  let callIndex = 0;
+  return {
+    messages: {
+      create: async () => {
+        callIndex += 1;
+        if (callIndex === 1) {
+          return {
+            content: [{ type: "text", text: responseText }],
+            usage: { input_tokens: 123, output_tokens: 45 },
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      },
+    },
+  };
+};
 
 let failures = 0;
 const check = (label, cond) => {
@@ -67,12 +85,14 @@ const check = (label, cond) => {
     { text: "cuerpo", startMs: 600, endMs: 900, timestampMs: null, confidence: null },
   ];
   let capturedPrompt = "";
+  let callIndex = 0;
   __setAnthropicClientForTesting({
     messages: {
       create: async (params) => {
-        capturedPrompt = params.messages[0].content;
+        callIndex += 1;
+        if (callIndex === 1) capturedPrompt = params.messages[0].content;
         return {
-          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], notes: "" }) }],
+          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
           usage: { input_tokens: 1, output_tokens: 1 },
         };
       },
@@ -92,12 +112,14 @@ const check = (label, cond) => {
 // 1c. Sin `transcriptWords` (job con captions manuales, sin transcripción automática): vuelve al modo línea, honesto sobre su propia precisión.
 {
   let capturedPrompt = "";
+  let callIndex = 0;
   __setAnthropicClientForTesting({
     messages: {
       create: async (params) => {
-        capturedPrompt = params.messages[0].content;
+        callIndex += 1;
+        if (callIndex === 1) capturedPrompt = params.messages[0].content;
         return {
-          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], notes: "" }) }],
+          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
           usage: { input_tokens: 1, output_tokens: 1 },
         };
       },
@@ -152,14 +174,16 @@ const makeSequencedFakeClient = (responses) => {
     durationInSeconds: 8,
     destination: "youtube-16-9",
   });
-  check("respuesta vacía por max_tokens: reintenta exactamente una vez (2 llamadas)", calls.length === 2);
+  // 3 llamadas: intento + reintento del plan principal, más la llamada
+  // aparte (siempre ocurre) del CTA obligatorio de mitad de video.
+  check("respuesta vacía por max_tokens: reintenta exactamente una vez (3 llamadas: intento + reintento + CTA de mitad)", calls.length === 3);
   check("respuesta vacía por max_tokens: el reintento pide más max_tokens que el primer intento", calls[1].maxTokens > calls[0].maxTokens);
   // Bug real: el razonamiento interno competía por el mismo presupuesto
   // que max_tokens y a veces se lo comía entero (respuesta vacía en
   // producción). Confirmado con la API real que desactivarlo arregla
   // esto sin perder calidad editorial -- este chequeo evita que alguien
   // lo reactive sin querer en el futuro.
-  check("ambos intentos piden el razonamiento desactivado", calls.every((c) => c.thinking?.type === "disabled"));
+  check("las 3 llamadas piden el razonamiento desactivado", calls.every((c) => c.thinking?.type === "disabled"));
   check("respuesta vacía por max_tokens: el plan final es el del reintento", plan.notes === "ok en el reintento");
   check("respuesta vacía por max_tokens: metrics.retried=true", plan.metrics.retried === true);
   check("respuesta vacía por max_tokens: metrics.stopReason es del último intento", plan.metrics.stopReason === "end_turn");
@@ -269,10 +293,12 @@ const makeSequencedFakeClient = (responses) => {
 // 1j. El perfil de recursos del canal (qué nunca fabricar) y el historial de correcciones llegan al prompt.
 {
   let capturedPrompt = "";
+  let callIndex = 0;
   __setAnthropicClientForTesting({
     messages: {
       create: async (params) => {
-        capturedPrompt = params.messages[0].content;
+        callIndex += 1;
+        if (callIndex === 1) capturedPrompt = params.messages[0].content;
         return {
           content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
           usage: { input_tokens: 1, output_tokens: 1 },
@@ -290,6 +316,80 @@ const makeSequencedFakeClient = (responses) => {
   });
   check("perfil de recursos: el prompt incluye la restricción de nunca fabricar", capturedPrompt.includes("NUNCA inventes ni presentes como real: financial-data"));
   check("historial de correcciones: el prompt lo incluye como referencia", capturedPrompt.includes("B-roll excesivo en la introducción"));
+}
+
+// Decisión 6 del auditor: CTA obligatorio de mitad de video, calculado
+// sobre la línea temporal YA EDITADA (no la ingenua del original).
+{
+  // Video de 10s, un corte de 0-4s -> línea editada: source 4-10 mapea a
+  // output 0-6 (6s de salida). Punto medio de la salida = 3s -> de vuelta
+  // al original: 4 + (3-0) = 7s. Si se usara el punto medio INGENUO del
+  // original (10/2=5s) estaría mal -- cae todavía dentro de lo cortado.
+  let callIndex = 0;
+  let middleCtaPrompt = "";
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        callIndex += 1;
+        if (callIndex === 1) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              cuts: [{ startSeconds: 0, endSeconds: 4, reason: "intro descartada" }],
+              zooms: [],
+              resources: [],
+              notes: "plan principal",
+            }) }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 100, output_tokens: 50 },
+          };
+        }
+        middleCtaPrompt = params.messages[0].content;
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            cuts: [],
+            zooms: [],
+            resources: [{
+              startSeconds: 7.0, endSeconds: 9.0,
+              type: "text-highlight", description: "like y suscríbete",
+              editorialGoal: "emphasis", segment: "development",
+              intensity: "subtle", veracityRequirement: "illustrative-ok", essential: false,
+            }],
+            notes: "",
+          }) }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 20, output_tokens: 10 },
+        };
+      },
+    },
+  });
+  const plan = await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    durationInSeconds: 10,
+    destination: "youtube-16-9",
+  });
+  check("CTA de mitad: el punto medio pasado al modelo es el de la línea EDITADA (7.00s), no el ingenuo (5s)", middleCtaPrompt.includes("7.00 segundos") || middleCtaPrompt.includes("7.00s"));
+  check("CTA de mitad: el recurso devuelto se suma al plan principal", plan.resources.length === 1 && plan.resources[0].description === "like y suscríbete");
+  check("CTA de mitad: sus tokens se suman al total del plan", plan.metrics.inputTokens === 120 && plan.metrics.outputTokens === 60);
+  check("CTA de mitad: queda registrado aparte en metrics.middleCta", plan.metrics.middleCta?.inputTokens === 20);
+}
+
+// Si el modelo no propone ningún CTA de mitad (p.ej. no encaja en ese tramo), no se agrega nada y el resto del plan sigue intacto.
+{
+  let callIndex = 0;
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async () => {
+        callIndex += 1;
+        const text = callIndex === 1
+          ? JSON.stringify({ cuts: [], zooms: [], resources: [{ startSeconds: 1, endSeconds: 2, type: "graphic", description: "x", editorialGoal: "context", segment: "development" }], notes: "" })
+          : JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" });
+        return { content: [{ type: "text", text }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } };
+      },
+    },
+  });
+  const plan = await planEdit({ captions: fakeCaptions, guidelines: "guía", durationInSeconds: 8, destination: "youtube-16-9" });
+  check("sin CTA de mitad propuesto: el plan principal no pierde sus propios recursos", plan.resources.length === 1);
 }
 
 // 2. JSON envuelto en bloque de código markdown (el modelo no debería hacerlo, pero puede pasar).
@@ -313,6 +413,59 @@ const makeSequencedFakeClient = (responses) => {
   const plan = parseEditorialResponse(mixed, 8);
   check("corte inválido descartado, válido se mantiene: queda 1", plan.cuts.length === 1);
   check("corte inválido descartado: el que queda es el correcto", plan.cuts[0].startSeconds === 2);
+}
+
+// Bug real: una corrida propuso 91 cortes, varios de 10-70ms -- ruido
+// sin valor editorial propio. Se descartan con su motivo registrado.
+{
+  const withMicrocuts = JSON.stringify({
+    cuts: [
+      { startSeconds: 2, endSeconds: 5, reason: "corte real, 3s" },
+      { startSeconds: 10, endSeconds: 10.04, reason: "microcorte de 40ms" },
+      { startSeconds: 20, endSeconds: 20.3, reason: "justo en el límite, 0.3s, válido" },
+    ],
+    zooms: [],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(withMicrocuts, 30);
+  check("microcorte (40ms) descartado, los demás sobreviven: quedan 2", plan.cuts.length === 2);
+  check("microcorte descartado: queda registrado en cutIssues con su motivo", plan.cutIssues.some((i) => i.includes("40ms") || i.includes("microcorte sin valor editorial")));
+}
+
+// Fusión de cortes casi contiguos (Decisión 1 del auditor): un hueco
+// menor al umbral SIN palabra real en el medio se fusiona; uno CON
+// palabra real no se toca, aunque sea igual de chico.
+{
+  const cuts = [
+    { id: "a", startSeconds: 125.82, endSeconds: 130.26 },
+    { id: "b", startSeconds: 130.37, endSeconds: 183.38 }, // hueco de 0.11s, sin palabra
+    { id: "c", startSeconds: 183.38, endSeconds: 207.83 }, // tocan exacto, siempre se fusiona
+  ];
+  const words = [
+    { text: "hola", startMs: 0, endMs: 300, timestampMs: null, confidence: null },
+    { text: "mundo", startMs: 300, endMs: 600, timestampMs: null, confidence: null },
+  ];
+  const { cuts: merged, mergeLog } = mergeNearbyGaplessCuts(cuts, words);
+  check("fusión real (caso del auditor): 3 cortes quedan en 1", merged.length === 1);
+  check("fusión real: cubre todo el rango 125.82-207.83", merged[0].startSeconds === 125.82 && merged[0].endSeconds === 207.83);
+  check("fusión real: el log explica la fusión", mergeLog.length >= 1);
+
+  // Ahora el mismo hueco de 0.11s, pero con una palabra real adentro -- NO debe fusionarse.
+  const cutsWithWordInGap = [
+    { id: "a", startSeconds: 125.82, endSeconds: 130.26 },
+    { id: "b", startSeconds: 130.37, endSeconds: 183.38 },
+  ];
+  const wordsInGap = [{ text: "no", startMs: 130300, endMs: 130350, timestampMs: null, confidence: null }];
+  const result2 = mergeNearbyGaplessCuts(cutsWithWordInGap, wordsInGap);
+  check("hueco con palabra real adentro: NO se fusiona (se conservan 2 cortes)", result2.cuts.length === 2);
+  check("hueco con palabra real: el log explica por qué no se fusionó", result2.mergeLog.some((l) => l.includes("NO fusionado")));
+
+  // Sin transcriptWords (job con captions manuales): el hueco de 0.11s NO
+  // se toca (no se puede verificar), pero b y c, que se TOCAN exacto
+  // (hueco=0, no cabe ninguna palabra ahí posible), sí se fusionan
+  // siempre -- con o sin datos por palabra.
+  const result3 = mergeNearbyGaplessCuts(cuts, undefined);
+  check("sin transcriptWords: el hueco de 0.11s no se toca, pero el que se tocan exacto sí se fusiona -> quedan 2", result3.cuts.length === 2);
 }
 
 // 4. Zoom con escala fuera de límites de seguridad se recorta, no se descarta.

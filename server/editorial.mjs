@@ -6,6 +6,7 @@
 // posterior y las guías de cada canal ya se lo dicen al modelo.
 import fs from "node:fs";
 import Anthropic from "@anthropic-ai/sdk";
+import { buildTimeline, mapOutputToSource } from "./timeline.mjs";
 
 const DEFAULT_MODEL = process.env.EDITORIAL_MODEL ?? "claude-sonnet-5";
 // Bug real en producción: con la transcripción palabra por palabra de un
@@ -16,6 +17,16 @@ const DEFAULT_MODEL = process.env.EDITORIAL_MODEL ?? "claude-sonnet-5";
 // reintento con más margen todavía si hace falta (ver planEdit).
 const FIRST_MAX_TOKENS = Number(process.env.EDITORIAL_MAX_TOKENS ?? 16000);
 const RETRY_MAX_TOKENS = Number(process.env.EDITORIAL_RETRY_MAX_TOKENS ?? 32000);
+// Específico de cortes -- no toca el EPSILON genérico de server/timeline.mjs
+// (ese es para fusionar rangos que ya se tocan, no para juzgar si un corte
+// propuesto vale la pena). Un corte más corto que esto casi nunca aísla
+// una muletilla/palabra completa -- es ruido de redondeo del modelo.
+const MIN_CUT_SECONDS = Number(process.env.EDITORIAL_MIN_CUT_SECONDS ?? 0.15);
+// Gaps entre dos cortes propuestos por el modelo que sean MENORES a esto
+// se fusionan (si no hay una palabra real en el medio) -- ver
+// mergeNearbyGaplessCuts(). Mismo valor que MIN_CUT_SECONDS por ahora,
+// pero es una constante aparte a propósito: miden cosas distintas.
+const CUT_MERGE_GAP_SECONDS = Number(process.env.EDITORIAL_CUT_MERGE_GAP_SECONDS ?? 0.15);
 
 let client = null;
 
@@ -128,6 +139,25 @@ ${correctionsText}
 
 ${cutPrecisionInstruction}
 
+## Bloques completos sin valor (problemas técnicos, no muletillas sueltas)
+
+A veces un tramo ENTERO no aporta nada al espectador, no por tener una
+muletilla aquí y otra allá, sino porque todo el tramo es ruido: problemas
+para compartir pantalla, interrupciones de conexión, intentos repetidos
+de configurar Zoom u otra herramienta, conversación técnica que no toca
+el tema del video, y las pausas/repeticiones que esos problemas generan.
+Cuando identifiques uno de estos tramos, proponé UN SOLO corte que cubra
+todo el bloque de punta a punta -- no generes decenas de micro-cortes
+tratando de salvar palabra por palabra dentro de ese tramo. La pregunta
+es simple: "¿este tramo completo, de principio a fin, aporta algo al
+tema del video?" -- si la respuesta es no, se va entero.
+
+Al mismo tiempo, no asumas que un tramo ruidoso se extiende más de lo
+que realmente dura: si una parte del audio ya tiene contenido relevante
+al tema (aunque esté cerca de un tramo técnico), no la incluyas en el
+corte. Cada corte grande debe justificarse con lo que realmente contiene
+ese rango, no con el tramo vecino.
+
 ## Transcripción (${granularity === "word" ? "una palabra" : "una línea"} por entrada, con su rango de tiempo)
 
 ${transcriptAsText(transcript)}
@@ -144,7 +174,26 @@ Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que lo
 
 "essential" tiene una consecuencia real: si un recurso esencial no se consigue, el sistema DETIENE el video entero en vez de continuar sin él -- por eso tiene que reflejar la verdad, ni más ni menos. La pregunta correcta es una sola, por cada recurso: "¿sin este recurso específico, el argumento del video pierde sentido o se vuelve engañoso?". Si sí, essential=true -- no lo evites por precaución, esa es justamente la situación para la que existe el campo. Si la respuesta es no (el recurso ayuda, ilustra, o es una captura real de algo ya mostrado, pero el argumento se sostiene igual sin él), essential=false. No apuntes a ningún número en particular -- ni "casi nunca" ni "varios por video" -- juzga cada recurso por separado con esa pregunta.
 
-El presentador puede pedir like/suscripción/compartir, o invitar a seguirlo en otra red (TikTok, Instagram, etc.), en cualquier momento del video -- al inicio, en medio del desarrollo, o al cierre, no solo al final. Si detectas una de estas invitaciones en la transcripción, es válido acompañarla con un gráfico o animación breve (type: "graphic" o "text-highlight") sincronizado con ese momento exacto, si encaja con el perfil del canal. NUNCA inventes una invitación que el presentador no hizo, y nunca rechaces o reubiques una de estas invitaciones solo por dónde cae en el tiempo -- su ubicación temporal la decide el presentador, no vos.
+## Llamados a la acción (CTA): obligatorios al inicio, a la mitad y al cierre
+
+Regla global, para todos los canales: todo video debe llevar un llamado a
+la acción (like/suscripción/compartir, o seguir al presentador en otra
+red) en TRES momentos -- inicio, mitad y cierre. No es solo "si el
+presentador lo pide": en la mitad del video, el recordatorio visual es
+OBLIGATORIO aunque el presentador no diga nada ahí.
+
+- **Inicio**: si el presentador hace el llamado verbalmente cerca del
+  inicio, acompañalo con un recurso sincronizado con ese momento exacto.
+- **Cierre**: proponé un recurso de CTA cerca del final SIEMPRE, exista o
+  no una invitación verbal ahí -- si existe, sincronizalo con ella; si no
+  existe, igual tiene que aparecer un recordatorio visual breve.
+- **Mitad**: no te pido que lo decidas vos en este paso -- eso se
+  resuelve aparte, después de que definas los cortes (ver más abajo).
+
+Si el presentador hace un llamado a la acción en CUALQUIER otro momento
+del video (no solo inicio/cierre), tratalo igual que siempre: acompañalo
+si corresponde, en cualquier ubicación temporal -- no lo rechaces ni lo
+reubiques solo por dónde cae.
 
 Para estos recursos, usa ÚNICAMENTE nombres de plataforma, usuarios, enlaces o datos de contacto que el presentador haya dicho explícitamente en la transcripción. NUNCA inventes un @usuario, un enlace o un nombre de perfil que no esté en la transcripción -- si el presentador dice "síganme en redes" sin especificar más, el recurso debe quedarse en lo genérico que sí dijo (el nombre de la plataforma, si la nombró), nunca completar el dato faltante. Si no hay información suficiente en la transcripción para generar el recurso correctamente, omítelo.
 
@@ -206,22 +255,40 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
     throw new Error("La IA editorial no devolvió un objeto JSON.");
   }
 
-  const cuts = (Array.isArray(parsed.cuts) ? parsed.cuts : [])
-    .filter(
-      (cut) =>
-        cut &&
-        isFiniteNumber(cut.startSeconds) &&
-        isFiniteNumber(cut.endSeconds) &&
-        cut.endSeconds > cut.startSeconds &&
-        cut.startSeconds >= 0 &&
-        cut.endSeconds <= durationInSeconds + 0.5, // pequeño margen por redondeo
-    )
-    .map((cut, index) => ({
+  // Bug real: una corrida real propuso 91 cortes, varios de 10-70ms --
+  // más cortos que casi cualquier palabra hablada, sin valor editorial
+  // propio (no aíslan una muletilla completa, son ruido de redondeo del
+  // modelo). Se descartan, con su motivo registrado -- igual que los
+  // recursos inválidos, nunca en silencio.
+  const cutIssues = [];
+  const rawCuts = Array.isArray(parsed.cuts) ? parsed.cuts : [];
+  const cuts = [];
+  rawCuts.forEach((cut, index) => {
+    const label = `corte #${index + 1}`;
+    if (
+      !cut ||
+      !isFiniteNumber(cut.startSeconds) ||
+      !isFiniteNumber(cut.endSeconds) ||
+      cut.endSeconds <= cut.startSeconds ||
+      cut.startSeconds < 0 ||
+      cut.endSeconds > durationInSeconds + 0.5 // pequeño margen por redondeo
+    ) {
+      cutIssues.push(`${label}: tiempos inválidos (${cut?.startSeconds}-${cut?.endSeconds}) -- descartado.`);
+      return;
+    }
+    if (cut.endSeconds - cut.startSeconds < MIN_CUT_SECONDS) {
+      cutIssues.push(
+        `${label}: duración ${((cut.endSeconds - cut.startSeconds) * 1000).toFixed(0)}ms, menor al mínimo editorial de ${(MIN_CUT_SECONDS * 1000).toFixed(0)}ms -- descartado (microcorte sin valor editorial propio).`,
+      );
+      return;
+    }
+    cuts.push({
       id: `ai-cut-${index}`,
       startSeconds: cut.startSeconds,
       endSeconds: cut.endSeconds,
       reason: typeof cut.reason === "string" ? cut.reason : undefined,
-    }));
+    });
+  });
 
   const zooms = (Array.isArray(parsed.zooms) ? parsed.zooms : [])
     .filter(
@@ -314,11 +381,70 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
 
   return {
     cuts,
+    cutIssues,
     zooms,
     resources,
     resourceIssues,
     notes: typeof parsed.notes === "string" ? parsed.notes : "",
   };
+};
+
+/**
+ * Fusiona dos cortes propuestos por el modelo cuando el hueco entre ellos
+ * es menor a CUT_MERGE_GAP_SECONDS y en ese hueco no hay ninguna palabra
+ * real de la transcripción -- un hueco así es casi siempre un artefacto
+ * de redondeo (dos cortes decididos por separado que no coincidieron
+ * exacto en el límite), no contenido que valga la pena conservar. Si SÍ
+ * hay una palabra ahí, no se fusiona -- se prioriza no perder contenido
+ * por sobre prolijidad.
+ *
+ * No toca engine/timeline.ts ni server/timeline.mjs (esos son genéricos,
+ * los usan también zooms/recursos/captions) -- esto es exclusivo de
+ * cortes, con su propia constante y su propia lógica consciente de
+ * palabras, que esos módulos no tienen.
+ */
+export const mergeNearbyGaplessCuts = (cuts, transcriptWords) => {
+  const hasWords = Array.isArray(transcriptWords) && transcriptWords.length > 0;
+  const sorted = [...cuts].sort((a, b) => a.startSeconds - b.startSeconds);
+  const merged = [];
+  const mergeLog = [];
+
+  for (const cut of sorted) {
+    const last = merged[merged.length - 1];
+    const gap = last ? cut.startSeconds - last.endSeconds : Infinity;
+
+    if (last && gap >= 0 && gap <= 1e-6) {
+      // Se tocan exacto (o se superponen) -- no hay hueco donde pueda
+      // caber una palabra, fusiona siempre, con o sin transcriptWords.
+      last.endSeconds = Math.max(last.endSeconds, cut.endSeconds);
+      continue;
+    }
+
+    if (last && gap > 1e-6 && gap <= CUT_MERGE_GAP_SECONDS) {
+      if (!hasWords) {
+        mergeLog.push(
+          `NO fusionado: hueco de ${(gap * 1000).toFixed(0)}ms entre ${last.endSeconds.toFixed(2)}s y ${cut.startSeconds.toFixed(2)}s -- sin transcripción por palabra para verificar que no haya contenido ahí, así que no se toca.`,
+        );
+      } else {
+        const wordInGap = transcriptWords.find(
+          (w) => w.endMs / 1000 > last.endSeconds && w.startMs / 1000 < cut.startSeconds,
+        );
+        if (!wordInGap) {
+          mergeLog.push(
+            `fusionado: hueco de ${(gap * 1000).toFixed(0)}ms entre ${last.endSeconds.toFixed(2)}s y ${cut.startSeconds.toFixed(2)}s (sin palabra real en el medio).`,
+          );
+          last.endSeconds = Math.max(last.endSeconds, cut.endSeconds);
+          continue;
+        }
+        mergeLog.push(
+          `NO fusionado: hueco de ${(gap * 1000).toFixed(0)}ms entre ${last.endSeconds.toFixed(2)}s y ${cut.startSeconds.toFixed(2)}s contiene la palabra "${wordInGap.text}" -- se conserva.`,
+        );
+      }
+    }
+    merged.push({ ...cut });
+  }
+
+  return { cuts: merged, mergeLog };
 };
 
 const callModel = async ({ anthropic, prompt, model, maxTokens }) => {
@@ -364,6 +490,130 @@ const callModel = async ({ anthropic, prompt, model, maxTokens }) => {
  * entrada/salida, incluso cuando todo sale bien -- así un fallo similar
  * se diagnostica de inmediato la próxima vez, sin adivinar.
  */
+const MIDDLE_CTA_EXCERPT_PADDING_SECONDS = 20;
+
+/** Entradas de la transcripción (palabras o líneas) dentro de +-padding segundos de un punto. */
+const extractExcerpt = (transcript, centerSeconds, paddingSeconds) =>
+  transcript.filter(
+    (entry) =>
+      entry.endMs / 1000 >= centerSeconds - paddingSeconds &&
+      entry.startMs / 1000 <= centerSeconds + paddingSeconds,
+  );
+
+const buildMiddleCtaPrompt = ({ guidelines, resourceProfile, midpointSourceSeconds, excerpt, granularity, destination }) => {
+  const resourceProfileText = resourceProfile
+    ? `Tipos de recurso permitidos en este canal: ${resourceProfile.allowedResourceTypes?.join(", ") ?? "(todos)"}.` +
+      (resourceProfile.neverFabricate?.length
+        ? ` NUNCA inventes ni presentes como real: ${resourceProfile.neverFabricate.join(", ")}.`
+        : "")
+    : "";
+
+  return `Estás completando un plan de edición de video ya decidido -- los cortes y zooms de este video YA se definieron en un paso anterior. Tu única tarea ahora es el recurso de llamado a la acción (CTA) que va OBLIGATORIAMENTE cerca de la mitad del video ya editado.
+
+Formato de salida: ${destination}.
+
+## Guía editorial de este canal
+
+${guidelines}
+
+${resourceProfileText}
+
+## Dónde cae la mitad
+
+El punto medio del video YA EDITADO (con los cortes ya aplicados), traducido de vuelta al tiempo del video ORIGINAL, es ${midpointSourceSeconds.toFixed(2)} segundos. Acá tenés la transcripción real alrededor de ese punto (tiempo original, ${granularity === "word" ? "una palabra" : "una línea"} por entrada):
+
+${transcriptAsText(excerpt)}
+
+## Tu tarea
+
+Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado en este fragmento, lo más cerca posible de ${midpointSourceSeconds.toFixed(2)}s sin interrumpir una explicación en curso -- podés moverlo unos segundos antes o después dentro de este fragmento si hace falta. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial, independiente de lo que se diga en este tramo puntual. Que sea breve y discreto -- no tape información importante. NUNCA inventes un @usuario, enlace o nombre de perfil que no esté en la transcripción.
+
+## Formato de respuesta
+
+Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, sin bloque de código markdown. Forma exacta (igual que siempre, pero "cuts" y "zooms" vacíos y "resources" con exactamente un elemento):
+
+{
+  "cuts": [],
+  "zooms": [],
+  "resources": [
+    {
+      "startSeconds": number, "endSeconds": number,
+      "type": "${RESOURCE_TYPES.join('" | "')}",
+      "description": "qué mostrar, concreto, máximo 20 palabras",
+      "justification": "fragmento breve del discurso que lo justifica, si lo hay",
+      "editorialGoal": "emphasis",
+      "segment": "development",
+      "intensity": "subtle",
+      "veracityRequirement": "illustrative-ok",
+      "essential": false,
+      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras"
+    }
+  ],
+  "notes": ""
+}`;
+};
+
+/**
+ * Segunda llamada, chica y aparte, solo para el CTA obligatorio de
+ * mitad de video (Decisión 6 del auditor). No se puede resolver en la
+ * misma llamada que decide los cortes: la "mitad" tiene que calcularse
+ * sobre la duración YA EDITADA, que no se conoce hasta que el modelo
+ * terminó de decidir los cortes. Es una capa más sobre el render, no un
+ * requisito -- si falla, se registra y se omite sin romper el resto del
+ * plan (un video sin el CTA de mitad sigue siendo mejor que un job que
+ * se detiene por esto).
+ */
+const planMiddleCta = async ({
+  cuts,
+  captions,
+  transcriptWords,
+  guidelines,
+  resourceProfile,
+  durationInSeconds,
+  destination,
+  model,
+  onLog,
+}) => {
+  const timeline = buildTimeline(durationInSeconds, cuts);
+  const midpointOutputSeconds = timeline.outputDurationInSeconds / 2;
+  const midpointSourceSeconds = mapOutputToSource(timeline, midpointOutputSeconds);
+
+  const useWords = Array.isArray(transcriptWords) && transcriptWords.length > 0;
+  const fullTranscript = useWords ? transcriptWords : captions;
+  const excerpt = extractExcerpt(fullTranscript, midpointSourceSeconds, MIDDLE_CTA_EXCERPT_PADDING_SECONDS);
+  if (excerpt.length === 0) {
+    throw new Error(
+      `sin transcripción alrededor del punto medio (${midpointSourceSeconds.toFixed(2)}s) -- no se puede generar el CTA de mitad.`,
+    );
+  }
+
+  const prompt = buildMiddleCtaPrompt({
+    guidelines,
+    resourceProfile,
+    midpointSourceSeconds,
+    excerpt,
+    granularity: useWords ? "word" : "line",
+    destination,
+  });
+
+  onLog(`CTA de mitad de video: punto medio editado=${midpointOutputSeconds.toFixed(2)}s -> original=${midpointSourceSeconds.toFixed(2)}s, pidiendo recurso...`);
+  const anthropic = getClient();
+  const attempt = await callModel({ anthropic, prompt, model, maxTokens: FIRST_MAX_TOKENS });
+  onLog(
+    `CTA de mitad de video: respuesta stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out (razonamiento=${attempt.thinkingTokens ?? "?"})`,
+  );
+
+  const parsed = parseEditorialResponse(attempt.text, durationInSeconds);
+  if (parsed.resources.length === 0) {
+    onLog("CTA de mitad de video: el modelo no propuso ninguno en este fragmento -- se omite.");
+    return { resource: null, metrics: attempt };
+  }
+  return {
+    resource: { ...parsed.resources[0], id: "ai-resource-middle-cta" },
+    metrics: attempt,
+  };
+};
+
 export const planEdit = async ({
   captions,
   // Opcional: tiempos por palabra (de whisper). Si viene, se usa en vez
@@ -432,17 +682,47 @@ export const planEdit = async ({
     }
   }
 
+  // CTA obligatorio de mitad de video (Decisión 6 del auditor) -- capa
+  // aparte sobre el plan principal, nunca bloquea el resto si falla.
+  let middleCtaMetrics = null;
+  try {
+    const { resource, metrics } = await planMiddleCta({
+      cuts: plan.cuts,
+      captions,
+      transcriptWords,
+      guidelines,
+      resourceProfile,
+      durationInSeconds,
+      destination,
+      model,
+      onLog,
+    });
+    middleCtaMetrics = metrics;
+    if (resource) {
+      plan.resources.push(resource);
+    }
+  } catch (err) {
+    onLog(`CTA de mitad de video falló (${err.message ?? err}) -- se omite, no bloquea el resto del plan.`);
+  }
+
   return {
     ...plan,
     metrics: {
       elapsedMs,
       model,
       stopReason: attempt.stopReason,
-      inputTokens: attempt.inputTokens,
-      outputTokens: attempt.outputTokens,
+      inputTokens: attempt.inputTokens + (middleCtaMetrics?.inputTokens ?? 0),
+      outputTokens: attempt.outputTokens + (middleCtaMetrics?.outputTokens ?? 0),
       thinkingTokens: attempt.thinkingTokens,
       maxTokens: maxTokensUsed,
       retried,
+      middleCta: middleCtaMetrics
+        ? {
+            stopReason: middleCtaMetrics.stopReason,
+            inputTokens: middleCtaMetrics.inputTokens,
+            outputTokens: middleCtaMetrics.outputTokens,
+          }
+        : null,
     },
   };
 };

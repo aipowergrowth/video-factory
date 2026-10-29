@@ -1,7 +1,7 @@
 // Mismos casos que ya se verificaron para src/engine/timeline.ts --
 // server/timeline.mjs es un puerto exacto a JS plano, así que se prueba
 // con los mismos casos para confirmar que no se desvió.
-import { buildTimeline, remapRangeToOutput, normalizeCuts } from "./timeline.mjs";
+import { buildTimeline, remapRangeToOutput, normalizeCuts, mapOutputToSource } from "./timeline.mjs";
 
 let failures = 0;
 const approx = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
@@ -48,6 +48,17 @@ const check = (label, cond) => {
   check("rango que atraviesa el corte: 2 pedazos", r3.length === 2);
   check("pedazo 1: 35-40", r3.length === 2 && approx(r3[0].startSeconds, 35) && approx(r3[0].endSeconds, 40));
   check("pedazo 2: 40-45 (50-55 desplazado -10)", r3.length === 2 && approx(r3[1].startSeconds, 40) && approx(r3[1].endSeconds, 45));
+}
+
+// mapOutputToSource: el inverso, para el CTA obligatorio de mitad de video.
+{
+  const t = buildTimeline(100, [{ startSeconds: 40, endSeconds: 50 }]);
+  // output 0-40 es source 0-40 sin cambios.
+  check("mapOutputToSource antes del corte: sin cambios", approx(mapOutputToSource(t, 20), 20));
+  // output 40-90 es source 50-100 (desplazado +10).
+  check("mapOutputToSource después del corte: +10s", approx(mapOutputToSource(t, 45), 55));
+  // el punto medio real de la salida (90/2=45) cae en source 55, no en el ingenuo 50.
+  check("punto medio de la salida (45) no es el punto medio ingenuo del original (50)", approx(mapOutputToSource(t, t.outputDurationInSeconds / 2), 55));
 }
 
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);

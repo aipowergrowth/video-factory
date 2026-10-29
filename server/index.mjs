@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
-import { planEdit } from "./editorial.mjs";
+import { planEdit, mergeNearbyGaplessCuts } from "./editorial.mjs";
 import { buildTimeline, remapRangeToOutput } from "./timeline.mjs";
 
 const require = createRequire(import.meta.url);
@@ -532,7 +532,21 @@ const planEditIfNeeded = async (jobId, job) => {
   if (plan.notes) {
     console.log(`[job ${jobId}] notas del editor IA: ${plan.notes}`);
   }
-  for (const cut of plan.cuts) {
+  if (plan.cutIssues.length > 0) {
+    console.log(`[job ${jobId}] ${plan.cutIssues.length} corte(s) propuesto(s) se descartaron:`);
+    for (const issue of plan.cutIssues) {
+      console.log(`[job ${jobId}]   ${issue}`);
+    }
+  }
+  // Cortes casi contiguos (sin palabra real en el hueco) se fusionan acá
+  // -- antes de persistir job.cuts, para que el motor nunca vea la
+  // astilla. Si hay transcriptWords los usa para verificar que el hueco
+  // no se come una palabra; sin eso, no fusiona nada (por seguridad).
+  const { cuts: mergedCuts, mergeLog } = mergeNearbyGaplessCuts(plan.cuts, job.transcriptWords);
+  for (const line of mergeLog) {
+    console.log(`[job ${jobId}]   ${line}`);
+  }
+  for (const cut of mergedCuts) {
     console.log(
       `[job ${jobId}]   corte ${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s: ${cut.reason ?? "(sin razón)"}`,
     );
@@ -550,7 +564,7 @@ const planEditIfNeeded = async (jobId, job) => {
     );
   }
 
-  job.cuts = plan.cuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
+  job.cuts = mergedCuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
   job.zooms = plan.zooms.map(({ id, startSeconds, endSeconds, fromScale, toScale, origin }) => ({
     id,
     startSeconds,
