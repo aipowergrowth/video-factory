@@ -170,6 +170,13 @@ export type ChannelProfile = {
     accentColor: string;
     captionBackgroundColor: string;
     captionTextColor: string;
+    /**
+     * Frase de respaldo para un CTA que no trae `displayText` propio --
+     * nunca se usa `resource.description` para esto. Fija por canal
+     * (p.ej. "Dale like y suscríbete a 'A mí no me cuadra'"), sin
+     * enlaces, usuarios ni nombres de perfil inventados.
+     */
+    defaultCtaText: string;
   };
 };
 
@@ -228,6 +235,17 @@ export type Resource = {
   /** Solo en recursos de CTA: posición/porcentaje sobre la línea YA editada. */
   editedSeconds?: number;
   editedPercent?: number;
+  /**
+   * El texto EXACTO que debe verse en pantalla -- NUNCA `description`
+   * (esa es prosa para el editor humano, no contenido para el video; ver
+   * el defecto real que llevó a este campo: el render mostraba cosas
+   * como "Texto resaltado: '...'" literalmente en pantalla). Para
+   * `text-highlight` es obligatorio -- sin esto, el recurso queda
+   * pendiente de 3B (ver `cta-guarantee.mjs#isRenderableIn3A`), nunca se
+   * usa `description` como reemplazo. Para CTA es opcional: si falta, el
+   * motor usa la frase fija del canal (`ChannelProfile.theme.defaultCtaText`).
+   */
+  displayText?: string;
 };
 
 /**

@@ -10,6 +10,7 @@ export const DEFAULT_THEME: ChannelProfile["theme"] = {
   accentColor: "#ffffff",
   captionBackgroundColor: "rgba(0,0,0,0.6)",
   captionTextColor: "#ffffff",
+  defaultCtaText: "Dale like y suscríbete",
 };
 
 const ThemeContext = createContext<ChannelProfile["theme"]>(DEFAULT_THEME);

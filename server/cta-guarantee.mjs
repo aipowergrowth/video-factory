@@ -120,23 +120,31 @@ export const remapResourcesWithCtaGuarantee = ({ resources, timeline, log, exist
 };
 
 /**
- * Qué tipos de recurso puede representar visualmente Fase 3A (dictamen de
- * autorización, 30-oct-2026): CTA (cualquier `type` con `ctaPosition`) y
- * `text-highlight`. MISMA regla en el motor Remotion
- * (`src/engine/VideoEngine.tsx`, filtro de `renderableResources`) -- si
- * una cambia, la otra tiene que cambiar igual (mismo patrón que
- * timeline.mjs/timeline.ts).
+ * Qué recursos puede representar visualmente Fase 3A (dictamen de
+ * autorización, 30-oct-2026): CTA (cualquier `type` con `ctaPosition`,
+ * `displayText` opcional -- si falta, el motor usa la frase fija del
+ * canal) y `text-highlight` CON `displayText` -- un text-highlight SIN
+ * `displayText` no se puede mostrar sin inventar texto, así que no
+ * cuenta como renderizable (defecto real corregido: el motor mostraba
+ * `description`, que es prosa para el editor, no texto para el video).
+ * MISMA regla en el motor Remotion (`src/engine/VideoEngine.tsx`,
+ * filtro de `renderableResources`) -- si una cambia, la otra tiene que
+ * cambiar igual (mismo patrón que timeline.mjs/timeline.ts).
  */
 export const isRenderableIn3A = (resource) =>
-  Boolean(resource.ctaPosition) || resource.type === "text-highlight";
+  Boolean(resource.ctaPosition) ||
+  (resource.type === "text-highlight" && Boolean(resource.displayText));
 
 /**
  * Separa, de la lista final de recursos, los que Fase 3A todavía no
- * puede renderizar (broll/image/graphic sin CTA/document-reference/
- * transition/music/sfx) -- quedan identificados como pendientes de Fase
- * 3B, nunca inventados ni omitidos en silencio (Decisión 5/6B del
- * dictamen). Si alguno es `essential`, lo marca aparte en el log: esa
- * entrega no se puede tratar como completa para ese contenido.
+ * puede renderizar -- quedan identificados como pendientes de Fase 3B,
+ * nunca inventados ni omitidos en silencio (Decisión 5/6B del
+ * dictamen). Dos motivos posibles: el tipo en sí no está soportado
+ * todavía (broll/image/graphic sin CTA/document-reference/transition/
+ * music/sfx), o es un `text-highlight` al que el modelo no le puso
+ * `displayText` (nunca se usa `description` como reemplazo). Si alguno
+ * es `essential`, lo marca aparte en el log: esa entrega no se puede
+ * tratar como completa para ese contenido.
  */
 export const computePendingResources = (resources, log) => {
   const pending = resources
@@ -146,7 +154,10 @@ export const computePendingResources = (resources, log) => {
       type: resource.type,
       description: resource.description,
       essential: resource.essential,
-      reason: `tipo "${resource.type}" todavía no se puede representar visualmente en Fase 3A -- pendiente de Fase 3B (necesita adquisición y/o verificación de un recurso visual real).`,
+      reason:
+        resource.type === "text-highlight"
+          ? 'recurso "text-highlight" sin "displayText" -- el modelo no definió el texto exacto a mostrar; nunca se usa "description" como reemplazo.'
+          : `tipo "${resource.type}" todavía no se puede representar visualmente en Fase 3A -- pendiente de Fase 3B (necesita adquisición y/o verificación de un recurso visual real).`,
     }));
 
   if (pending.length > 0) {

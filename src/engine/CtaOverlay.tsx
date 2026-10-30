@@ -7,13 +7,20 @@ import { useEngineTheme } from "./theme/ThemeContext";
  * Discreto a propósito -- pastilla chica arriba a la derecha, nunca abajo
  * (ahí viven los subtítulos, nunca hay que taparlos) ni en el centro
  * (ahí suele estar el rostro del presentador o, en pantalla compartida,
- * el gráfico). El texto es exactamente `resource.description` -- nunca se
- * inventa ni se completa nada que el plan editorial no haya puesto ahí.
+ * el gráfico).
+ *
+ * El texto es `resource.displayText` -- NUNCA `resource.description`
+ * (esa es prosa para el editor humano, no contenido para el video; ver
+ * el defecto real que motivó este campo). Si el recurso no trae
+ * `displayText` (el modelo no lo propuso), se usa la frase fija del
+ * canal (`theme.defaultCtaText`) en vez de inventar algo o mostrar la
+ * descripción cruda.
  */
 export const CtaOverlay: React.FC<{ resource: Resource }> = ({ resource }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
   const theme = useEngineTheme();
+  const text = resource.displayText ?? theme.defaultCtaText;
   const appear = spring({ frame, fps, config: { damping: 200 } });
   const scale = interpolate(appear, [0, 1], [0.9, 1]);
   const opacity = interpolate(appear, [0, 1], [0, 1]);
@@ -54,7 +61,7 @@ export const CtaOverlay: React.FC<{ resource: Resource }> = ({ resource }) => {
             lineHeight: 1.25,
           }}
         >
-          {resource.description}
+          {text}
         </span>
       </div>
     </AbsoluteFill>

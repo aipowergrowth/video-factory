@@ -4,10 +4,14 @@ import { useEngineTheme } from "./theme/ThemeContext";
 
 /**
  * Texto en pantalla (`type: "text-highlight"`, sin `ctaPosition`). Debe
- * representar FIELMENTE lo que el plan editorial puso en `description` --
- * nunca se le agrega ni se le completa nada acá (Decisión 3 del dictamen
- * de cierre de Fase 3A). Arriba, centrado -- nunca abajo, para no competir
- * nunca con los subtítulos.
+ * representar FIELMENTE lo que el plan editorial puso en `displayText`
+ * -- NUNCA `description` (esa es prosa para el editor humano, no
+ * contenido para el video; defecto real que motivó este campo: el
+ * render mostraba cosas como "Texto resaltado: '...'" literalmente en
+ * pantalla). `VideoEngine.tsx` ya garantiza que este componente solo
+ * recibe recursos CON `displayText` -- si no lo trae, queda pendiente
+ * de 3B en vez de llegar acá (ver cta-guarantee.mjs#isRenderableIn3A).
+ * Arriba, centrado -- nunca abajo, para no competir con los subtítulos.
  */
 export const TextHighlightOverlay: React.FC<{ resource: Resource }> = ({
   resource,
@@ -45,7 +49,7 @@ export const TextHighlightOverlay: React.FC<{ resource: Resource }> = ({
             textShadow: "0 2px 6px rgba(0,0,0,0.6)",
           }}
         >
-          {resource.description}
+          {resource.displayText}
         </span>
       </div>
     </AbsoluteFill>

@@ -60,11 +60,16 @@ export const VideoEngine: React.FC<VideoEngineProps> = ({
   // remapRangeToOutput (y la reubicación por corte, si hacía falta) antes
   // de persistir el job. Volver a remapear acá aplicaría el
   // desplazamiento de los cortes dos veces. Fase 3A solo renderiza CTA
-  // (cualquier `type` con `ctaPosition`) y `text-highlight` -- el resto
-  // quedó en `job.pendingResources`, que este motor no lee (es solo para
-  // el informe humano).
+  // (cualquier `type` con `ctaPosition`) y `text-highlight` CON
+  // `displayText` -- un text-highlight sin `displayText` no se puede
+  // mostrar sin inventar texto, así que queda en `job.pendingResources`
+  // (el servidor ya lo clasificó así -- MISMA regla acá, ver
+  // cta-guarantee.mjs#isRenderableIn3A). `job.pendingResources` es solo
+  // para el informe humano, este motor nunca lo lee.
   const renderableResources = (job.resources ?? []).filter(
-    (resource) => Boolean(resource.ctaPosition) || resource.type === "text-highlight",
+    (resource) =>
+      Boolean(resource.ctaPosition) ||
+      (resource.type === "text-highlight" && Boolean(resource.displayText)),
   );
 
   const captionsInOutputTime: Caption[] = (job.captions ?? []).flatMap(

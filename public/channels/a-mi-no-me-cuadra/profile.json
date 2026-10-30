@@ -4,6 +4,7 @@
   "theme": {
     "accentColor": "#E53935",
     "captionBackgroundColor": "rgba(0,0,0,0.6)",
-    "captionTextColor": "#ffffff"
+    "captionTextColor": "#ffffff",
+    "defaultCtaText": "Dale like y suscríbete a 'A mí no me cuadra'"
   }
 }

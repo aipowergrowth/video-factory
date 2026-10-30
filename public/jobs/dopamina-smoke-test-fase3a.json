@@ -1372,7 +1372,8 @@
       "essential": false,
       "ctaPosition": "start",
       "editedSeconds": 2,
-      "editedPercent": 7.1
+      "editedPercent": 7.1,
+      "displayText": "Síguenos para más contenido como este"
     },
     {
       "id": "text-highlight-test",
@@ -1384,7 +1385,8 @@
       "segment": "development",
       "intensity": "moderate",
       "veracityRequirement": "must-be-real",
-      "essential": false
+      "essential": false,
+      "displayText": "Dr. Cameron Sepah, UCSF -- creador del concepto \"Detox de dopamina\""
     }
   ],
   "ctaIssues": [],

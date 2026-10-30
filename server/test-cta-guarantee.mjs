@@ -145,11 +145,26 @@ const noopLog = () => {};
 // --- Fase 3A (autorizada 30-oct-2026): qué se renderiza, qué queda pendiente de 3B ---
 
 {
-  check("CTA (cualquier type) es renderizable en 3A", isRenderableIn3A({ type: "graphic", ctaPosition: "start" }));
-  check("text-highlight sin CTA es renderizable en 3A", isRenderableIn3A({ type: "text-highlight" }));
+  check("CTA (cualquier type) es renderizable en 3A, aunque no traiga displayText", isRenderableIn3A({ type: "graphic", ctaPosition: "start" }));
+  check("text-highlight CON displayText es renderizable en 3A", isRenderableIn3A({ type: "text-highlight", displayText: "hola" }));
+  check("text-highlight SIN displayText NO es renderizable (nunca se usa description)", !isRenderableIn3A({ type: "text-highlight", description: "texto resaltado: algo" }));
   check("broll sin CTA NO es renderizable en 3A", !isRenderableIn3A({ type: "broll" }));
   check("document-reference NO es renderizable en 3A", !isRenderableIn3A({ type: "document-reference" }));
   check("graphic sin CTA NO es renderizable en 3A", !isRenderableIn3A({ type: "graphic" }));
+}
+
+{
+  // Defecto real corregido: un text-highlight sin displayText queda
+  // pendiente con un motivo específico (no el genérico de "tipo no
+  // soportado"), y nunca se usa description como si fuera el texto.
+  const logs = [];
+  const pending = computePendingResources(
+    [{ id: "th-sin-texto", type: "text-highlight", description: "Texto resaltado: 'algo que dijo el presentador'", essential: false }],
+    (msg) => logs.push(msg),
+  );
+  check("text-highlight sin displayText: queda pendiente", pending.length === 1 && pending[0].id === "th-sin-texto");
+  check("text-highlight sin displayText: motivo específico (no el genérico de tipo no soportado)", pending[0].reason.includes("displayText") && !pending[0].reason.includes("Fase 3B (necesita adquisición"));
+  check("text-highlight sin displayText: pendingResources.description sigue siendo la description original (solo para el informe, nunca para mostrar en video)", pending[0].description === "Texto resaltado: 'algo que dijo el presentador'");
 }
 
 {

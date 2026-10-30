@@ -837,6 +837,58 @@ const makeSequencedFakeClient = (responses) => {
   check("CTA de inicio extendido: queda registrado en ctaDurationAdjustments con 'extendido'", plan.ctaDurationAdjustments.some((a) => a.includes("extendido")));
 }
 
+// 4f. Defecto real corregido: el motor mostraba `description` (prosa
+// para el editor) en pantalla en vez de `displayText` (el texto real).
+// parseEditorialResponse debe tomar `displayText` del modelo tal cual,
+// sin tocarlo, y nunca completarlo con `description` si falta.
+{
+  const withDisplayText = JSON.stringify({
+    cuts: [], zooms: [],
+    resources: [
+      {
+        startSeconds: 10, endSeconds: 15,
+        type: "text-highlight",
+        description: "Texto resaltado: 'cifra exacta que dijo el presentador'",
+        displayText: "cifra exacta que dijo el presentador",
+        editorialGoal: "comprehension", segment: "development",
+      },
+      {
+        startSeconds: 20, endSeconds: 25,
+        type: "graphic",
+        description: "Botón de CTA de cierre",
+        editorialGoal: "emphasis", segment: "closing",
+        ctaPosition: "end",
+        displayText: "Dale like y suscríbete",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(withDisplayText, 200);
+  const th = plan.resources.find((r) => r.type === "text-highlight");
+  const cta = plan.resources.find((r) => r.ctaPosition === "end");
+  check("text-highlight: displayText se parsea tal cual", th && th.displayText === "cifra exacta que dijo el presentador");
+  check("text-highlight: description se conserva aparte, nunca se mezcla con displayText", th && th.description === "Texto resaltado: 'cifra exacta que dijo el presentador'");
+  check("CTA con displayText propio: se conserva", cta && cta.displayText === "Dale like y suscríbete");
+}
+
+{
+  // Sin displayText en absoluto: queda undefined, nunca se completa con description.
+  const withoutDisplayText = JSON.stringify({
+    cuts: [], zooms: [],
+    resources: [
+      {
+        startSeconds: 10, endSeconds: 15,
+        type: "text-highlight",
+        description: "Texto resaltado: 'algo'",
+        editorialGoal: "comprehension", segment: "development",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(withoutDisplayText, 200);
+  check("sin displayText: queda undefined (nunca se usa description como reemplazo)", plan.resources[0].displayText === undefined);
+}
+
 // 5. Respuesta que no es JSON en absoluto: debe fallar con un error claro, no silenciosamente.
 {
   let threw = false;

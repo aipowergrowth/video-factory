@@ -4,6 +4,7 @@
   "theme": {
     "accentColor": "#F2B705",
     "captionBackgroundColor": "rgba(0,0,0,0.6)",
-    "captionTextColor": "#ffffff"
+    "captionTextColor": "#ffffff",
+    "defaultCtaText": "Dale like y suscríbete a 'Alex Cripto y Negocios'"
   }
 }

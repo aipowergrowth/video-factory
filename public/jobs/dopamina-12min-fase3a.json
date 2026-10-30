@@ -1479,7 +1479,8 @@
       "intensity": "moderate",
       "veracityRequirement": "illustrative-ok",
       "essential": false,
-      "provenanceNotes": "texto generado internamente, no requiere licencia"
+      "provenanceNotes": "texto generado internamente, no requiere licencia",
+      "displayText": "La dopamina del ejercicio al aire libre dura más que la del scroll o el azúcar"
     },
     {
       "id": "ai-resource-5",
@@ -1510,7 +1511,8 @@
       "provenanceNotes": "gráfico genérico de canal, sin derechos externos",
       "ctaPosition": "end",
       "editedSeconds": 738.08,
-      "editedPercent": 98
+      "editedPercent": 98,
+      "displayText": "Dale like y suscríbete a 'A mí no me cuadra'"
     },
     {
       "id": "ai-resource-middle-cta",
@@ -1527,7 +1529,8 @@
       "provenanceNotes": "gráfico propio del canal, sin licencia externa necesaria",
       "ctaPosition": "middle",
       "editedSeconds": 379.69,
-      "editedPercent": 50.4
+      "editedPercent": 50.4,
+      "displayText": "Dale like y suscríbete"
     },
     {
       "id": "ai-resource-start-cta",
@@ -1544,7 +1547,8 @@
       "provenanceNotes": "gráfico genérico de canal, sin licencia externa requerida",
       "ctaPosition": "start",
       "editedSeconds": 23.71,
-      "editedPercent": 3.1
+      "editedPercent": 3.1,
+      "displayText": "Suscríbete y activa la campana"
     }
   ],
   "ctaIssues": [],

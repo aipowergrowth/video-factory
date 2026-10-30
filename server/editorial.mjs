@@ -192,6 +192,12 @@ Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que lo
 
 "essential" tiene una consecuencia real: si un recurso esencial no se consigue, el sistema DETIENE el video entero en vez de continuar sin él -- por eso tiene que reflejar la verdad, ni más ni menos. La pregunta correcta es una sola, por cada recurso: "¿sin este recurso específico, el argumento del video pierde sentido o se vuelve engañoso?". Si sí, essential=true -- no lo evites por precaución, esa es justamente la situación para la que existe el campo. Si la respuesta es no (el recurso ayuda, ilustra, o es una captura real de algo ya mostrado, pero el argumento se sostiene igual sin él), essential=false. No apuntes a ningún número en particular -- ni "casi nunca" ni "varios por video" -- juzga cada recurso por separado con esa pregunta.
 
+"displayText" es el texto EXACTO que va a aparecer escrito en pantalla -- distinto de "description", que es tu nota para quien produzca el recurso, nunca algo que se muestre. Nunca escribas en "displayText" algo como "Texto resaltado: ..." o una explicación de qué es el recurso -- solo el texto final, tal cual se vería en el video.
+
+- Para "text-highlight": "displayText" debe ser SOLO palabras, cifras o nombres que el presentador diga literalmente en la transcripción -- nunca una paráfrasis ni un resumen tuyo. Si no hay una frase concreta y breve del presentador que puedas citar así, no propongas el recurso.
+- Para cualquier recurso con "ctaPosition" (CTA): "displayText" es una frase corta (como un cartel, no una oración larga) que invite a la acción -- nunca un enlace, un @usuario ni un nombre de perfil inventado. Si el presentador no dio pie a una frase concreta, podés omitir "displayText" en el CTA (el sistema usa una frase fija del canal) -- nunca inventes un dato de contacto para rellenarlo.
+- Para los demás tipos de recurso (broll, image, graphic, document-reference, transition, music, sfx), "displayText" no aplica -- no lo incluyas.
+
 ## Llamados a la acción (CTA): tu responsabilidad acá es el cierre y el inicio SOLO si hay invitación verbal
 
 Regla global, para todos los canales: todo video debe llevar un llamado a
@@ -261,7 +267,8 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
       "veracityRequirement": "${VERACITY_REQUIREMENTS.join('" | "')}",
       "essential": boolean,
       "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras",
-      "ctaPosition": "start" | "end" | null
+      "ctaPosition": "start" | "end" | null,
+      "displayText": "texto EXACTO a mostrar en pantalla (solo text-highlight y CTA, ver arriba) | null"
     }
   ],
   "notes": "resumen breve de tu criterio editorial para que un humano lo revise"
@@ -506,6 +513,9 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
         // Identifica cuál de los CTA obligatorios es (si lo es) -- se usa
         // después para garantizar que nunca desaparezcan en silencio.
         ctaPosition: ["start", "end", "middle"].includes(resource.ctaPosition) ? resource.ctaPosition : undefined,
+        // El texto EXACTO que se muestra en pantalla -- NUNCA
+        // `description` (esa es prosa para el editor, ver Fase 3A).
+        displayText: typeof resource.displayText === "string" ? resource.displayText : undefined,
       },
       durationInSeconds,
     );
@@ -693,7 +703,7 @@ ${transcriptAsText(excerpt)}
 
 ## Tu tarea
 
-Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado en este fragmento, lo más cerca posible de ${midpointSourceSeconds.toFixed(2)}s sin interrumpir una explicación en curso -- podés moverlo unos segundos antes o después dentro de este fragmento si hace falta. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial, independiente de lo que se diga en este tramo puntual. Que sea breve y discreto: entre 3 y 8 segundos, un recordatorio puntual, nunca un tramo largo del discurso ni algo tan corto que resulte imperceptible -- no tape información importante. NUNCA inventes un @usuario, enlace o nombre de perfil que no esté en la transcripción.
+Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado en este fragmento, lo más cerca posible de ${midpointSourceSeconds.toFixed(2)}s sin interrumpir una explicación en curso -- podés moverlo unos segundos antes o después dentro de este fragmento si hace falta. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial, independiente de lo que se diga en este tramo puntual. Que sea breve y discreto: entre 3 y 8 segundos, un recordatorio puntual, nunca un tramo largo del discurso ni algo tan corto que resulte imperceptible -- no tape información importante. "displayText" es la frase corta que se muestra en pantalla (no una explicación tuya) -- nunca inventes un @usuario, enlace o nombre de perfil; si no hay pie para una frase concreta, omití "displayText" (el sistema usa una frase fija del canal).
 
 ## Formato de respuesta
 
@@ -713,7 +723,8 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
       "intensity": "subtle",
       "veracityRequirement": "illustrative-ok",
       "essential": false,
-      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras"
+      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras",
+      "displayText": "frase corta a mostrar en pantalla | null"
     }
   ],
   "notes": ""
@@ -746,7 +757,7 @@ ${transcriptAsText(excerpt)}
 
 ## Tu tarea
 
-Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado DESPUÉS de que termine el gancho inicial (la idea, pregunta o afirmación con la que arranca el video) -- nunca interrumpiéndolo, nunca en el primer segundo. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial. Que sea breve y discreto: entre 3 y 15 segundos, un recordatorio puntual -- no tape información importante ni el gancho. NUNCA inventes un @usuario, enlace o nombre de perfil que no esté en la transcripción.
+Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado DESPUÉS de que termine el gancho inicial (la idea, pregunta o afirmación con la que arranca el video) -- nunca interrumpiéndolo, nunca en el primer segundo. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial. Que sea breve y discreto: entre 3 y 15 segundos, un recordatorio puntual -- no tape información importante ni el gancho. "displayText" es la frase corta que se muestra en pantalla (no una explicación tuya) -- nunca inventes un @usuario, enlace o nombre de perfil; si no hay pie para una frase concreta, omití "displayText" (el sistema usa una frase fija del canal).
 
 ## Formato de respuesta
 
@@ -766,7 +777,8 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
       "intensity": "subtle",
       "veracityRequirement": "illustrative-ok",
       "essential": false,
-      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras"
+      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras",
+      "displayText": "frase corta a mostrar en pantalla | null"
     }
   ],
   "notes": ""
