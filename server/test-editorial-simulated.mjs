@@ -13,6 +13,7 @@ import {
   clampCtaDuration,
   __setAnthropicClientForTesting,
 } from "./editorial.mjs";
+import { buildTimeline } from "./timeline.mjs";
 
 const fakeCaptions = [
   { text: "Hola, bienvenidos al canal.", startMs: 0, endMs: 2000, timestampMs: null, confidence: null },
@@ -513,6 +514,57 @@ const makeSequencedFakeClient = (responses) => {
   check("sin transcriptWords: el hueco de 0.11s no se toca, pero el que se tocan exacto sí se fusiona -> quedan 2", result3.cuts.length === 2);
 }
 
+// 3b. Corrección menor B del auditor (cierre de validación screen-share,
+// 30-oct-2026): cortes anidados o solapados (gap NEGATIVO) deben
+// unificarse en la lista final -- bug real encontrado: la condición
+// original exigía `gap >= 0`, dejando un corte anidado listado aparte
+// como si fueran dos cortes distintos, en vez de uno solo.
+{
+  // Anidado: b (20-30) cae entero dentro de a (10-50).
+  const nested = [
+    { id: "a", startSeconds: 10, endSeconds: 50 },
+    { id: "b", startSeconds: 20, endSeconds: 30 },
+  ];
+  const resultNested = mergeNearbyGaplessCuts(nested, undefined);
+  check("corte anidado: se unifica en 1 solo corte", resultNested.cuts.length === 1);
+  check("corte anidado: el unificado cubre todo 10-50 (el rango externo, no se achica)", resultNested.cuts[0].startSeconds === 10 && resultNested.cuts[0].endSeconds === 50);
+  check("corte anidado: queda registrado en el log", resultNested.mergeLog.some((l) => l.includes("solapado/anidado")));
+
+  // Solapado parcial: a (10-30) y b (25-40) se cruzan sin que uno esté
+  // adentro del otro -- el unificado debe cubrir la unión completa.
+  const overlapping = [
+    { id: "a", startSeconds: 10, endSeconds: 30 },
+    { id: "b", startSeconds: 25, endSeconds: 40 },
+  ];
+  const resultOverlap = mergeNearbyGaplessCuts(overlapping, undefined);
+  check("cortes solapados (parcial): se unifican en 1 solo corte", resultOverlap.cuts.length === 1);
+  check("cortes solapados: el unificado cubre la unión completa (10-40)", resultOverlap.cuts[0].startSeconds === 10 && resultOverlap.cuts[0].endSeconds === 40);
+
+  // Tres cortes: dos se solapan entre sí, el tercero está lejos -- solo
+  // los dos solapados se unifican, el tercero queda separado.
+  const mixed = [
+    { id: "a", startSeconds: 10, endSeconds: 30 },
+    { id: "b", startSeconds: 15, endSeconds: 20 }, // anidado en a
+    { id: "c", startSeconds: 100, endSeconds: 110 }, // lejos, no se toca
+  ];
+  const resultMixed = mergeNearbyGaplessCuts(mixed, undefined);
+  check("solapado + corte lejano: quedan 2 cortes (el unificado + el lejano)", resultMixed.cuts.length === 2);
+  check("solapado + corte lejano: el corte lejano no se tocó", resultMixed.cuts.some((c) => c.startSeconds === 100 && c.endSeconds === 110));
+
+  // La duración editada tiene que ser la MISMA se le pase a buildTimeline
+  // la lista cruda (con el anidado listado aparte) o la ya unificada --
+  // normalizeCuts (dentro de buildTimeline) ya resolvía esto internamente
+  // incluso antes de esta corrección; lo que cambia es solo la prolijidad
+  // de la lista final de cortes, nunca la duración calculada.
+  const videoDuration = 200;
+  const timelineFromRaw = buildTimeline(videoDuration, nested);
+  const timelineFromMerged = buildTimeline(videoDuration, resultNested.cuts);
+  check(
+    "duración editada: igual con la lista cruda (anidada) o con la ya unificada",
+    timelineFromRaw.outputDurationInSeconds === timelineFromMerged.outputDurationInSeconds,
+  );
+}
+
 // 4. Zoom con escala fuera de límites de seguridad se recorta, no se descarta.
 {
   const extreme = JSON.stringify({
@@ -576,6 +628,54 @@ const makeSequencedFakeClient = (responses) => {
 
   const noCta = clampCtaDuration({ startSeconds: 50, endSeconds: 200 });
   check("recurso sin ctaPosition: clampCtaDuration no lo toca aunque sea muy largo", !noCta.adjusted && noCta.resource.endSeconds === 200);
+}
+
+// 4d. Corrección menor A del auditor (cierre de validación screen-share,
+// 30-oct-2026): duración mínima de 3s para los CTA, incluyendo
+// planMiddleCta. Se extiende hacia ADELANTE (nunca se adelanta el
+// inicio del llamado) salvo que no haya espacio porque el CTA cae
+// pegado al final del video -- ahí se extiende hacia atrás sin pasar de 0.
+{
+  const tooShort = clampCtaDuration({ startSeconds: 10, endSeconds: 11, ctaPosition: "end" }, 200);
+  check("CTA de 1s (bajo el mínimo): se extiende a 3s", tooShort.adjusted && tooShort.resource.endSeconds - tooShort.resource.startSeconds === 3);
+  check("CTA de 1s extendido: se extiende hacia adelante, el inicio NO se mueve", tooShort.resource.startSeconds === 10);
+
+  const nearEnd = clampCtaDuration({ startSeconds: 199, endSeconds: 199.5, ctaPosition: "end" }, 200);
+  check("CTA pegado al final del video (sin espacio hacia adelante): se extiende hacia atrás", nearEnd.adjusted && nearEnd.resource.endSeconds === 200);
+  check("CTA pegado al final: queda con exactamente 3s, sin pasarse de la duración del video", nearEnd.resource.endSeconds - nearEnd.resource.startSeconds === 3 && nearEnd.resource.startSeconds === 197);
+
+  const exactlyMin = clampCtaDuration({ startSeconds: 10, endSeconds: 13, ctaPosition: "start" }, 200);
+  check("CTA de exactamente 3s: no se toca", !exactlyMin.adjusted);
+
+  const middleTooShort = clampCtaDuration({ startSeconds: 10, endSeconds: 11.5, ctaPosition: "middle" }, 200);
+  check("CTA de mitad de 1.5s (bajo el mínimo): se extiende a 3s igual que start/end", middleTooShort.adjusted && middleTooShort.resource.endSeconds - middleTooShort.resource.startSeconds === 3);
+
+  // Sin durationInSeconds conocido (nunca debería pasar en producción,
+  // pero no debe romper): extiende hacia adelante sin chequear el límite.
+  const noDuration = clampCtaDuration({ startSeconds: 10, endSeconds: 11, ctaPosition: "end" });
+  check("CTA corto sin durationInSeconds: igual se extiende hacia adelante", noDuration.adjusted && noDuration.resource.endSeconds === 13);
+}
+
+// 4e. Duración mínima integrada en parseEditorialResponse y en
+// planMiddleCta (vía planEdit) -- no solo en clampCtaDuration aislado.
+{
+  const shortCta = JSON.stringify({
+    cuts: [],
+    zooms: [],
+    resources: [
+      {
+        startSeconds: 5, endSeconds: 6,
+        type: "graphic", description: "recordatorio brevísimo",
+        editorialGoal: "emphasis", segment: "intro",
+        ctaPosition: "start",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(shortCta, 200);
+  const startCta = plan.resources.find((r) => r.ctaPosition === "start");
+  check("CTA de inicio de 1s vía parseEditorialResponse: se extiende a 3s", startCta && startCta.endSeconds - startCta.startSeconds === 3);
+  check("CTA de inicio extendido: queda registrado en ctaDurationAdjustments con 'extendido'", plan.ctaDurationAdjustments.some((a) => a.includes("extendido")));
 }
 
 // 5. Respuesta que no es JSON en absoluto: debe fallar con un error claro, no silenciosamente.
