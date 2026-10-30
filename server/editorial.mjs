@@ -22,6 +22,11 @@ const RETRY_MAX_TOKENS = Number(process.env.EDITORIAL_RETRY_MAX_TOKENS ?? 32000)
 // propuesto vale la pena). Un corte más corto que esto casi nunca aísla
 // una muletilla/palabra completa -- es ruido de redondeo del modelo.
 const MIN_CUT_SECONDS = Number(process.env.EDITORIAL_MIN_CUT_SECONDS ?? 0.15);
+// Corrección del dictamen de cierre de talking-head (30-oct-2026): un
+// zoom de menos de 2s apenas se percibe como énfasis -- se extiende
+// hacia adelante igual que un CTA corto; solo se descarta si no hay
+// espacio para extenderlo ni dentro de los límites del video.
+const MIN_ZOOM_SECONDS = Number(process.env.EDITORIAL_MIN_ZOOM_SECONDS ?? 2);
 // Gaps entre dos cortes propuestos por el modelo que sean MENORES a esto
 // se fusionan (si no hay una palabra real en el medio) -- ver
 // mergeNearbyGaplessCuts(). Mismo valor que MIN_CUT_SECONDS por ahora,
@@ -187,24 +192,25 @@ Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que lo
 
 "essential" tiene una consecuencia real: si un recurso esencial no se consigue, el sistema DETIENE el video entero en vez de continuar sin él -- por eso tiene que reflejar la verdad, ni más ni menos. La pregunta correcta es una sola, por cada recurso: "¿sin este recurso específico, el argumento del video pierde sentido o se vuelve engañoso?". Si sí, essential=true -- no lo evites por precaución, esa es justamente la situación para la que existe el campo. Si la respuesta es no (el recurso ayuda, ilustra, o es una captura real de algo ya mostrado, pero el argumento se sostiene igual sin él), essential=false. No apuntes a ningún número en particular -- ni "casi nunca" ni "varios por video" -- juzga cada recurso por separado con esa pregunta.
 
-## Llamados a la acción (CTA): tu responsabilidad es inicio y cierre, NADA de mitad
+## Llamados a la acción (CTA): tu responsabilidad acá es el cierre y el inicio SOLO si hay invitación verbal
 
 Regla global, para todos los canales: todo video debe llevar un llamado a
 la acción (like/suscripción/compartir, o seguir al presentador en otra
-red) en TRES momentos -- inicio, mitad y cierre. De esos tres, en este
-paso SOLO te pido inicio y cierre. El de mitad lo genera un paso
-completamente aparte, automático, DESPUÉS de este -- no es tarea tuya:
-no propongas ningún recurso para cubrirlo, ni siquiera un recordatorio
-genérico "por si acaso". Si lo hacés, se duplica con el que genera ese
-otro paso y el sistema lo descarta.
+red) en TRES momentos -- inicio, mitad y cierre -- cada uno OBLIGATORIO
+exista o no una invitación verbal del presentador ahí. Mitad e inicio
+SIN invitación verbal se resuelven en pasos completamente aparte,
+automáticos, DESPUÉS de este -- no son tarea tuya en este paso: no
+propongas ningún recurso genérico "por si acaso" para cubrirlos. Si lo
+hacés, se duplica con el que genera ese otro paso y el sistema lo
+descarta.
 
-- **Inicio**: si el presentador hace el llamado verbalmente cerca del
-  inicio (like, suscripción, o invitación a seguirlo en otra red --
-  TikTok, Instagram, cualquiera que nombre), acompañalo con un recurso
-  sincronizado con ese momento exacto, con "ctaPosition": "start". Que
-  dure lo que dura la invitación verbal, entre 3 y 15 segundos -- nunca
-  menos de 3 (sería imperceptible) ni el resto del discurso que sigue
-  después.
+- **Inicio**: proponé un recurso de CTA cerca del inicio SOLO SI el
+  presentador hace el llamado verbalmente ahí (like, suscripción, o
+  invitación a seguirlo en otra red -- TikTok, Instagram, cualquiera que
+  nombre) -- sincronizalo con ese momento exacto y marcalo con
+  "ctaPosition": "start". Si NO hay invitación verbal cerca del inicio,
+  no propongas nada para esto: un paso aparte elige un momento adecuado
+  después del gancho inicial, automáticamente.
 - **Cierre**: proponé un recurso de CTA cerca del final SIEMPRE, exista o
   no una invitación verbal ahí -- si existe, sincronizalo con ella y que
   dure lo que dura esa invitación; si no existe, que sea un recordatorio
@@ -215,6 +221,10 @@ otro paso y el sistema lo descarta.
   recurso no puede representar ambas sin resultar repetitivo, proponé
   dos, cada uno con "ctaPosition": "end". No fuerces un número fijo:
   dejá que la cantidad real de invitaciones del presentador lo decida.
+
+Cuando SÍ propongas un CTA de inicio (porque hubo invitación verbal),
+que dure entre 3 y 15 segundos -- nunca menos de 3 (sería imperceptible)
+ni el resto del discurso que sigue después.
 
 El campo "ctaPosition" (string: "start" | "end", opcional) identifica
 cuál de los CTA obligatorios es cada recurso -- se usa después para
@@ -378,22 +388,48 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
     });
   });
 
-  const zooms = (Array.isArray(parsed.zooms) ? parsed.zooms : [])
-    .filter(
-      (zoom) =>
-        zoom &&
-        isFiniteNumber(zoom.startSeconds) &&
-        isFiniteNumber(zoom.endSeconds) &&
-        zoom.endSeconds > zoom.startSeconds &&
-        isFiniteNumber(zoom.fromScale) &&
-        isFiniteNumber(zoom.toScale) &&
-        zoom.fromScale > 0 &&
-        zoom.toScale > 0,
-    )
-    .map((zoom, index) => ({
+  const zoomIssues = [];
+  const rawZooms = Array.isArray(parsed.zooms) ? parsed.zooms : [];
+  const zooms = [];
+  rawZooms.forEach((zoom, index) => {
+    const label = `zoom #${index + 1}`;
+    if (
+      !zoom ||
+      !isFiniteNumber(zoom.startSeconds) ||
+      !isFiniteNumber(zoom.endSeconds) ||
+      zoom.endSeconds <= zoom.startSeconds ||
+      !isFiniteNumber(zoom.fromScale) ||
+      !isFiniteNumber(zoom.toScale) ||
+      zoom.fromScale <= 0 ||
+      zoom.toScale <= 0
+    ) {
+      zoomIssues.push(`${label}: forma inválida -- descartado.`);
+      return;
+    }
+
+    let startSeconds = zoom.startSeconds;
+    let endSeconds = zoom.endSeconds;
+    if (endSeconds - startSeconds < MIN_ZOOM_SECONDS) {
+      const desiredEnd = startSeconds + MIN_ZOOM_SECONDS;
+      if (isFiniteNumber(durationInSeconds) && desiredEnd > durationInSeconds) {
+        // No hay espacio para extenderlo ni usando el resto del video --
+        // un zoom tan corto no aporta énfasis real, se descarta en vez
+        // de dejarlo imperceptible.
+        zoomIssues.push(
+          `${label}: duración ${(endSeconds - startSeconds).toFixed(2)}s, menor al mínimo editorial de ${MIN_ZOOM_SECONDS}s y sin espacio para extenderlo dentro del video -- descartado.`,
+        );
+        return;
+      }
+      zoomIssues.push(
+        `${label}: duración ${(endSeconds - startSeconds).toFixed(2)}s, extendido a ${MIN_ZOOM_SECONDS}s (mínimo editorial, conservando el inicio en ${startSeconds.toFixed(2)}s).`,
+      );
+      endSeconds = desiredEnd;
+    }
+
+    zooms.push({
       id: `ai-zoom-${index}`,
-      startSeconds: zoom.startSeconds,
-      endSeconds: zoom.endSeconds,
+      startSeconds,
+      endSeconds,
       // Límite de seguridad: nunca más de 2x, por si el modelo se pasa.
       fromScale: Math.min(2, Math.max(0.5, zoom.fromScale)),
       toScale: Math.min(2, Math.max(0.5, zoom.toScale)),
@@ -407,7 +443,8 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
             }
           : undefined,
       reason: typeof zoom.reason === "string" ? zoom.reason : undefined,
-    }));
+    });
+  });
 
   const resourceIssues = [];
   const ctaDurationAdjustments = [];
@@ -482,6 +519,7 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
     cuts,
     cutIssues,
     zooms,
+    zoomIssues,
     resources,
     resourceIssues,
     ctaDurationAdjustments,
@@ -613,6 +651,13 @@ const callModel = async ({ anthropic, prompt, model, maxTokens }) => {
  * se diagnostica de inmediato la próxima vez, sin adivinar.
  */
 const MIDDLE_CTA_EXCERPT_PADDING_SECONDS = 20;
+// Corrección del dictamen de cierre de talking-head (30-oct-2026, precisión
+// A del operador): mismo mecanismo que el CTA de mitad, pero para el CTA
+// de inicio cuando NO hubo invitación verbal -- en vez de un punto único
+// (como el punto medio), se usa una VENTANA de los primeros segundos del
+// video ya editado, para que el modelo elija dónde dentro de ella cae el
+// final del gancho inicial.
+const START_CTA_WINDOW_SECONDS = 45;
 
 /** Entradas de la transcripción (palabras o líneas) dentro de +-padding segundos de un punto. */
 const extractExcerpt = (transcript, centerSeconds, paddingSeconds) =>
@@ -665,6 +710,59 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
       "justification": "fragmento breve del discurso que lo justifica, si lo hay",
       "editorialGoal": "emphasis",
       "segment": "development",
+      "intensity": "subtle",
+      "veracityRequirement": "illustrative-ok",
+      "essential": false,
+      "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras"
+    }
+  ],
+  "notes": ""
+}`;
+};
+
+const buildStartCtaPrompt = ({ guidelines, resourceProfile, windowSourceStart, windowSourceEnd, excerpt, granularity, destination }) => {
+  const resourceProfileText = resourceProfile
+    ? `Tipos de recurso permitidos en este canal: ${resourceProfile.allowedResourceTypes?.join(", ") ?? "(todos)"}.` +
+      (resourceProfile.neverFabricate?.length
+        ? ` NUNCA inventes ni presentes como real: ${resourceProfile.neverFabricate.join(", ")}.`
+        : "")
+    : "";
+
+  return `Estás completando un plan de edición de video ya decidido -- los cortes y zooms de este video YA se definieron en un paso anterior, y esa decisión ya determinó que el presentador NO hace una invitación verbal (like/suscripción/seguir en otra red) cerca del inicio. Tu única tarea ahora es el recurso de llamado a la acción (CTA) que va OBLIGATORIAMENTE cerca del inicio del video ya editado, en ausencia de esa invitación verbal.
+
+Formato de salida: ${destination}.
+
+## Guía editorial de este canal
+
+${guidelines}
+
+${resourceProfileText}
+
+## Dónde cae el inicio del video YA EDITADO
+
+Los primeros segundos del video YA EDITADO (con los cortes ya aplicados), traducidos de vuelta al tiempo del video ORIGINAL, van de ${windowSourceStart.toFixed(2)}s a ${windowSourceEnd.toFixed(2)}s. Acá tenés la transcripción real en ese tramo (tiempo original, ${granularity === "word" ? "una palabra" : "una línea"} por entrada):
+
+${transcriptAsText(excerpt)}
+
+## Tu tarea
+
+Proponé EXACTAMENTE UN recurso de CTA (like, suscripción, compartir, o seguir al presentador en otra red) ubicado DESPUÉS de que termine el gancho inicial (la idea, pregunta o afirmación con la que arranca el video) -- nunca interrumpiéndolo, nunca en el primer segundo. Este CTA es obligatorio: el presentador no tiene que haberlo pedido verbalmente acá, el sistema lo agrega por decisión editorial. Que sea breve y discreto: entre 3 y 15 segundos, un recordatorio puntual -- no tape información importante ni el gancho. NUNCA inventes un @usuario, enlace o nombre de perfil que no esté en la transcripción.
+
+## Formato de respuesta
+
+Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, sin bloque de código markdown. Forma exacta (igual que siempre, pero "cuts" y "zooms" vacíos y "resources" con exactamente un elemento):
+
+{
+  "cuts": [],
+  "zooms": [],
+  "resources": [
+    {
+      "startSeconds": number, "endSeconds": number,
+      "type": "${RESOURCE_TYPES.join('" | "')}",
+      "description": "qué mostrar, concreto, máximo 20 palabras",
+      "justification": "fragmento breve del discurso que lo justifica, si lo hay",
+      "editorialGoal": "emphasis",
+      "segment": "intro",
       "intensity": "subtle",
       "veracityRequirement": "illustrative-ok",
       "essential": false,
@@ -747,6 +845,92 @@ const planMiddleCta = async ({
   };
 };
 
+/**
+ * Segunda llamada, chica y aparte, solo para el CTA obligatorio de
+ * inicio cuando el presentador NO hace una invitación verbal ahí
+ * (corrección del dictamen de cierre de talking-head, 30-oct-2026,
+ * precisión A del operador). A diferencia de planMiddleCta, esta
+ * llamada es CONDICIONAL: solo se ejecuta si la llamada principal no
+ * ya produjo un recurso "start" sincronizado con una invitación verbal
+ * real (ver planEdit) -- cuando SÍ hay invitación verbal, la llamada
+ * principal ya resuelve esto mejor (tiene la transcripción completa y
+ * el momento exacto), no hace falta adivinar con una ventana.
+ *
+ * Reutiliza el mismo mecanismo que planMiddleCta (buildTimeline +
+ * mapOutputToSource + extractExcerpt + callModel + parseEditorialResponse)
+ * en vez de crear otro sistema -- la única diferencia real es que en vez
+ * de un punto único (el punto medio) se usa una VENTANA (los primeros
+ * START_CTA_WINDOW_SECONDS del video ya editado), porque "después del
+ * gancho inicial" es un rango a elegir, no un punto fijo a calcular.
+ */
+const planStartCta = async ({
+  cuts,
+  captions,
+  transcriptWords,
+  guidelines,
+  resourceProfile,
+  durationInSeconds,
+  destination,
+  model,
+  onLog,
+}) => {
+  const timeline = buildTimeline(durationInSeconds, cuts);
+  const windowOutputEnd = Math.min(START_CTA_WINDOW_SECONDS, timeline.outputDurationInSeconds);
+  const windowSourceStart = mapOutputToSource(timeline, 0);
+  const windowSourceEnd = mapOutputToSource(timeline, windowOutputEnd);
+  const windowCenter = (windowSourceStart + windowSourceEnd) / 2;
+  const windowPadding = (windowSourceEnd - windowSourceStart) / 2;
+
+  const useWords = Array.isArray(transcriptWords) && transcriptWords.length > 0;
+  const fullTranscript = useWords ? transcriptWords : captions;
+  const excerpt = extractExcerpt(fullTranscript, windowCenter, windowPadding);
+  if (excerpt.length === 0) {
+    throw new Error(
+      `sin transcripción en el tramo inicial (${windowSourceStart.toFixed(2)}-${windowSourceEnd.toFixed(2)}s) -- no se puede generar el CTA de inicio.`,
+    );
+  }
+
+  const prompt = buildStartCtaPrompt({
+    guidelines,
+    resourceProfile,
+    windowSourceStart,
+    windowSourceEnd,
+    excerpt,
+    granularity: useWords ? "word" : "line",
+    destination,
+  });
+
+  onLog(
+    `CTA de inicio sin invitación verbal: ventana editada=0.00-${windowOutputEnd.toFixed(2)}s -> original=${windowSourceStart.toFixed(2)}-${windowSourceEnd.toFixed(2)}s, pidiendo recurso...`,
+  );
+  const anthropic = getClient();
+  const attempt = await callModel({ anthropic, prompt, model, maxTokens: FIRST_MAX_TOKENS });
+  onLog(
+    `CTA de inicio: respuesta stop_reason=${attempt.stopReason}, tokens=${attempt.inputTokens}in/${attempt.outputTokens}out (razonamiento=${attempt.thinkingTokens ?? "?"})`,
+  );
+
+  const parsed = parseEditorialResponse(attempt.text, durationInSeconds);
+  if (parsed.resources.length === 0) {
+    onLog("CTA de inicio: el modelo no propuso ninguno en este fragmento -- se omite.");
+    return { resource: null, metrics: attempt };
+  }
+  const { resource: clamped, adjusted, originalDuration, finalDuration } = clampCtaDuration(
+    {
+      ...parsed.resources[0],
+      id: "ai-resource-start-cta",
+      ctaPosition: "start",
+    },
+    durationInSeconds,
+  );
+  if (adjusted) {
+    onLog(describeCtaDurationAdjustment(clamped, originalDuration, finalDuration));
+  }
+  return {
+    resource: clamped,
+    metrics: attempt,
+  };
+};
+
 export const planEdit = async ({
   captions,
   // Opcional: tiempos por palabra (de whisper). Si viene, se usa en vez
@@ -815,6 +999,12 @@ export const planEdit = async ({
     }
   }
 
+  if (plan.zoomIssues.length > 0) {
+    for (const issue of plan.zoomIssues) {
+      onLog(issue);
+    }
+  }
+
   if (plan.ctaDurationAdjustments.length > 0) {
     for (const adjustment of plan.ctaDurationAdjustments) {
       onLog(adjustment);
@@ -863,6 +1053,41 @@ export const planEdit = async ({
     ctaIssues.push(`Falta el CTA obligatorio de "middle": la llamada falló (${err.message ?? err}).`);
   }
 
+  // CTA obligatorio de inicio (corrección del dictamen de cierre de
+  // talking-head, 30-oct-2026) -- CONDICIONAL, a diferencia del de
+  // mitad: solo se ejecuta si la llamada principal NO ya puso un
+  // recurso "start" (lo que significa que SÍ hubo invitación verbal
+  // real y ya quedó bien resuelto ahí). Si no hay ninguno, se asume que
+  // no hubo invitación verbal y se delega en esta llamada aparte, igual
+  // de nunca-en-silencio que la de mitad.
+  let startCtaMetrics = null;
+  if (!plan.resources.some((r) => r.ctaPosition === "start")) {
+    try {
+      const { resource, metrics } = await planStartCta({
+        cuts: plan.cuts,
+        captions,
+        transcriptWords,
+        guidelines,
+        resourceProfile,
+        durationInSeconds,
+        destination,
+        model,
+        onLog,
+      });
+      startCtaMetrics = metrics;
+      if (resource) {
+        plan.resources.push(resource);
+      } else {
+        ctaIssues.push(
+          'Falta el CTA obligatorio de "start": no hubo invitación verbal y el modelo no propuso ninguno en la ventana inicial.',
+        );
+      }
+    } catch (err) {
+      onLog(`CTA de inicio (sin invitación verbal) falló (${err.message ?? err}) -- se omite, no bloquea el resto del plan.`);
+      ctaIssues.push(`Falta el CTA obligatorio de "start": la llamada falló (${err.message ?? err}).`);
+    }
+  }
+
   return {
     ...plan,
     ctaIssues,
@@ -870,8 +1095,8 @@ export const planEdit = async ({
       elapsedMs,
       model,
       stopReason: attempt.stopReason,
-      inputTokens: attempt.inputTokens + (middleCtaMetrics?.inputTokens ?? 0),
-      outputTokens: attempt.outputTokens + (middleCtaMetrics?.outputTokens ?? 0),
+      inputTokens: attempt.inputTokens + (middleCtaMetrics?.inputTokens ?? 0) + (startCtaMetrics?.inputTokens ?? 0),
+      outputTokens: attempt.outputTokens + (middleCtaMetrics?.outputTokens ?? 0) + (startCtaMetrics?.outputTokens ?? 0),
       thinkingTokens: attempt.thinkingTokens,
       maxTokens: maxTokensUsed,
       retried,
@@ -880,6 +1105,13 @@ export const planEdit = async ({
             stopReason: middleCtaMetrics.stopReason,
             inputTokens: middleCtaMetrics.inputTokens,
             outputTokens: middleCtaMetrics.outputTokens,
+          }
+        : null,
+      startCta: startCtaMetrics
+        ? {
+            stopReason: startCtaMetrics.stopReason,
+            inputTokens: startCtaMetrics.inputTokens,
+            outputTokens: startCtaMetrics.outputTokens,
           }
         : null,
     },

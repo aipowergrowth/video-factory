@@ -101,12 +101,15 @@ export const remapResourcesWithCtaGuarantee = ({ resources, timeline, log, exist
     });
   }
 
-  // "start" depende de que el presentador lo haya pedido verbalmente --
-  // no es obligatorio que exista. "middle" y "end" sí lo son siempre.
-  // Si ya hay un ctaIssue más específico sobre este mismo CTA (p.ej. la
-  // llamada de planMiddleCta falló), no se agrega un segundo mensaje
-  // genérico redundante -- el problema ya quedó visible con su causa.
-  for (const required of ["middle", "end"]) {
+  // Corrección del dictamen de cierre de talking-head (30-oct-2026): el
+  // CTA de inicio pasó a ser obligatorio siempre (antes dependía de que
+  // el presentador lo pidiera verbalmente). Los tres momentos -- start,
+  // middle, end -- se verifican ahora con la MISMA lógica, sin crear un
+  // sistema aparte para "start". Si ya hay un ctaIssue más específico
+  // sobre este mismo CTA (p.ej. la llamada de planMiddleCta falló), no
+  // se agrega un segundo mensaje genérico redundante -- el problema ya
+  // quedó visible con su causa.
+  for (const required of ["start", "middle", "end"]) {
     const alreadyFlagged = ctaIssues.some((issue) => issue.includes(`"${required}"`));
     if (!alreadyFlagged && !finalResources.some((r) => r.ctaPosition === required)) {
       ctaIssues.push(`Falta el CTA obligatorio de "${required}" -- no apareció en el plan en absoluto.`);

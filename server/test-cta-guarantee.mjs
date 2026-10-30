@@ -46,13 +46,14 @@ const noopLog = () => {};
       { id: "r1", description: "recurso normal en el corte", startSeconds: 45, endSeconds: 50 },
       { id: "r2", description: "mitad", startSeconds: 10, endSeconds: 15, ctaPosition: "middle" },
       { id: "r3", description: "cierre", startSeconds: 90, endSeconds: 95, ctaPosition: "end" },
+      { id: "r4", description: "inicio", startSeconds: 1, endSeconds: 4, ctaPosition: "start" },
     ],
     timeline: t,
     log: noopLog,
   });
   check("recurso normal en un corte: se descarta (comportamiento preexistente)", droppedCount === 1);
   check("recurso normal en un corte: no aparece en la lista final", !resources.some((r) => r.id === "r1"));
-  check("CTA de mitad y cierre fuera del corte: sin issues", ctaIssues.length === 0);
+  check("CTA de inicio, mitad y cierre fuera del corte: sin issues", ctaIssues.length === 0);
 }
 
 // --- punto (b): CTA que cae en un corte se reubica, nunca se descarta en silencio ---
@@ -62,6 +63,7 @@ const noopLog = () => {};
   const logs = [];
   const { resources, ctaIssues } = remapResourcesWithCtaGuarantee({
     resources: [
+      { id: "cta-start", description: "CTA de inicio", startSeconds: 1, endSeconds: 4, ctaPosition: "start" },
       { id: "cta-middle", description: "CTA de mitad", startSeconds: 45, endSeconds: 50, ctaPosition: "middle" },
       { id: "cta-end", description: "CTA de cierre", startSeconds: 90, endSeconds: 95, ctaPosition: "end" },
     ],
@@ -71,7 +73,7 @@ const noopLog = () => {};
   const middleCta = resources.find((r) => r.ctaPosition === "middle");
   check("CTA de mitad en un corte: NO se descarta, aparece reubicado", middleCta !== undefined);
   check("CTA de mitad reubicado: log explica la reubicación", logs.some((l) => l.includes("reubicado")));
-  check("CTA de mitad y cierre presentes: sin ctaIssues", ctaIssues.length === 0);
+  check("CTA de inicio, mitad y cierre presentes: sin ctaIssues", ctaIssues.length === 0);
 }
 
 {
@@ -104,6 +106,22 @@ const noopLog = () => {};
   check("issue específico de cierre", ctaIssues.some((i) => i.includes('"end"')));
 }
 
+// Corrección del dictamen de cierre de talking-head (30-oct-2026): el
+// CTA de inicio ahora es obligatorio SIEMPRE, igual que mitad y cierre
+// -- antes era condicional a que el presentador lo pidiera verbalmente.
+{
+  const t = buildTimeline(100, []);
+  const { ctaIssues } = remapResourcesWithCtaGuarantee({
+    resources: [
+      { id: "cta-middle", description: "mitad", startSeconds: 45, endSeconds: 50, ctaPosition: "middle" },
+      { id: "cta-end", description: "cierre", startSeconds: 95, endSeconds: 99, ctaPosition: "end" },
+    ],
+    timeline: t,
+    log: noopLog,
+  });
+  check("sin CTA de inicio (ahora obligatorio): queda en ctaIssues", ctaIssues.length === 1 && ctaIssues[0].includes('"start"'));
+}
+
 {
   // Un ctaIssue ya existente (p.ej. porque planMiddleCta falló antes de
   // llegar aquí) se preserva junto con los nuevos, no se pierde.
@@ -116,6 +134,7 @@ const noopLog = () => {};
   });
   check("ctaIssue preexistente se conserva", ctaIssues.some((i) => i.includes("timeout")));
   check("no se duplica un segundo issue de mitad", ctaIssues.filter((i) => i.includes('"middle"')).length === 1);
+  check("CTA de inicio ausente (ahora obligatorio): también queda en ctaIssues", ctaIssues.some((i) => i.includes('"start"')));
 }
 
 // --- punto (c): verificabilidad sin render -- editedSeconds / editedPercent ---

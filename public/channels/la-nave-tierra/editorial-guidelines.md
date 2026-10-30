@@ -40,10 +40,13 @@ distintos rompe la ilusión documental.
 ## Llamado a la acción
 
 Este canal no tiene presentador que lo pida en voz alta — el llamado a
-la acción obligatorio de inicio/mitad/cierre (regla global del sistema)
-se adapta al formato: un gráfico o texto en pantalla sincronizado con el
-ritmo de la narración, consistente con el estilo visual del canal, no
-una animación ajena a lo que ya se ve.
+la acción obligatorio de inicio/mitad/cierre (regla global del sistema,
+los tres SIEMPRE obligatorios, exista o no una invitación verbal -- acá
+nunca la hay) se adapta al formato: un gráfico o texto en pantalla
+sincronizado con el ritmo de la narración, consistente con el estilo
+visual del canal, no una animación ajena a lo que ya se ve. El de
+inicio en particular va DESPUÉS del gancho inicial del guion, nunca
+superpuesto a él.
 
 ## Fuera de alcance
 

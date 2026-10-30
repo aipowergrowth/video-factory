@@ -176,16 +176,18 @@ const makeSequencedFakeClient = (responses) => {
     durationInSeconds: 8,
     destination: "youtube-16-9",
   });
-  // 3 llamadas: intento + reintento del plan principal, más la llamada
-  // aparte (siempre ocurre) del CTA obligatorio de mitad de video.
-  check("respuesta vacía por max_tokens: reintenta exactamente una vez (3 llamadas: intento + reintento + CTA de mitad)", calls.length === 3);
+  // 4 llamadas: intento + reintento del plan principal, más la llamada
+  // aparte (siempre ocurre) del CTA obligatorio de mitad de video, más
+  // la del CTA de inicio (ocurre porque el plan principal -- vacío en
+  // este test -- no incluyó ningún recurso "start").
+  check("respuesta vacía por max_tokens: reintenta exactamente una vez (4 llamadas: intento + reintento + CTA de mitad + CTA de inicio)", calls.length === 4);
   check("respuesta vacía por max_tokens: el reintento pide más max_tokens que el primer intento", calls[1].maxTokens > calls[0].maxTokens);
   // Bug real: el razonamiento interno competía por el mismo presupuesto
   // que max_tokens y a veces se lo comía entero (respuesta vacía en
   // producción). Confirmado con la API real que desactivarlo arregla
   // esto sin perder calidad editorial -- este chequeo evita que alguien
   // lo reactive sin querer en el futuro.
-  check("las 3 llamadas piden el razonamiento desactivado", calls.every((c) => c.thinking?.type === "disabled"));
+  check("las 4 llamadas piden el razonamiento desactivado", calls.every((c) => c.thinking?.type === "disabled"));
   check("respuesta vacía por max_tokens: el plan final es el del reintento", plan.notes === "ok en el reintento");
   check("respuesta vacía por max_tokens: metrics.retried=true", plan.metrics.retried === true);
   check("respuesta vacía por max_tokens: metrics.stopReason es del último intento", plan.metrics.stopReason === "end_turn");
@@ -334,6 +336,9 @@ const makeSequencedFakeClient = (responses) => {
       create: async (params) => {
         callIndex += 1;
         if (callIndex === 1) {
+          // Plan principal: sin recurso "start" -> dispara también la
+          // llamada aparte de CTA de inicio (callIndex 3), que en este
+          // test no es lo que se está verificando -- responde vacío.
           return {
             content: [{ type: "text", text: JSON.stringify({
               cuts: [{ startSeconds: 0, endSeconds: 4, reason: "intro descartada" }],
@@ -343,6 +348,13 @@ const makeSequencedFakeClient = (responses) => {
             }) }],
             stop_reason: "end_turn",
             usage: { input_tokens: 100, output_tokens: 50 },
+          };
+        }
+        if (callIndex === 3) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 5, output_tokens: 2 },
           };
         }
         middleCtaPrompt = params.messages[0].content;
@@ -372,8 +384,115 @@ const makeSequencedFakeClient = (responses) => {
   });
   check("CTA de mitad: el punto medio pasado al modelo es el de la línea EDITADA (7.00s), no el ingenuo (5s)", middleCtaPrompt.includes("7.00 segundos") || middleCtaPrompt.includes("7.00s"));
   check("CTA de mitad: el recurso devuelto se suma al plan principal", plan.resources.length === 1 && plan.resources[0].description === "like y suscríbete");
-  check("CTA de mitad: sus tokens se suman al total del plan", plan.metrics.inputTokens === 120 && plan.metrics.outputTokens === 60);
+  check("CTA de mitad: sus tokens se suman al total del plan (incluye también la llamada aparte de inicio)", plan.metrics.inputTokens === 125 && plan.metrics.outputTokens === 62);
   check("CTA de mitad: queda registrado aparte en metrics.middleCta", plan.metrics.middleCta?.inputTokens === 20);
+}
+
+// Corrección del dictamen de cierre de talking-head (30-oct-2026,
+// precisión A): el CTA de inicio reutiliza el mecanismo de planMiddleCta
+// (ventana sobre la línea editada + llamada aparte), pero es
+// CONDICIONAL -- solo se dispara si la llamada principal NO ya puso un
+// recurso "start" (es decir, no hubo invitación verbal real).
+{
+  // Caso 1: la llamada principal SÍ tiene un "start" sincronizado con
+  // invitación verbal -- la llamada aparte de inicio NO debe dispararse.
+  let callCount = 0;
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              cuts: [],
+              zooms: [],
+              resources: [{
+                startSeconds: 2, endSeconds: 6,
+                type: "text-highlight", description: "síganme en Instagram",
+                editorialGoal: "emphasis", segment: "intro",
+                ctaPosition: "start",
+              }],
+              notes: "",
+            }) }],
+            stop_reason: "end_turn",
+            usage: { input_tokens: 50, output_tokens: 20 },
+          };
+        }
+        // callCount===2 debería ser SOLO la de mitad -- si hay una
+        // tercera llamada, es la de inicio que no debería haber ocurrido.
+        return { content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }], stop_reason: "end_turn", usage: { input_tokens: 5, output_tokens: 2 } };
+      },
+    },
+  });
+  await planEdit({ captions: fakeCaptions, guidelines: "guía", durationInSeconds: 10, destination: "youtube-16-9" });
+  check("CTA de inicio con invitación verbal real: NO dispara la llamada aparte (solo 2 llamadas: principal + mitad)", callCount === 2);
+}
+
+{
+  // Caso 2: sin invitación verbal -- se dispara la llamada aparte, con
+  // una VENTANA (no un punto único) calculada sobre la línea editada.
+  // Mismo video de prueba que el caso del "7.00s" (10s con un corte
+  // 0-4s -> línea editada de 6s, menor al tope de ventana de 45s, así
+  // que la ventana es el video editado completo): source 4-10 mapea a
+  // output 0-6 -> la ventana de inicio cae en output 0-6.00 -> de vuelta
+  // al original, source 4.00-10.00.
+  let callCount = 0;
+  let startCtaPrompt = "";
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        callCount += 1;
+        if (callCount === 1) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              cuts: [{ startSeconds: 0, endSeconds: 4, reason: "silencio inicial" }],
+              zooms: [], resources: [], notes: "",
+            }) }],
+            stop_reason: "end_turn", usage: { input_tokens: 100, output_tokens: 50 },
+          };
+        }
+        if (callCount === 2) {
+          // CTA de mitad: responde vacío, no es lo que se está probando.
+          return { content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }], stop_reason: "end_turn", usage: { input_tokens: 5, output_tokens: 2 } };
+        }
+        startCtaPrompt = params.messages[0].content;
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            cuts: [], zooms: [],
+            resources: [{
+              startSeconds: 5, endSeconds: 7,
+              type: "graphic", description: "recordatorio de suscripción",
+              editorialGoal: "emphasis", segment: "intro",
+              intensity: "subtle", veracityRequirement: "illustrative-ok", essential: false,
+            }],
+            notes: "",
+          }) }],
+          stop_reason: "end_turn", usage: { input_tokens: 30, output_tokens: 15 },
+        };
+      },
+    },
+  });
+  const plan = await planEdit({ captions: fakeCaptions, guidelines: "guía", durationInSeconds: 10, destination: "youtube-16-9" });
+  check("CTA de inicio sin invitación verbal: SÍ dispara la llamada aparte (3 llamadas)", callCount === 3);
+  check("CTA de inicio sin invitación verbal: la ventana pasada al modelo usa tiempo ORIGINAL (4.00s-10.00s), no el editado", startCtaPrompt.includes("4.00s") && startCtaPrompt.includes("10.00s"));
+  const startCta = plan.resources.find((r) => r.ctaPosition === "start");
+  check("CTA de inicio sin invitación verbal: el recurso se suma al plan, tageado 'start'", startCta !== undefined && startCta.description === "recordatorio de suscripción");
+}
+
+{
+  // Si tampoco la llamada aparte propone nada, queda como ctaIssue
+  // visible -- igual que el de mitad, nunca se omite en silencio.
+  let callIndex = 0;
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async () => {
+        callIndex += 1;
+        return { content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }], stop_reason: "end_turn", usage: { input_tokens: 5, output_tokens: 2 } };
+      },
+    },
+  });
+  const plan = await planEdit({ captions: fakeCaptions, guidelines: "guía", durationInSeconds: 10, destination: "youtube-16-9" });
+  check("sin CTA de inicio en ningún lado: queda como ctaIssue visible", plan.ctaIssues.some((i) => i.includes('"start"')));
 }
 
 // CTA de mitad excedido de duración (defecto real de la corrida sobre
@@ -574,6 +693,46 @@ const makeSequencedFakeClient = (responses) => {
   });
   const plan = parseEditorialResponse(extreme, 8);
   check("zoom extremo se recorta a 2x en vez de descartarse", plan.zooms.length === 1 && plan.zooms[0].toScale === 2);
+}
+
+// 4b. Corrección del dictamen de cierre de talking-head (30-oct-2026):
+// duración mínima de 2s para zooms -- se extiende hacia adelante dentro
+// de los límites del video; si no hay espacio, se descarta y queda
+// registrado, nunca en silencio (misma lógica que el mínimo de CTA).
+{
+  const shortZoom = JSON.stringify({
+    cuts: [],
+    zooms: [{ startSeconds: 10, endSeconds: 10.5, fromScale: 1, toScale: 1.2, reason: "énfasis breve" }],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(shortZoom, 200);
+  check("zoom de 0.5s (bajo el mínimo): se extiende a 2s", plan.zooms.length === 1 && plan.zooms[0].endSeconds - plan.zooms[0].startSeconds === 2);
+  check("zoom extendido: conserva su startSeconds (10), se extiende hacia adelante", plan.zooms[0].startSeconds === 10);
+  check("zoom extendido: queda registrado en zoomIssues", plan.zoomIssues.some((i) => i.includes("extendido")));
+}
+
+{
+  // Zoom pegado al final del video, sin espacio para extender hacia
+  // adelante ni usando el resto del video -- se descarta, registrado.
+  const impossible = JSON.stringify({
+    cuts: [],
+    zooms: [{ startSeconds: 199, endSeconds: 199.5, fromScale: 1, toScale: 1.2, reason: "énfasis al cierre" }],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(impossible, 200);
+  check("zoom sin espacio para extender (pegado al final): se descarta", plan.zooms.length === 0);
+  check("zoom descartado por mínimo: queda registrado en zoomIssues, nunca en silencio", plan.zoomIssues.some((i) => i.includes("descartado")));
+}
+
+{
+  // Zoom ya dentro del mínimo: no se toca.
+  const fine = JSON.stringify({
+    cuts: [],
+    zooms: [{ startSeconds: 10, endSeconds: 13, fromScale: 1, toScale: 1.2, reason: "énfasis" }],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(fine, 200);
+  check("zoom de 3s (ya sobre el mínimo): no se toca", plan.zooms.length === 1 && plan.zooms[0].endSeconds === 13 && plan.zoomIssues.length === 0);
 }
 
 // 4b. CTA que se excede del tope de duración se recorta, no se descarta
