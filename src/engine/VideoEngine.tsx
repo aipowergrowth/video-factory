@@ -2,6 +2,7 @@ import { AbsoluteFill, Sequence, useVideoConfig } from "remotion";
 import type { Caption, ChannelProfile, EngineJob } from "../types";
 import { secondsToFrames } from "../lib/time";
 import { OverlayRenderer } from "./OverlayRenderer";
+import { ResourceRenderer } from "./ResourceRenderer";
 import { Captions } from "./Captions";
 import { Fade } from "./Fade";
 import { Source } from "./sources/Source";
@@ -54,6 +55,18 @@ export const VideoEngine: React.FC<VideoEngineProps> = ({
     }));
   });
 
+  // A diferencia de overlays/captions, `job.resources` YA viene en tiempo
+  // de SALIDA -- el servidor (cta-guarantee.mjs) ya corrió
+  // remapRangeToOutput (y la reubicación por corte, si hacía falta) antes
+  // de persistir el job. Volver a remapear acá aplicaría el
+  // desplazamiento de los cortes dos veces. Fase 3A solo renderiza CTA
+  // (cualquier `type` con `ctaPosition`) y `text-highlight` -- el resto
+  // quedó en `job.pendingResources`, que este motor no lee (es solo para
+  // el informe humano).
+  const renderableResources = (job.resources ?? []).filter(
+    (resource) => Boolean(resource.ctaPosition) || resource.type === "text-highlight",
+  );
+
   const captionsInOutputTime: Caption[] = (job.captions ?? []).flatMap(
     (caption) => {
       const ranges = remapRangeToOutput(timeline, {
@@ -82,6 +95,25 @@ export const VideoEngine: React.FC<VideoEngineProps> = ({
             <Sequence key={key} from={from} durationInFrames={durationInFrames}>
               <Fade durationInFrames={durationInFrames}>
                 <OverlayRenderer overlay={overlay} />
+              </Fade>
+            </Sequence>
+          );
+        })}
+
+        {renderableResources.map((resource) => {
+          const from = secondsToFrames(resource.startSeconds, fps);
+          const durationInFrames = secondsToFrames(
+            resource.endSeconds - resource.startSeconds,
+            fps,
+          );
+          if (durationInFrames <= 0) {
+            return null;
+          }
+
+          return (
+            <Sequence key={resource.id} from={from} durationInFrames={durationInFrames}>
+              <Fade durationInFrames={durationInFrames}>
+                <ResourceRenderer resource={resource} />
               </Fade>
             </Sequence>
           );

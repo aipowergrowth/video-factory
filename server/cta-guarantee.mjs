@@ -118,3 +118,49 @@ export const remapResourcesWithCtaGuarantee = ({ resources, timeline, log, exist
 
   return { resources: finalResources, droppedCount, ctaIssues };
 };
+
+/**
+ * Qué tipos de recurso puede representar visualmente Fase 3A (dictamen de
+ * autorización, 30-oct-2026): CTA (cualquier `type` con `ctaPosition`) y
+ * `text-highlight`. MISMA regla en el motor Remotion
+ * (`src/engine/VideoEngine.tsx`, filtro de `renderableResources`) -- si
+ * una cambia, la otra tiene que cambiar igual (mismo patrón que
+ * timeline.mjs/timeline.ts).
+ */
+export const isRenderableIn3A = (resource) =>
+  Boolean(resource.ctaPosition) || resource.type === "text-highlight";
+
+/**
+ * Separa, de la lista final de recursos, los que Fase 3A todavía no
+ * puede renderizar (broll/image/graphic sin CTA/document-reference/
+ * transition/music/sfx) -- quedan identificados como pendientes de Fase
+ * 3B, nunca inventados ni omitidos en silencio (Decisión 5/6B del
+ * dictamen). Si alguno es `essential`, lo marca aparte en el log: esa
+ * entrega no se puede tratar como completa para ese contenido.
+ */
+export const computePendingResources = (resources, log) => {
+  const pending = resources
+    .filter((resource) => !isRenderableIn3A(resource))
+    .map((resource) => ({
+      id: resource.id,
+      type: resource.type,
+      description: resource.description,
+      essential: resource.essential,
+      reason: `tipo "${resource.type}" todavía no se puede representar visualmente en Fase 3A -- pendiente de Fase 3B (necesita adquisición y/o verificación de un recurso visual real).`,
+    }));
+
+  if (pending.length > 0) {
+    const essentialCount = pending.filter((r) => r.essential).length;
+    log(
+      `*** ${pending.length} RECURSO(S) PENDIENTE(S) DE FASE 3B (no se renderizan todavía) ***` +
+        (essentialCount > 0
+          ? ` -- ${essentialCount} de ellos ESENCIAL(ES): esta entrega NO se puede tratar como completa para ese contenido.`
+          : ""),
+    );
+    for (const r of pending) {
+      log(`  [pendiente 3B${r.essential ? ", ESENCIAL" : ""}] "${r.description}" (tipo ${r.type})`);
+    }
+  }
+
+  return pending;
+};

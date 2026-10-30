@@ -11,7 +11,7 @@ import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
 import { planEdit, mergeNearbyGaplessCuts } from "./editorial.mjs";
 import { buildTimeline } from "./timeline.mjs";
-import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee } from "./cta-guarantee.mjs";
+import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee, computePendingResources } from "./cta-guarantee.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -611,6 +611,10 @@ const planEditIfNeeded = async (jobId, job) => {
   }
   job.resources = remappedResources;
   job.ctaIssues = ctaIssues;
+  // Fase 3A (autorizada 30-oct-2026) solo renderiza CTA y text-highlight --
+  // el resto queda identificado como pendiente de Fase 3B, nunca inventado
+  // ni omitido en silencio (ver cta-guarantee.mjs#computePendingResources).
+  job.pendingResources = computePendingResources(remappedResources, (msg) => console.log(`[job ${jobId}] ${msg}`));
 
   await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
   return job;
@@ -932,6 +936,7 @@ app.post("/jobs/:id/replan", async (req, res) => {
         );
       }
     }
+    const pendingResources = computePendingResources(resources, (msg) => console.log(`[replan ${jobId}] ${msg}`));
 
     res.json({
       jobId,
@@ -940,6 +945,7 @@ app.post("/jobs/:id/replan", async (req, res) => {
       cuts: mergedCuts,
       resources,
       ctaIssues,
+      pendingResources,
       editedDurationInSeconds: Number(timeline.outputDurationInSeconds.toFixed(2)),
       resourcesDroppedByCuts: droppedCount,
     });

@@ -3,7 +3,12 @@
 // desaparecer, y cada CTA que sobrevive lleva su posición editada
 // (segundo + porcentaje) para poder verificarla sin renderizar.
 import { buildTimeline } from "./timeline.mjs";
-import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee } from "./cta-guarantee.mjs";
+import {
+  relocateToNearestSurvivingInterval,
+  remapResourcesWithCtaGuarantee,
+  isRenderableIn3A,
+  computePendingResources,
+} from "./cta-guarantee.mjs";
 
 let failures = 0;
 const approx = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
@@ -135,6 +140,45 @@ const noopLog = () => {};
   check("ctaIssue preexistente se conserva", ctaIssues.some((i) => i.includes("timeout")));
   check("no se duplica un segundo issue de mitad", ctaIssues.filter((i) => i.includes('"middle"')).length === 1);
   check("CTA de inicio ausente (ahora obligatorio): también queda en ctaIssues", ctaIssues.some((i) => i.includes('"start"')));
+}
+
+// --- Fase 3A (autorizada 30-oct-2026): qué se renderiza, qué queda pendiente de 3B ---
+
+{
+  check("CTA (cualquier type) es renderizable en 3A", isRenderableIn3A({ type: "graphic", ctaPosition: "start" }));
+  check("text-highlight sin CTA es renderizable en 3A", isRenderableIn3A({ type: "text-highlight" }));
+  check("broll sin CTA NO es renderizable en 3A", !isRenderableIn3A({ type: "broll" }));
+  check("document-reference NO es renderizable en 3A", !isRenderableIn3A({ type: "document-reference" }));
+  check("graphic sin CTA NO es renderizable en 3A", !isRenderableIn3A({ type: "graphic" }));
+}
+
+{
+  const logs = [];
+  const resources = [
+    { id: "cta-start", type: "text-highlight", description: "suscribite", ctaPosition: "start", essential: false },
+    { id: "r-broll", type: "broll", description: "imagen de un cerebro", essential: false },
+    { id: "r-doc", type: "document-reference", description: "estudio de UCSF sobre dopamina", essential: true },
+  ];
+  const pending = computePendingResources(resources, (msg) => logs.push(msg));
+  check("pendingResources: el CTA no queda pendiente", !pending.some((p) => p.id === "cta-start"));
+  check("pendingResources: broll y document-reference sí quedan pendientes", pending.length === 2);
+  check("pendingResources: conserva su type y description originales", pending.some((p) => p.id === "r-doc" && p.type === "document-reference" && p.description === "estudio de UCSF sobre dopamina"));
+  check("pendingResources: marca cuál es essential", pending.find((p) => p.id === "r-doc").essential === true);
+  check(
+    "pendingResources: el log advierte que hay un recurso ESENCIAL pendiente (entrega no completa)",
+    logs.some((l) => l.includes("ESENCIAL") && l.toLowerCase().includes("no se puede tratar como completa")),
+  );
+}
+
+{
+  // Sin ningún recurso pendiente: no genera ruido en el log.
+  const logs = [];
+  const pending = computePendingResources(
+    [{ id: "cta-end", type: "graphic", description: "like y suscríbete", ctaPosition: "end", essential: false }],
+    (msg) => logs.push(msg),
+  );
+  check("sin recursos pendientes: array vacío", pending.length === 0);
+  check("sin recursos pendientes: no loguea nada", logs.length === 0);
 }
 
 // --- punto (c): verificabilidad sin render -- editedSeconds / editedPercent ---

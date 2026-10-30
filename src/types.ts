@@ -152,6 +152,14 @@ export type EngineJob = {
   cuts?: Cut[];
   /** Zooms tipo Ken Burns sobre el video base. */
   zooms?: ZoomKeyframe[];
+  /**
+   * Recursos de la IA editorial ya en tiempo de SALIDA (ver tipo `Resource`
+   * arriba) -- Fase 3A solo renderiza los que tengan `ctaPosition` o
+   * `type === "text-highlight"`; el resto son `pendingResources`.
+   */
+  resources?: Resource[];
+  /** Recursos que la IA editorial decidió pero Fase 3A no renderiza todavía. */
+  pendingResources?: PendingResource[];
 };
 
 /** Perfil editorial de un canal — vive fuera del código, en public/channels. */
@@ -170,4 +178,68 @@ export type CorrectionRule = {
   from: string;
   to: string;
   caseSensitive?: boolean;
+};
+
+/**
+ * Recursos audiovisuales decididos por la IA editorial (`server/editorial.mjs`)
+ * y ya procesados por la garantía de CTA (`server/cta-guarantee.mjs`) antes de
+ * llegar a este motor. A DIFERENCIA de `overlays`/`cuts`/`zooms`/`captions`
+ * (que viajan en tiempo del video ORIGINAL y este motor los remapea con
+ * `engine/timeline.ts`), `startSeconds`/`endSeconds` acá YA vienen en tiempo
+ * de SALIDA -- el servidor ya corrió `remapRangeToOutput` (y, si hacía falta,
+ * reubicación por corte) antes de persistir el job. Nunca volver a remapear
+ * esto con `buildTimeline`/`remapRangeToOutput` -- sería aplicar el
+ * desplazamiento de los cortes dos veces.
+ */
+export type ResourceType =
+  | "broll"
+  | "image"
+  | "graphic"
+  | "document-reference"
+  | "text-highlight"
+  | "transition"
+  | "music"
+  | "sfx";
+
+export type CtaPosition = "start" | "middle" | "end";
+
+export type Resource = {
+  id: string;
+  /** Tiempo de SALIDA (ya editado) -- ver comentario del tipo arriba. */
+  startSeconds: number;
+  endSeconds: number;
+  type: ResourceType;
+  description: string;
+  justification?: string;
+  editorialGoal:
+    | "evidence"
+    | "comprehension"
+    | "context"
+    | "emotion"
+    | "emphasis"
+    | "transition";
+  segment: "intro" | "development" | "demonstration" | "transition" | "closing";
+  intensity: "subtle" | "moderate" | "prominent";
+  veracityRequirement: "must-be-real" | "illustrative-ok";
+  essential: boolean;
+  provenanceNotes?: string;
+  /** Si está presente, es uno de los 3 CTA obligatorios -- ver cta-guarantee.mjs. */
+  ctaPosition?: CtaPosition;
+  /** Solo en recursos de CTA: posición/porcentaje sobre la línea YA editada. */
+  editedSeconds?: number;
+  editedPercent?: number;
+};
+
+/**
+ * Recurso que la IA editorial decidió pero que Fase 3A todavía no puede
+ * representar visualmente (ver `server/cta-guarantee.mjs#computePendingResources`).
+ * Puramente informativo para el job/informe humano -- este motor NO lo lee
+ * ni intenta renderizarlo.
+ */
+export type PendingResource = {
+  id: string;
+  type: ResourceType;
+  description: string;
+  essential: boolean;
+  reason: string;
 };
