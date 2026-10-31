@@ -83,6 +83,15 @@ RUN npx remotion browser ensure
 # sin instalar ni descargar nada en tiempo de ejecución.
 COPY --from=whisper-builder /build/whisper.cpp ./whisper.cpp
 
+# Commit exacto con el que se construyó esta imagen -- horneado en build
+# time (docker-publish.yml pasa --build-arg GIT_SHA=${{ github.sha }}).
+# Sin esto no había ninguna forma de confirmar, a partir de un contenedor
+# ya corriendo, qué versión del código está realmente activa -- cada
+# auditoría de un render tenía que inferirlo indirectamente. El mismo
+# valor también queda en el tag de la imagen (ghcr.io/.../fabrica-videos-engine:sha-<GIT_SHA>).
+ARG GIT_SHA=desconocido
+ENV GIT_SHA=${GIT_SHA}
+
 ENV NODE_ENV=production
 ENV PORT=3001
 ENV WHISPER_MODEL=small

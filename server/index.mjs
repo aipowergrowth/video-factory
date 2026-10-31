@@ -1282,6 +1282,7 @@ const logCpuFeatures = () => {
 
 app.listen(PORT, () => {
   console.log(`fabrica-videos API escuchando en :${PORT}`);
+  console.log(`  imagen (GIT_SHA) -> ${process.env.GIT_SHA ?? "desconocido (variable GIT_SHA no definida -- imagen construida antes de este cambio)"}`);
   console.log(`  uploads/jobs   -> ${UPLOADS_JOBS_DIR}`);
   console.log(`  uploads/videos -> ${UPLOADS_VIDEOS_DIR}`);
   console.log(`  outputs        -> ${OUTPUTS_DIR}`);
