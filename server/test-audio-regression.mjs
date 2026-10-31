@@ -132,14 +132,23 @@ try {
   check(`caso A: fallo al ejecutar (ver si FFmpeg soporta los filtros usados)`, false, String(err.message ?? err));
 }
 
-// --- Caso B: "pues" -- hay una pausa real corta cerca del corte
-// propuesto (impreciso). El corte se ajusta a la pausa real y sobrevive.
+// --- Caso B: "pues" -- hay DOS pausas reales cortas cerca de cada
+// borde del corte propuesto (impreciso, como Whisper desfasado). Cada
+// borde encuentra una pausa real DISTINTA y el corte sobrevive
+// ajustado a ambas -- importante: si los dos bordes mapearan a LA
+// MISMA pausa, el algoritmo elegiría su centro para los dos y el corte
+// colapsaría a longitud 0 (se descartaría, por diseño -- ver la prueba
+// "pausas convergentes" en test-audio-analysis.mjs). Para que un corte
+// sobreviva con bordes distintos, necesita una pausa real junto a cada
+// borde, no una sola pausa compartida.
 let casoBResult = null;
 try {
   const fixture = await buildSyntheticFixture("caso-b-pues", [
-    { kind: "voice", durationSeconds: 49.9 },
-    { kind: "silence", durationSeconds: 0.35 },
-    { kind: "voice", durationSeconds: 19.75 },
+    { kind: "voice", durationSeconds: 49.8 },
+    { kind: "silence", durationSeconds: 0.3 }, // pausa real A: 49.8-50.1
+    { kind: "voice", durationSeconds: 0.4 },
+    { kind: "silence", durationSeconds: 0.3 }, // pausa real B: 50.5-50.8
+    { kind: "voice", durationSeconds: 18.9 },
   ]);
   const result = await refineCutsWithRealSilence({
     cuts: [{ id: "ai-cut-1", startSeconds: 50.0, endSeconds: 50.6 }], // impreciso a propósito, como Whisper desfasado
@@ -149,15 +158,18 @@ try {
     ffmpegEnv,
   });
   casoBResult = { ...result, fixture };
-  console.log(`[debug caso B] pauseMap.intervals=${JSON.stringify(result.pauseMap.intervals)}`);
-  console.log(`[debug caso B] cutIssues=${JSON.stringify(result.cutIssues)}`);
-  check("caso B (pues): hay exactamente 1 pausa real detectada", result.pauseMap.intervals.length === 1, `intervals=${JSON.stringify(result.pauseMap.intervals)}`);
-  check("caso B (pues): el corte SOBREVIVE, ajustado a la pausa real", result.cuts.length === 1, `cuts=${JSON.stringify(result.cuts)}`);
+  check("caso B (pues): hay exactamente 2 pausas reales detectadas", result.pauseMap.intervals.length === 2, `intervals=${JSON.stringify(result.pauseMap.intervals)}`);
+  check("caso B (pues): el corte SOBREVIVE, ajustado a las dos pausas reales", result.cuts.length === 1, `cuts=${JSON.stringify(result.cuts)} cutIssues=${JSON.stringify(result.cutIssues)}`);
   if (result.cuts.length === 1) {
     const adjusted = result.cuts[0];
     check(
-      "caso B (pues): el corte ajustado cae dentro de la pausa real real (49.9-50.25)",
-      adjusted.startSeconds >= 49.85 && adjusted.endSeconds <= 50.3,
+      "caso B (pues): el borde de inicio cae dentro de la pausa real A (49.8-50.1)",
+      adjusted.startSeconds >= 49.8 && adjusted.startSeconds <= 50.1,
+      `ajustado=${adjusted.startSeconds.toFixed(3)}-${adjusted.endSeconds.toFixed(3)}`,
+    );
+    check(
+      "caso B (pues): el borde final cae dentro de la pausa real B (50.5-50.8)",
+      adjusted.endSeconds >= 50.5 && adjusted.endSeconds <= 50.8,
       `ajustado=${adjusted.startSeconds.toFixed(3)}-${adjusted.endSeconds.toFixed(3)}`,
     );
   }
@@ -212,7 +224,11 @@ try {
 // fondo constante y SIN ninguna pausa realmente detectable -- el
 // sistema no debe fallar ni inventar nada, solo descartar el corte.
 try {
-  const fixture = await buildSyntheticFixture("caso-e-ruido-de-fondo", [{ kind: "noise", durationSeconds: 15, amplitude: 0.08 }]);
+  // amplitude=0.3 -- un valor bajo (0.06-0.08) resultó estar POR DEBAJO
+  // del umbral de silencio (-35dB) en el FFmpeg real: silencedetect lo
+  // reportaba como silencio total, justo lo que este caso busca EVITAR
+  // (confirmado en un corrido anterior de este mismo workflow en CI).
+  const fixture = await buildSyntheticFixture("caso-e-ruido-de-fondo", [{ kind: "noise", durationSeconds: 15, amplitude: 0.3 }]);
   const { cuts, pauseMap } = await refineCutsWithRealSilence({
     cuts: [{ id: "ai-cut-ruido", startSeconds: 7.0, endSeconds: 7.5 }],
     videoPath: fixture.path,
