@@ -558,6 +558,11 @@ const planEditIfNeeded = async (jobId, job) => {
     const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
     const ffmpegPathForAudio = resolveFfmpeg();
     const ffmpegEnvForAudio = binaryEnv(ffmpegPathForAudio);
+    // Medición explícita del tiempo adicional de la solución estructural
+    // (dictamen 31-oct-2026, sección 10: "tiempo adicional real de
+    // procesamiento") -- se mide con un cronómetro en el propio proceso,
+    // no infiriendo restas entre líneas de log con otra marca de tiempo.
+    const acousticPhaseStartedAt = Date.now();
     ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsWithRealSilence({
       cuts: snappedCuts,
       videoPath,
@@ -586,6 +591,9 @@ const planEditIfNeeded = async (jobId, job) => {
     qualityGateIncidents = gateResult.incidents;
     console.log(
       `[job ${jobId}] puerta de calidad: ${gateResult.ok ? "OK" : "NO SUPERADA"} tras ${gateResult.rounds} ronda(s)${gateResult.stoppedReason ? ` -- ${gateResult.stoppedReason}` : ""}.`,
+    );
+    console.log(
+      `[job ${jobId}] tiempo adicional de la solución estructural (mapa de pausas reales + puerta de calidad): ${((Date.now() - acousticPhaseStartedAt) / 1000).toFixed(1)}s.`,
     );
     if (!gateResult.ok) {
       throw new Error(
