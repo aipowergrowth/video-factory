@@ -1,296 +1,288 @@
-// Análisis de energía acústica real del audio (dictamen de corrección
-// de audio, 30-oct-2026, sección 2): snapCutsToWordBoundaries
-// (editorial.mjs) ya garantiza que ningún borde de corte cae DENTRO de
-// una palabra según los tiempos de Whisper -- pero esos tiempos pueden
-// estar desfasados respecto al audio real (defecto real: "Cameron
-// Sepah" sonaba cortado aunque el ajuste por palabra ya se había
-// aplicado). Esto analiza el AUDIO REAL con FFmpeg para, dentro del
-// rango ya garantizado seguro por palabra (nunca afuera de él), elegir
-// el punto de menor energía real -- la pausa más probable -- en vez de
-// confiar solo en el timestamp de Whisper.
+// Análisis de audio real para corregir bordes de corte (dictamen de
+// corrección de audio, 30-oct-2026, secciones 2-3 + precisiones A/B
+// del operador sobre el resultado real en el VPS).
 //
-// Reutiliza FFmpeg (ya vendorizado por @remotion/compositor-*, ver
-// resolveCompositorFfmpeg en index.mjs) -- nada de un servicio externo
-// (requisito 10 del dictamen).
+// Historia real de este archivo, importante para entender el diseño:
+// la primera versión extraía PCM crudo (`-f s16le pipe:1`) y calculaba
+// energía RMS a mano. El ffmpeg REAL de producción
+// (compositor-linux-x64-gnu, compilado con --disable-muxers) no tiene
+// el muxer "s16le" -- solo un conjunto chico: webm, opus, mp4, wav,
+// mp3, mov, matroska, hevc, h264, gif, image2, image2pipe, adts, m4a,
+// mpegts, null, avi. Además, el desfase de Whisper respecto al audio
+// real puede ser mayor que la ventana angosta (+-0.35s) que esa
+// primera versión buscaba DENTRO del límite ya "seguro por palabra" --
+// si Whisper está desfasado, ese límite deja de ser confiable.
+//
+// Esta versión reemplaza todo el mecanismo por `silencedetect`, el
+// filtro de audio que YA trae el ffmpeg de producción (confirmado),
+// usado con el muxer "null" (también confirmado) -- NO necesita
+// extraer ni un byte de audio: ffmpeg hace la detección de silencios
+// internamente y la reporta por stderr. Esto evita de raíz el problema
+// de la cabecera WAV (nunca se extrae PCM en absoluto) y, sobre todo,
+// permite buscar la pausa real más cercana en una ventana ancha
+// (+-1.0s) SIN depender de que los límites de Whisper sean correctos.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-// Misma tasa que usa Whisper (ver transcribe.mjs) -- consistente con
-// el resto del pipeline, y de sobra para resolver energía en ventanas
-// de 10ms (160 muestras).
-const SAMPLE_RATE = 16000;
-const FRAME_MS = 10;
-const FRAME_SAMPLES = Math.round((SAMPLE_RATE * FRAME_MS) / 1000);
-const FRAME_BYTES = FRAME_SAMPLES * 2; // s16le = 2 bytes/muestra
+// Precisión (a) del operador, 30-oct-2026: mover cada borde a la
+// pausa real más cercana dentro de +-1.0s, SIN exigir que quede dentro
+// de los límites de Whisper (a diferencia del mecanismo anterior).
+export const SILENCE_SEARCH_RADIUS_SECONDS = 1.0;
+// Precisión (b): ventana más ancha solo para el diagnóstico/comparación
+// (snap-cuts), no para la decisión real.
+export const SILENCE_WIDE_REPORT_RADIUS_SECONDS = 3.0;
+// Propuestos por el operador en su pedido.
+export const SILENCE_NOISE_DB = -35;
+export const SILENCE_MIN_DURATION_SECONDS = 0.12;
 
-// Ventana de búsqueda alrededor de cada borde (precisión B del
-// operador, 30-oct-2026): +-0.35s. NUNCA se busca fuera del rango ya
-// garantizado seguro por palabra (edgeBounds de snapCutsToWordBoundaries)
-// -- esta ventana solo puede acortar esa búsqueda, nunca ampliarla.
-export const AUDIO_SEARCH_RADIUS_SECONDS = 0.35;
-
-// Umbral propuesto (el dictamen pide explícitamente "el umbral que tú
-// propongas"): una caída de al menos 12dB por debajo del pico de la
-// propia ventana, sostenida por al menos 30ms (3 frames de 10ms)
-// consecutivos. Una pausa real entre palabras muestra una caída mucho
-// más marcada y sostenida que el mínimo típico dentro de una consonante
-// (que suele ser más breve y menos profundo) -- esto es justamente el
-// requisito 5 del dictamen: no confundir un mínimo de volumen dentro de
-// una consonante con un límite real entre palabras.
-export const PAUSE_RELATIVE_DROP_DB = 12;
-export const PAUSE_MIN_SUSTAINED_MS = 30;
-const PAUSE_MIN_SUSTAINED_FRAMES = Math.round(PAUSE_MIN_SUSTAINED_MS / FRAME_MS);
+const buildSilencedetectArgs = ({ videoPath, windowStart, windowDuration, noiseDb, minDurationSeconds }) => [
+  "-ss", windowStart.toFixed(3),
+  "-i", videoPath,
+  "-t", windowDuration.toFixed(3),
+  "-vn",
+  "-af", `silencedetect=noise=${noiseDb}dB:d=${minDurationSeconds}`,
+  "-f", "null",
+  "-",
+];
 
 /**
- * Extrae una ventana chica de audio en PCM crudo (mono, 16kHz, s16le)
- * del video real. Seek rápido (input, aproximado) + seek fino (output,
- * preciso) -- evita decodificar el archivo completo desde el inicio
- * para llegar a un punto tarde en un video largo, sin perder precisión
- * en el punto exacto.
+ * Corre `silencedetect` sobre una ventana del audio real y devuelve el
+ * stderr crudo (ahí es donde ffmpeg loguea `silence_start`/`silence_end`
+ * -- el filtro no necesita escribir ningún archivo ni dato de audio).
  *
- * NO es testeable sin un FFmpeg real -- este entorno de desarrollo no
- * tiene uno funcional (ver informe). Revisar con cuidado antes de
- * confiar en ella; la lógica de análisis (computeRmsProfile,
- * findAcousticPausePoint) es pura y SÍ está probada.
+ * Deliberadamente SOLO seek de entrada (`-ss` antes de `-i`, sin seek
+ * de salida) -- es el que de forma más confiable conserva, en los
+ * timestamps que reporta el filtro, el tiempo del archivo ORIGINAL en
+ * vez de resetearlo a cero; para audio (`-vn`, sin dependencia de
+ * keyframes de video) la precisión de este seek es buena. NO se pudo
+ * verificar contra un ffmpeg de producción real desde este entorno de
+ * desarrollo (ver informe) -- por eso `parseSilenceDetectOutput` NO
+ * asume ciegamente que el resultado es absoluto: lo verifica contra la
+ * ventana pedida y corrige si hiciera falta (ver más abajo).
+ *
+ * NO es testeable sin un FFmpeg real -- la lógica de parseo/decisión
+ * (parseSilenceDetectOutput, findNearestRealPause) es pura y SÍ está
+ * probada con texto de stderr sintético.
  */
-const realExtractPcmWindow = async ({ ffmpegPath, ffmpegEnv, videoPath, startSeconds, durationSeconds }) => {
-  const coarseStart = Math.max(0, startSeconds - 2);
-  const fineOffset = startSeconds - coarseStart;
-  const { stdout } = await execFileAsync(
-    ffmpegPath,
-    [
-      "-ss", coarseStart.toFixed(3),
-      "-i", videoPath,
-      "-ss", fineOffset.toFixed(3),
-      "-t", durationSeconds.toFixed(3),
-      "-vn",
-      "-ar", String(SAMPLE_RATE),
-      "-ac", "1",
-      "-f", "s16le",
-      "pipe:1",
-    ],
-    { env: ffmpegEnv, encoding: "buffer", maxBuffer: 1024 * 1024 * 8 },
-  );
-  return stdout;
+const realDetectSilences = async ({ ffmpegPath, ffmpegEnv, videoPath, windowStart, windowDuration, noiseDb, minDurationSeconds }) => {
+  const args = buildSilencedetectArgs({ videoPath, windowStart, windowDuration, noiseDb, minDurationSeconds });
+  try {
+    const { stderr } = await execFileAsync(ffmpegPath, args, { env: ffmpegEnv, encoding: "utf8", maxBuffer: 1024 * 1024 * 4 });
+    return stderr ?? "";
+  } catch (err) {
+    // ffmpeg con -f null normalmente sale con código 0; si falla por
+    // otra razón (archivo inexistente, filtro no soportado, etc.), el
+    // stderr sigue siendo útil para el mensaje de error -- se propaga
+    // igual, quien llama decide qué hacer.
+    if (err && typeof err.stderr === "string") {
+      throw new Error(`${err.message}\n${err.stderr}`);
+    }
+    throw err;
+  }
 };
 
-let pcmExtractor = realExtractPcmWindow;
+let silenceDetector = realDetectSilences;
 
-export const extractPcmWindow = (args) => pcmExtractor(args);
+export const detectSilences = (args) => silenceDetector(args);
 
 /**
- * Solo para pruebas: inyecta un extractor falso en vez de invocar
+ * Solo para pruebas: inyecta un detector falso en vez de invocar
  * FFmpeg real -- mismo patrón que __setAnthropicClientForTesting en
- * editorial.mjs. Permite probar el control de flujo de
- * refineEdgeAcoustically/refineCutsAcoustically (fallback al límite
- * seguro por palabra, descarte si el resultado degenera, manejo de
- * errores) sin un FFmpeg real.
+ * editorial.mjs.
  */
-export const __setPcmExtractorForTesting = (fakeExtractor) => {
-  pcmExtractor = fakeExtractor ?? realExtractPcmWindow;
+export const __setSilenceDetectorForTesting = (fakeDetector) => {
+  silenceDetector = fakeDetector ?? realDetectSilences;
 };
 
 /**
- * PCM crudo (s16le mono) -> perfil de energía RMS en dB, un valor cada
- * FRAME_MS. Función PURA, testeable sin FFmpeg -- se le puede pasar
- * cualquier Buffer sintético. `windowStartSeconds` es solo para que
- * cada frame lleve su tiempo absoluto real, no relativo a la ventana.
- */
-export const computeRmsProfile = (pcmBuffer, windowStartSeconds) => {
-  const frameCount = Math.floor(pcmBuffer.length / FRAME_BYTES);
-  const profile = [];
-  for (let i = 0; i < frameCount; i++) {
-    let sumSquares = 0;
-    for (let s = 0; s < FRAME_SAMPLES; s++) {
-      const offset = i * FRAME_BYTES + s * 2;
-      const sample = pcmBuffer.readInt16LE(offset);
-      sumSquares += sample * sample;
-    }
-    const rms = Math.sqrt(sumSquares / FRAME_SAMPLES);
-    // dBFS relativo a la amplitud máxima de s16 (32768). Silencio
-    // absoluto (rms=0) da -Infinity -- se deja en un piso razonable
-    // para que el perfil sea siempre un número usable.
-    const db = rms > 0 ? 20 * Math.log10(rms / 32768) : -96;
-    profile.push({
-      offsetSeconds: Number((windowStartSeconds + (i * FRAME_MS) / 1000).toFixed(3)),
-      db: Number(db.toFixed(1)),
-    });
-  }
-  return profile;
-};
-
-/**
- * Busca, dentro de un perfil de energía, un punto de pausa real -- no
- * el mínimo absoluto sin más, sino el tramo más largo que se mantiene
- * sostenido por debajo de PAUSE_RELATIVE_DROP_DB respecto al pico de
- * la propia ventana, y por al menos PAUSE_MIN_SUSTAINED_MS. Dentro de
- * ese tramo, el punto elegido es el de menor energía (el centro
- * acústico de la pausa).
+ * stderr crudo de `silencedetect` -> lista de intervalos de silencio
+ * real en SEGUNDOS ABSOLUTOS del archivo original. Función PURA,
+ * testeable con texto sintético.
  *
- * Devuelve `null` si ningún tramo cumple -- requisito 8 del dictamen:
- * sin un punto seguro, no se inventa uno. Función PURA, testeable sin
- * FFmpeg.
+ * Un `silence_start` sin su `silence_end` correspondiente (la ventana
+ * analizada terminó todavía en silencio) se cierra al final de la
+ * ventana -- no se descarta, pero tampoco se extrapola más allá de lo
+ * que de verdad se analizó.
+ *
+ * Salvaguarda (no verificable sin FFmpeg real, ver comentario arriba
+ * de realDetectSilences): si los `silence_start` reportados son
+ * plausibles como absolutos (caen dentro de la ventana pedida, con 1s
+ * de margen), se usan tal cual; si no, se asumen relativos al inicio
+ * de la ventana y se les suma `windowStart`. El fin de un intervalo
+ * "colgado" (sin su silence_end) es siempre `windowEnd` -- un hecho
+ * absoluto sobre la ventana analizada, nunca depende de en qué
+ * unidades reportó ffmpeg el inicio.
  */
-export const findAcousticPausePoint = (profile) => {
-  if (profile.length === 0) return null;
-  const peakDb = Math.max(...profile.map((f) => f.db));
-  const threshold = peakDb - PAUSE_RELATIVE_DROP_DB;
+export const parseSilenceDetectOutput = (stderrText, windowStart, windowDuration) => {
+  const windowEnd = windowStart + windowDuration;
+  const closedIntervals = [];
+  // Un silence_start sin su silence_end (la ventana terminó todavía en
+  // silencio) se guarda aparte -- su fin real es "donde terminó la
+  // ventana analizada" (windowEnd), un hecho absoluto que no depende
+  // de en qué unidades reportó ffmpeg el inicio; nunca se lo sometemos
+  // a la misma corrección relativa/absoluta que el inicio.
+  let danglingStart = null;
 
-  let bestStart = -1;
-  let bestRun = 0;
-  let runStart = -1;
-  let run = 0;
-  for (let i = 0; i < profile.length; i++) {
-    if (profile[i].db <= threshold) {
-      if (run === 0) runStart = i;
-      run++;
-    } else {
-      if (run > bestRun) {
-        bestRun = run;
-        bestStart = runStart;
-      }
-      run = 0;
+  let pendingStart = null;
+  for (const line of stderrText.split("\n")) {
+    const startMatch = line.match(/silence_start:\s*(-?[\d.]+)/);
+    const endMatch = line.match(/silence_end:\s*(-?[\d.]+)/);
+    if (startMatch) {
+      pendingStart = Number(startMatch[1]);
+    } else if (endMatch && pendingStart !== null) {
+      closedIntervals.push({ start: pendingStart, end: Number(endMatch[1]) });
+      pendingStart = null;
     }
   }
-  if (run > bestRun) {
-    bestRun = run;
-    bestStart = runStart;
+  if (pendingStart !== null) {
+    danglingStart = pendingStart;
   }
 
-  if (bestRun < PAUSE_MIN_SUSTAINED_FRAMES) {
-    return null;
-  }
+  const allStarts = closedIntervals.map((iv) => iv.start).concat(danglingStart !== null ? [danglingStart] : []);
+  if (allStarts.length === 0) return [];
 
-  const runFrames = profile.slice(bestStart, bestStart + bestRun);
-  const quietest = runFrames.reduce((min, f) => (f.db < min.db ? f : min), runFrames[0]);
-  return quietest.offsetSeconds;
+  const margin = 1;
+  const looksAbsolute = allStarts.every((s) => s >= windowStart - margin && s <= windowEnd + margin);
+  const toAbsoluteStart = looksAbsolute ? (s) => s : (s) => s + windowStart;
+
+  const intervals = closedIntervals.map((iv) => ({ start: toAbsoluteStart(iv.start), end: toAbsoluteStart(iv.end) }));
+  if (danglingStart !== null) {
+    intervals.push({ start: toAbsoluteStart(danglingStart), end: windowEnd });
+  }
+  return intervals;
 };
 
 /**
- * Refina un borde de corte YA seguro por palabra con un punto acústico
- * real. `safeMin`/`safeMax` son el rango que snapCutsToWordBoundaries
- * ya calculó como seguro para este borde (`edgeBounds`) -- la ventana
- * de búsqueda (+-AUDIO_SEARCH_RADIUS_SECONDS alrededor de `wordSafeSeconds`)
- * se recorta SIEMPRE a ese rango, nunca lo excede: un hallazgo acústico
- * nunca puede reintroducir el corte de una palabra.
- *
- * Si no hay un punto de pausa confiable, devuelve el propio límite
- * seguro por palabra sin tocar (`refined: false`) -- nunca se deja un
- * borde defectuoso, pero tampoco se inventa una pausa sin confirmar
- * (la selección por energía es una herramienta para mejorar la
- * precisión, no una garantía absoluta -- dictamen, sección 2).
+ * De una lista de intervalos de silencio real, el más cercano a
+ * `targetSeconds` -- distancia 0 si el punto ya cae dentro del
+ * intervalo. El punto elegido dentro del intervalo elegido es su
+ * CENTRO (el lugar más seguro para cortar: máximo margen a ambos
+ * lados dentro de la pausa confirmada).
  */
-export const refineEdgeAcoustically = async ({
+export const findNearestRealPause = (intervals, targetSeconds) => {
+  if (!intervals || intervals.length === 0) return null;
+  let best = null;
+  let bestDistance = Infinity;
+  for (const iv of intervals) {
+    const distance = targetSeconds < iv.start ? iv.start - targetSeconds : targetSeconds > iv.end ? targetSeconds - iv.end : 0;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = iv;
+    }
+  }
+  return { interval: best, distanceSeconds: bestDistance, chosenSeconds: (best.start + best.end) / 2 };
+};
+
+/**
+ * Busca la pausa real más cercana a `targetSeconds`, dentro de
+ * +-`maxDistanceSeconds` (precisión (a): 1.0s por defecto, ya NO
+ * limitado al rango "seguro por palabra" de Whisper). Devuelve `null`
+ * si no hay ninguna pausa confirmada dentro de esa distancia --
+ * requisito del dictamen: "si no existe un punto seguro, conservar el
+ * fragmento hablado", nunca se inventa un punto.
+ */
+export const findRealPauseNearEdge = async ({
   ffmpegPath,
   ffmpegEnv,
   videoPath,
-  wordSafeSeconds,
-  safeMin,
-  safeMax,
+  targetSeconds,
+  maxDistanceSeconds = SILENCE_SEARCH_RADIUS_SECONDS,
+  noiseDb = SILENCE_NOISE_DB,
+  minDurationSeconds = SILENCE_MIN_DURATION_SECONDS,
+  videoDurationSeconds,
 }) => {
-  const windowStart = Math.max(safeMin, wordSafeSeconds - AUDIO_SEARCH_RADIUS_SECONDS);
-  const windowEnd = Math.min(safeMax, wordSafeSeconds + AUDIO_SEARCH_RADIUS_SECONDS);
-
-  if (windowEnd - windowStart <= 0) {
-    return { seconds: wordSafeSeconds, refined: false, profile: [] };
+  const windowStart = Math.max(0, targetSeconds - maxDistanceSeconds);
+  const windowEndRaw = targetSeconds + maxDistanceSeconds;
+  const windowEnd = typeof videoDurationSeconds === "number" ? Math.min(videoDurationSeconds, windowEndRaw) : windowEndRaw;
+  const windowDuration = windowEnd - windowStart;
+  if (windowDuration <= 0) {
+    return { found: false, intervals: [] };
   }
 
-  const pcm = await extractPcmWindow({
-    ffmpegPath,
-    ffmpegEnv,
-    videoPath,
-    startSeconds: windowStart,
-    durationSeconds: windowEnd - windowStart,
-  });
-  const profile = computeRmsProfile(pcm, windowStart);
-  const pausePoint = findAcousticPausePoint(profile);
+  const stderrText = await detectSilences({ ffmpegPath, ffmpegEnv, videoPath, windowStart, windowDuration, noiseDb, minDurationSeconds });
+  const intervals = parseSilenceDetectOutput(stderrText, windowStart, windowDuration);
+  const nearest = findNearestRealPause(intervals, targetSeconds);
 
-  if (pausePoint === null) {
-    return { seconds: wordSafeSeconds, refined: false, profile };
+  if (!nearest || nearest.distanceSeconds > maxDistanceSeconds) {
+    return { found: false, intervals };
   }
-  return { seconds: pausePoint, refined: true, profile };
+  return { found: true, seconds: nearest.chosenSeconds, interval: nearest.interval, intervals };
 };
 
 /**
- * Refina acústicamente TODOS los cortes (ambos bordes de cada uno) --
- * para el pipeline real (planEditIfNeeded/POST /jobs/:id/replan en
- * index.mjs). Usa `edgeBounds` (de snapCutsToWordBoundaries) para que
- * cada refinamiento nunca busque fuera del rango ya garantizado seguro
- * por palabra.
+ * Corrige TODOS los cortes usando pausas reales como fuente principal
+ * (precisión (a) del operador) -- para el pipeline real
+ * (planEditIfNeeded/POST /jobs/:id/replan en index.mjs).
  *
- * Requisito 8 del dictamen: si ninguno de los dos bordes de un corte
- * encuentra una pausa confiable Y ADEMÁS el corte ya venía ajustado
- * por palabra (su rango seguro es más angosto que lo que pidió el
- * modelo), se prioriza conservar el audio hablado -- nunca se deja un
- * corte con un borde que no se pudo confirmar. En la práctica esto ya
- * lo garantiza snapCutsToWordBoundaries (el corte nunca cae dentro de
- * una palabra); acá solo se vigila que el refinamiento acústico en sí
- * no vuelva a invertir o degenerar el corte -- si pasa, se descarta y
- * se registra, igual que snapCutsToWordBoundaries.
+ * Para cada borde de cada corte: busca la pausa real más cercana
+ * dentro de +-SILENCE_SEARCH_RADIUS_SECONDS, centrada en el límite ya
+ * "seguro por palabra" (de snapCutsToWordBoundaries, recibido en
+ * `cuts`) -- se usa como punto de partida de la búsqueda, NO como
+ * límite que no se puede cruzar: si Whisper está desfasado, la pausa
+ * real elegida puede caer afuera de ese rango.
+ *
+ * Si CUALQUIERA de los dos bordes no encuentra una pausa real
+ * confirmada, se descarta el corte entero y se registra en
+ * `cutIssues` -- "si no hay pausa, no cortes: conserva el audio",
+ * nunca se fuerza un corte con un borde sin confirmar.
  */
-export const refineCutsAcoustically = async ({ cuts, edgeBounds, videoPath, ffmpegPath, ffmpegEnv, minCutSeconds, log = () => {} }) => {
+export const refineCutsWithRealSilence = async ({
+  cuts,
+  videoPath,
+  videoDurationSeconds,
+  ffmpegPath,
+  ffmpegEnv,
+  log = () => {},
+}) => {
   const cutIssues = [];
   const refined = [];
 
   for (const cut of cuts) {
-    const bounds = edgeBounds[cut.id];
-    if (!bounds) {
-      refined.push(cut);
-      continue;
-    }
-
-    let startSeconds = cut.startSeconds;
-    let endSeconds = cut.endSeconds;
     try {
-      const startResult = await refineEdgeAcoustically({
-        ffmpegPath,
-        ffmpegEnv,
-        videoPath,
-        wordSafeSeconds: cut.startSeconds,
-        safeMin: bounds.start.min,
-        safeMax: bounds.start.max,
+      const startResult = await findRealPauseNearEdge({
+        ffmpegPath, ffmpegEnv, videoPath, videoDurationSeconds,
+        targetSeconds: cut.startSeconds,
       });
-      startSeconds = startResult.seconds;
+      const endResult = await findRealPauseNearEdge({
+        ffmpegPath, ffmpegEnv, videoPath, videoDurationSeconds,
+        targetSeconds: cut.endSeconds,
+      });
+
+      if (!startResult.found || !endResult.found) {
+        cutIssues.push(
+          `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s${cut.reason ? `, ${cut.reason}` : ""}): ` +
+            `${!startResult.found ? "no se encontró una pausa real confirmada cerca del inicio" : ""}` +
+            `${!startResult.found && !endResult.found ? " ni cerca del final" : !endResult.found ? "no se encontró una pausa real confirmada cerca del final" : ""}` +
+            ` (ventana de ±${SILENCE_SEARCH_RADIUS_SECONDS}s) -- se conserva el audio hablado en vez de forzar un corte sin confirmar.`,
+        );
+        continue;
+      }
+
       log(
-        `corte "${cut.id}" borde inicio: ${
-          startResult.refined
-            ? `ajustado acústicamente a ${startSeconds.toFixed(3)}s (pausa real encontrada)`
-            : `sin pausa acústica confiable -- se usa el límite seguro por palabra (${startSeconds.toFixed(3)}s)`
-        }`,
+        `corte "${cut.id}" borde inicio: pausa real confirmada en ${startResult.seconds.toFixed(3)}s ` +
+          `(antes: ${cut.startSeconds.toFixed(3)}s, desfase ${Math.abs(startResult.seconds - cut.startSeconds).toFixed(3)}s).`,
+      );
+      log(
+        `corte "${cut.id}" borde final: pausa real confirmada en ${endResult.seconds.toFixed(3)}s ` +
+          `(antes: ${cut.endSeconds.toFixed(3)}s, desfase ${Math.abs(endResult.seconds - cut.endSeconds).toFixed(3)}s).`,
       );
 
-      const endResult = await refineEdgeAcoustically({
-        ffmpegPath,
-        ffmpegEnv,
-        videoPath,
-        wordSafeSeconds: cut.endSeconds,
-        safeMin: bounds.end.min,
-        safeMax: bounds.end.max,
-      });
-      endSeconds = endResult.seconds;
-      log(
-        `corte "${cut.id}" borde final: ${
-          endResult.refined
-            ? `ajustado acústicamente a ${endSeconds.toFixed(3)}s (pausa real encontrada)`
-            : `sin pausa acústica confiable -- se usa el límite seguro por palabra (${endSeconds.toFixed(3)}s)`
-        }`,
-      );
+      if (endResult.seconds - startResult.seconds <= 0) {
+        cutIssues.push(
+          `corte "${cut.id}": las pausas reales encontradas en cada borde se cruzan (inicio ${startResult.seconds.toFixed(3)}s, final ${endResult.seconds.toFixed(3)}s) -- descartado, se conserva el audio.`,
+        );
+        continue;
+      }
+
+      refined.push({ ...cut, startSeconds: startResult.seconds, endSeconds: endResult.seconds });
     } catch (err) {
-      log(`corte "${cut.id}": el análisis acústico falló (${err.message ?? err}) -- se usa el límite seguro por palabra sin refinar.`);
-      startSeconds = cut.startSeconds;
-      endSeconds = cut.endSeconds;
-    }
-
-    if (endSeconds - startSeconds < minCutSeconds) {
+      log(`corte "${cut.id}": el análisis de audio real falló (${err.message ?? err}) -- se conserva el audio, no se corta sin confirmar.`);
       cutIssues.push(
-        `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s): el refinamiento acústico de ambos bordes dejó menos de ${(minCutSeconds * 1000).toFixed(0)}ms de corte real -- descartado para no arriesgar un corte defectuoso.`,
+        `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s): el análisis de audio real falló (${err.message ?? err}) -- se conserva el audio en vez de arriesgar un corte sin confirmar.`,
       );
-      continue;
     }
-
-    refined.push({ ...cut, startSeconds, endSeconds });
   }
 
   return { cuts: refined, cutIssues };

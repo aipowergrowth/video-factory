@@ -9,10 +9,16 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
-import { planEdit, mergeNearbyGaplessCuts, snapCutsToWordBoundaries, buildSnapCutsDiagnostic, MIN_CUT_SECONDS } from "./editorial.mjs";
+import { planEdit, mergeNearbyGaplessCuts, snapCutsToWordBoundaries, buildSnapCutsDiagnostic } from "./editorial.mjs";
 import { buildTimeline } from "./timeline.mjs";
 import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee, computePendingResources } from "./cta-guarantee.mjs";
-import { refineCutsAcoustically, refineEdgeAcoustically } from "./audio-analysis.mjs";
+import {
+  refineCutsWithRealSilence,
+  findRealPauseNearEdge,
+  findNearestRealPause,
+  SILENCE_WIDE_REPORT_RADIUS_SECONDS,
+  SILENCE_SEARCH_RADIUS_SECONDS,
+} from "./audio-analysis.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -557,30 +563,32 @@ const planEditIfNeeded = async (jobId, job) => {
   // palabra "Cameron" y se comía sus primeras sílabas. Ningún borde de
   // corte puede caer dentro de una palabra -- se recorta hacia adentro
   // con margen, o se descarta entero si no hay forma segura de hacerlo.
-  const { cuts: snappedCuts, cutIssues: snapCutIssues, edgeBounds } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
+  const { cuts: snappedCuts, cutIssues: snapCutIssues } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
   for (const issue of snapCutIssues) {
     console.log(`[job ${jobId}]   ${issue}`);
   }
-  // Los tiempos de Whisper pueden estar desfasados del audio real
-  // (defecto real: "Cameron Sepah" sonaba cortado aunque el ajuste por
-  // palabra ya se había aplicado) -- dentro del rango ya garantizado
-  // seguro por palabra (nunca afuera de él), se busca el punto de
-  // menor energía real del audio con FFmpeg. Nunca se sale del rango
-  // seguro, así que esto solo puede mejorar la precisión, nunca
-  // reintroducir el corte de una palabra. Sin un video real en disco
-  // (job de prueba sin `input.baseVideo`) se omite -- quedan los
-  // cortes ya seguros por palabra, igual que antes de esta corrección.
+  // Los tiempos de Whisper pueden estar desfasados del audio real --
+  // confirmado en producción: "Cameron Sepah" sonaba cortado aunque el
+  // ajuste por palabra ya se había aplicado, y el desfase medido
+  // superaba la ventana angosta que se usaba antes. El audio real
+  // (silencedetect de FFmpeg) es ahora la fuente PRINCIPAL: busca la
+  // pausa real más cercana a cada borde dentro de +-1s, sin exigir que
+  // quede dentro del límite "seguro por palabra" de Whisper. Si algún
+  // borde no tiene una pausa real confirmada, se descarta el corte
+  // entero -- se prioriza conservar el audio hablado antes que
+  // producir un corte sin confirmar. Sin un video real en disco (job
+  // de prueba sin `input.baseVideo`) se omite -- quedan los cortes ya
+  // seguros por palabra, igual que antes de esta corrección.
   let acousticCuts = snappedCuts;
   let acousticCutIssues = [];
   if (typeof job.input.baseVideo === "string") {
     const ffmpegPathForAudio = resolveCompositorFfmpeg();
-    ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsAcoustically({
+    ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsWithRealSilence({
       cuts: snappedCuts,
-      edgeBounds,
       videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
+      videoDurationSeconds: job.input.durationInSeconds,
       ffmpegPath: ffmpegPathForAudio,
       ffmpegEnv: binaryEnv(ffmpegPathForAudio),
-      minCutSeconds: MIN_CUT_SECONDS,
       log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
     }));
   }
@@ -952,7 +960,7 @@ app.post("/jobs/:id/replan", async (req, res) => {
     for (const line of mergeLog) {
       console.log(`[replan ${jobId}]   ${line}`);
     }
-    const { cuts: snappedCuts, cutIssues: snapCutIssues, edgeBounds } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
+    const { cuts: snappedCuts, cutIssues: snapCutIssues } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
     for (const issue of snapCutIssues) {
       console.log(`[replan ${jobId}]   ${issue}`);
     }
@@ -960,13 +968,12 @@ app.post("/jobs/:id/replan", async (req, res) => {
     let acousticCutIssues = [];
     if (typeof job.input.baseVideo === "string") {
       const ffmpegPathForAudio = resolveCompositorFfmpeg();
-      ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsAcoustically({
+      ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsWithRealSilence({
         cuts: snappedCuts,
-        edgeBounds,
         videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
+        videoDurationSeconds: job.input.durationInSeconds,
         ffmpegPath: ffmpegPathForAudio,
         ffmpegEnv: binaryEnv(ffmpegPathForAudio),
-        minCutSeconds: MIN_CUT_SECONDS,
         log: (msg) => console.log(`[replan ${jobId}]   ${msg}`),
       }));
     }
@@ -1022,12 +1029,14 @@ app.post("/jobs/:id/replan", async (req, res) => {
  * exactamente qué palabra cae en cada borde sin tener que exponer el
  * array completo de transcriptWords (puede ser enorme) por otro canal.
  *
- * Precisión B del operador (30-oct-2026): si el job tiene un video
- * real en disco (`input.baseVideo`), además corre el análisis de
- * energía acústica real sobre cada borde -- devuelve el perfil en dB y
- * el punto elegido, para poder verificar sin tener que escuchar el
- * audio completo. Sigue sin llamar al modelo, sin costo, sin persistir
- * ni modificar nada.
+ * Precisión B del operador sobre el resultado real en el VPS
+ * (30-oct-2026): si el job tiene un video real en disco
+ * (`input.baseVideo`), además corre `silencedetect` real de FFmpeg
+ * alrededor de cada borde -- devuelve las pausas reales detectadas en
+ * +-3s y las compara contra el límite "seguro por palabra" de Whisper
+ * (para medir el desfase), más si esa pausa caería dentro de la
+ * ventana que de verdad usa producción (+-1s). Sigue sin llamar al
+ * modelo, sin costo, sin persistir ni modificar nada.
  */
 app.post("/jobs/:id/snap-cuts", async (req, res) => {
   const jobId = req.params.id;
@@ -1054,38 +1063,44 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
     }
   }
 
-  const { adjustedCuts, cutIssues, wordsNearEdges, edgeBounds } = buildSnapCutsDiagnostic(cuts, job.transcriptWords);
+  const { adjustedCuts, cutIssues, wordsNearEdges } = buildSnapCutsDiagnostic(cuts, job.transcriptWords);
 
   let acousticNote = null;
   if (typeof job.input.baseVideo !== "string") {
-    acousticNote = 'Este job no tiene "input.baseVideo" (sin video real en disco) -- se omite el análisis acústico, solo se devuelve el diagnóstico por palabra.';
+    acousticNote = 'Este job no tiene "input.baseVideo" (sin video real en disco) -- se omite el análisis de audio real, solo se devuelve el diagnóstico por palabra.';
   } else {
     const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
     const ffmpegPathForAudio = resolveCompositorFfmpeg();
     const ffmpegEnvForAudio = binaryEnv(ffmpegPathForAudio);
 
     for (const edge of wordsNearEdges) {
-      const bounds = edgeBounds[edge.cutId]?.[edge.edge];
-      if (edge.discarded || !bounds) {
-        edge.acoustic = null;
+      if (edge.discarded) {
+        edge.silenceAnalysis = null;
         continue;
       }
       try {
-        const result = await refineEdgeAcoustically({
+        const wide = await findRealPauseNearEdge({
           ffmpegPath: ffmpegPathForAudio,
           ffmpegEnv: ffmpegEnvForAudio,
           videoPath,
-          wordSafeSeconds: edge.adjustedSeconds,
-          safeMin: bounds.min,
-          safeMax: bounds.max,
+          targetSeconds: edge.adjustedSeconds,
+          maxDistanceSeconds: SILENCE_WIDE_REPORT_RADIUS_SECONDS,
+          videoDurationSeconds: job.input.durationInSeconds,
         });
-        edge.acoustic = {
-          refined: result.refined,
-          chosenSeconds: Number(result.seconds.toFixed(3)),
-          profileDb: result.profile.map((f) => ({ offsetSeconds: f.offsetSeconds, db: f.db })),
+        const nearest = findNearestRealPause(wide.intervals, edge.adjustedSeconds);
+        edge.silenceAnalysis = {
+          realPausesWithin3s: wide.intervals.map((iv) => ({ start: Number(iv.start.toFixed(3)), end: Number(iv.end.toFixed(3)) })),
+          nearestRealPauseSeconds: nearest ? Number(nearest.chosenSeconds.toFixed(3)) : null,
+          // Si esa pausa caería dentro de la ventana que de verdad usa
+          // producción (+-1s) -- si no, producción descartaría este
+          // corte en vez de usarla (precisión A del operador).
+          wouldUseInProduction: Boolean(nearest && nearest.distanceSeconds <= SILENCE_SEARCH_RADIUS_SECONDS),
+          // Desfase entre el límite "seguro por palabra" (Whisper) y la
+          // pausa real más cercana -- lo que pide medir la precisión B.
+          whisperVsRealOffsetSeconds: nearest ? Number((nearest.chosenSeconds - edge.adjustedSeconds).toFixed(3)) : null,
         };
       } catch (err) {
-        edge.acoustic = { error: String(err.message ?? err) };
+        edge.silenceAnalysis = { error: String(err.message ?? err) };
       }
     }
   }

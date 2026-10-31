@@ -1,25 +1,25 @@
 // PRUEBA SIMULADA -- no llama a FFmpeg real (no hay uno funcional en
-// este entorno de desarrollo, ver informe). Prueba la lógica PURA de
-// análisis de energía (computeRmsProfile, findAcousticPausePoint) con
-// buffers PCM y perfiles sintéticos, y el CONTROL DE FLUJO de
-// refineEdgeAcoustically/refineCutsAcoustically inyectando un extractor
-// PCM falso (__setPcmExtractorForTesting, mismo patrón que
-// __setAnthropicClientForTesting en editorial.mjs) -- la invocación
-// REAL de FFmpeg dentro del extractor de verdad (realExtractPcmWindow)
-// queda sin probar acá a propósito, revisada por lectura cuidadosa en
-// vez de ejecución.
+// este entorno de desarrollo, ver informe; y el ffmpeg REAL de
+// producción además resultó estar compilado con --disable-muxers, sin
+// el muxer "s16le" que usaba la versión anterior de este archivo).
+// Prueba la lógica PURA de parseo/decisión (parseSilenceDetectOutput,
+// findNearestRealPause) con texto de stderr sintético, y el CONTROL DE
+// FLUJO de findRealPauseNearEdge/refineCutsWithRealSilence inyectando
+// un detector de silencios falso (__setSilenceDetectorForTesting,
+// mismo patrón que __setAnthropicClientForTesting en editorial.mjs) --
+// la invocación REAL de FFmpeg (realDetectSilences) queda sin probar
+// acá a propósito, revisada por lectura cuidadosa en vez de ejecución.
 import {
-  computeRmsProfile,
-  findAcousticPausePoint,
-  refineEdgeAcoustically,
-  refineCutsAcoustically,
-  __setPcmExtractorForTesting,
-  PAUSE_RELATIVE_DROP_DB,
-  PAUSE_MIN_SUSTAINED_MS,
+  parseSilenceDetectOutput,
+  findNearestRealPause,
+  findRealPauseNearEdge,
+  refineCutsWithRealSilence,
+  __setSilenceDetectorForTesting,
+  SILENCE_SEARCH_RADIUS_SECONDS,
 } from "./audio-analysis.mjs";
 
 let failures = 0;
-const approx = (a, b, eps = 0.05) => Math.abs(a - b) < eps;
+const approx = (a, b, eps = 0.01) => Math.abs(a - b) < eps;
 const check = (label, cond) => {
   if (!cond) {
     failures++;
@@ -29,263 +29,212 @@ const check = (label, cond) => {
   }
 };
 
-/** Construye un buffer PCM s16le mono de `durationMs` con amplitud constante. */
-const pcmFrame = (amplitude, durationMs, sampleRate = 16000) => {
-  const sampleCount = Math.round((sampleRate * durationMs) / 1000);
-  const buf = Buffer.alloc(sampleCount * 2);
-  for (let i = 0; i < sampleCount; i++) {
-    buf.writeInt16LE(amplitude, i * 2);
-  }
-  return buf;
-};
+/** stderr sintético de ffmpeg con un solo par silence_start/silence_end. */
+const fakeStderr = (startStr, endStr) =>
+  `[silencedetect @ 0x55] silence_start: ${startStr}\n[silencedetect @ 0x55] silence_end: ${endStr} | silence_duration: 0.333\n`;
 
-const concatPcm = (...buffers) => Buffer.concat(buffers);
-
-// --- computeRmsProfile ---
+// --- parseSilenceDetectOutput ---
 
 {
-  const silence = pcmFrame(0, 10);
-  const profile = computeRmsProfile(silence, 0);
-  check("silencio absoluto: 1 frame de 10ms", profile.length === 1);
-  check("silencio absoluto: db en el piso (-96)", profile[0].db === -96);
+  // Caso ABSOLUTO: los tiempos reportados ya caen dentro de la ventana
+  // pedida (29-31s) -- se usan tal cual, sin sumar windowStart.
+  const stderr = fakeStderr("29.68", "30.24");
+  const intervals = parseSilenceDetectOutput(stderr, 29.0, 2.0);
+  check("interpretación absoluta: 1 intervalo", intervals.length === 1);
+  check("interpretación absoluta: se usa el valor tal cual (29.68)", approx(intervals[0].start, 29.68));
 }
 
 {
-  const full = pcmFrame(32767, 10);
-  const profile = computeRmsProfile(full, 0);
-  check("amplitud máxima constante: db cercano a 0", approx(profile[0].db, 0, 0.1));
+  // Caso RELATIVO: los tiempos reportados son chicos (0.68s), no
+  // caen dentro de la ventana absoluta (29-31s) -- se interpretan como
+  // relativos al inicio de la ventana y se les suma windowStart (29.0).
+  const stderr = fakeStderr("0.68", "1.24");
+  const intervals = parseSilenceDetectOutput(stderr, 29.0, 2.0);
+  check("interpretación relativa: se detecta y se corrige sumando windowStart", approx(intervals[0].start, 29.68));
 }
 
 {
-  const half = pcmFrame(16384, 10);
-  const profile = computeRmsProfile(half, 0);
-  // 20*log10(16384/32768) = 20*log10(0.5) ≈ -6.02dB
-  check("amplitud a la mitad: db ≈ -6.02", approx(profile[0].db, -6.02));
+  // silence_start sin su silence_end correspondiente -- la ventana
+  // terminó todavía en silencio. Se cierra al final de la ventana, no
+  // se descarta ni se extrapola más allá.
+  const stderr = "[silencedetect @ 0x55] silence_start: 29.9\n";
+  const intervals = parseSilenceDetectOutput(stderr, 29.0, 2.0); // ventana 29.0-31.0
+  check("silence_start sin silence_end: se cierra al final de la ventana analizada", intervals.length === 1 && approx(intervals[0].end, 31.0));
 }
 
 {
-  const buf = concatPcm(pcmFrame(30000, 10), pcmFrame(30000, 10));
-  const profile = computeRmsProfile(buf, 5.0);
-  check("offsetSeconds: el primer frame empieza en el tiempo de ventana dado", profile[0].offsetSeconds === 5.0);
-  check("offsetSeconds: el segundo frame está 10ms después", approx(profile[1].offsetSeconds, 5.01));
-}
-
-// --- findAcousticPausePoint ---
-
-{
-  // Pausa real: 5 frames de silencio (50ms, sostenido) en medio de voz
-  // fuerte -- debe encontrarse.
-  const profile = [
-    { offsetSeconds: 0.0, db: -10 },
-    { offsetSeconds: 0.01, db: -10 },
-    { offsetSeconds: 0.02, db: -40 }, // empieza la pausa
-    { offsetSeconds: 0.03, db: -42 },
-    { offsetSeconds: 0.04, db: -45 }, // la más silenciosa
-    { offsetSeconds: 0.05, db: -41 },
-    { offsetSeconds: 0.06, db: -40 }, // termina la pausa
-    { offsetSeconds: 0.07, db: -10 },
-    { offsetSeconds: 0.08, db: -10 },
-  ];
-  const point = findAcousticPausePoint(profile);
-  check("pausa real sostenida: se encuentra un punto", point !== null);
-  check("pausa real: el punto elegido es el más silencioso del tramo (0.04, -45dB)", point === 0.04);
+  // Sin ninguna línea de silencio -- ninguna pausa detectada.
+  const intervals = parseSilenceDetectOutput("algo de log normal de ffmpeg\nnada de silencedetect\n", 29.0, 2.0);
+  check("sin líneas de silencio: array vacío", intervals.length === 0);
 }
 
 {
-  // Caída breve de un solo frame (p.ej. dentro de una consonante) --
-  // NO cuenta como pausa real (requisito 5 del dictamen).
-  const profile = [
-    { offsetSeconds: 0.0, db: -10 },
-    { offsetSeconds: 0.01, db: -10 },
-    { offsetSeconds: 0.02, db: -30 }, // un solo frame bajo, no sostenido
-    { offsetSeconds: 0.03, db: -10 },
-    { offsetSeconds: 0.04, db: -10 },
-  ];
-  const point = findAcousticPausePoint(profile);
-  check("caída de un solo frame (no sostenida): no se confunde con una pausa real", point === null);
+  // Dos pares en la misma ventana.
+  const stderr = fakeStderr("29.2", "29.4") + fakeStderr("30.6", "30.9");
+  const intervals = parseSilenceDetectOutput(stderr, 29.0, 2.0);
+  check("dos pares silence_start/end: se detectan ambos", intervals.length === 2);
+}
+
+// --- findNearestRealPause ---
+
+{
+  const intervals = [{ start: 29.2, end: 29.4 }, { start: 30.6, end: 30.9 }];
+  const result = findNearestRealPause(intervals, 29.5);
+  check("más cercano: elige el intervalo 29.2-29.4 (dist 0.1) sobre 30.6-30.9 (dist 1.1)", result.interval.start === 29.2);
+  check("más cercano: distancia correcta", approx(result.distanceSeconds, 0.1));
 }
 
 {
-  // Caída sostenida pero poco profunda (menos de 12dB bajo el pico) --
-  // tampoco cuenta: podría ser el valle normal entre dos vocales, no
-  // una pausa real entre palabras.
-  const profile = [
-    { offsetSeconds: 0.0, db: -10 },
-    { offsetSeconds: 0.01, db: -10 },
-    { offsetSeconds: 0.02, db: -16 }, // solo 6dB bajo el pico, no 12
-    { offsetSeconds: 0.03, db: -16 },
-    { offsetSeconds: 0.04, db: -16 },
-    { offsetSeconds: 0.05, db: -10 },
-  ];
-  const point = findAcousticPausePoint(profile);
-  check("caída sostenida pero poco profunda (<12dB bajo el pico): no se toma como pausa", point === null);
+  const intervals = [{ start: 29.0, end: 29.5 }];
+  const result = findNearestRealPause(intervals, 29.2);
+  check("objetivo DENTRO del intervalo: distancia 0", result.distanceSeconds === 0);
+  check("objetivo dentro del intervalo: el punto elegido es el CENTRO del intervalo (29.25), no el objetivo", approx(result.chosenSeconds, 29.25));
 }
 
 {
-  // Todo fuerte, sin ningún mínimo real -- requisito 8: sin punto
-  // seguro, no se inventa uno.
-  const profile = [
-    { offsetSeconds: 0.0, db: -8 },
-    { offsetSeconds: 0.01, db: -9 },
-    { offsetSeconds: 0.02, db: -8 },
-    { offsetSeconds: 0.03, db: -9 },
-  ];
-  check("sin ningún mínimo real en toda la ventana: devuelve null, no inventa un punto", findAcousticPausePoint(profile) === null);
+  check("sin intervalos: devuelve null", findNearestRealPause([], 10) === null);
 }
 
-{
-  // Dos tramos silenciosos de distinta duración -- se elige el más
-  // largo (el que con más confianza es una pausa real), no el primero.
-  const profile = [
-    { offsetSeconds: 0.00, db: -10 },
-    { offsetSeconds: 0.01, db: -40 }, // tramo corto (10ms) -- no llega al mínimo sostenido
-    { offsetSeconds: 0.02, db: -10 },
-    { offsetSeconds: 0.03, db: -10 },
-    { offsetSeconds: 0.04, db: -41 }, // tramo largo (50ms) -- este es el que debería elegirse
-    { offsetSeconds: 0.05, db: -43 },
-    { offsetSeconds: 0.06, db: -50 },
-    { offsetSeconds: 0.07, db: -42 },
-    { offsetSeconds: 0.08, db: -41 },
-    { offsetSeconds: 0.09, db: -10 },
-  ];
-  const point = findAcousticPausePoint(profile);
-  check("dos tramos silenciosos: se elige el tramo más largo (sostenido), no el primero", point === 0.06);
-}
+// --- findRealPauseNearEdge: control de flujo con detector simulado ---
 
 {
-  check("constantes expuestas: PAUSE_RELATIVE_DROP_DB = 12", PAUSE_RELATIVE_DROP_DB === 12);
-  check("constantes expuestas: PAUSE_MIN_SUSTAINED_MS = 30", PAUSE_MIN_SUSTAINED_MS === 30);
-}
-
-{
-  // Perfil vacío: no explota, devuelve null.
-  check("perfil vacío: devuelve null sin lanzar error", findAcousticPausePoint([]) === null);
-}
-
-/** PCM de `durationSeconds` con un tramo silencioso centrado (loud-quiet-loud). */
-const buildPausePatternPcm = (durationSeconds, { loudAmp = 30000, quietAmp = 50 } = {}) => {
-  const totalMs = durationSeconds * 1000;
-  const thirdMs = totalMs / 3;
-  return concatPcm(pcmFrame(loudAmp, thirdMs), pcmFrame(quietAmp, thirdMs), pcmFrame(loudAmp, totalMs - 2 * thirdMs));
-};
-
-/** PCM de `durationSeconds` todo fuerte -- sin ninguna pausa real. */
-const buildAllLoudPcm = (durationSeconds, amp = 30000) => pcmFrame(amp, durationSeconds * 1000);
-
-// --- refineEdgeAcoustically: control de flujo con FFmpeg simulado ---
-
-{
-  __setPcmExtractorForTesting(async ({ startSeconds, durationSeconds }) => buildPausePatternPcm(durationSeconds));
-  const result = await refineEdgeAcoustically({
+  __setSilenceDetectorForTesting(async () => fakeStderr("29.68", "30.24"));
+  const result = await findRealPauseNearEdge({
     ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-    wordSafeSeconds: 30.0, safeMin: 29.5, safeMax: 30.5,
+    targetSeconds: 29.9,
   });
-  check("pausa real encontrada: refined=true", result.refined === true);
-  check("pausa real encontrada: el punto elegido cae dentro del tramo silencioso (centro de la ventana)", result.seconds > 29.5 && result.seconds < 30.5);
-  check("pausa real encontrada: devuelve el perfil completo", result.profile.length > 0);
-  __setPcmExtractorForTesting(null);
+  check("pausa real encontrada dentro de la distancia máxima: found=true", result.found === true);
+  check("pausa real encontrada: el punto elegido es el centro del intervalo (29.96)", approx(result.seconds, 29.96));
+  __setSilenceDetectorForTesting(null);
 }
 
 {
-  __setPcmExtractorForTesting(async ({ durationSeconds }) => buildAllLoudPcm(durationSeconds));
-  const result = await refineEdgeAcoustically({
+  // La pausa detectada está fuera de la ventana realmente analizada
+  // (más lejos del objetivo que SILENCE_SEARCH_RADIUS_SECONDS) -- un
+  // ffmpeg real nunca reportaría algo fuera de lo que se le pidió
+  // analizar, así que el detector simulado respeta la ventana pedida.
+  __setSilenceDetectorForTesting(async ({ windowStart, windowDuration }) => {
+    const windowEnd = windowStart + windowDuration;
+    // La única pausa real de este audio está en 29.68-30.24 -- el
+    // detector solo la "ve" si cae dentro de la ventana que se le pidió.
+    if (29.68 >= windowStart && 30.24 <= windowEnd) return fakeStderr("29.68", "30.24");
+    return "";
+  });
+  const result = await findRealPauseNearEdge({
     ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-    wordSafeSeconds: 30.0, safeMin: 29.5, safeMax: 30.5,
+    targetSeconds: 29.9, maxDistanceSeconds: 0.01,
   });
-  check("sin pausa real (todo fuerte): refined=false", result.refined === false);
-  check("sin pausa real: cae al límite seguro por palabra (wordSafeSeconds), no inventa un punto", result.seconds === 30.0);
-  __setPcmExtractorForTesting(null);
+  check("pausa fuera de la ventana realmente analizada: found=false", result.found === false);
+  __setSilenceDetectorForTesting(null);
 }
 
 {
-  // safeMin === safeMax (sin ventana real para buscar) -- ni se llama
-  // al extractor, cae directo al límite seguro por palabra.
+  // Sin ninguna pausa detectada -- found=false, nunca se inventa un punto.
+  __setSilenceDetectorForTesting(async () => "sin silencios en este tramo\n");
+  const result = await findRealPauseNearEdge({
+    ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
+    targetSeconds: 50.0,
+  });
+  check("sin pausas detectadas: found=false", result.found === false);
+  __setSilenceDetectorForTesting(null);
+}
+
+{
+  // Ventana recortada por la duración real del video (videoDurationSeconds)
+  // hasta degenerar -- ni siquiera llama al detector.
   let called = false;
-  __setPcmExtractorForTesting(async () => {
+  __setSilenceDetectorForTesting(async () => {
     called = true;
-    return buildAllLoudPcm(0.1);
+    return "";
   });
-  const result = await refineEdgeAcoustically({
+  const result = await findRealPauseNearEdge({
     ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-    wordSafeSeconds: 30.0, safeMin: 30.0, safeMax: 30.0,
+    // videoDurationSeconds (98) menor que windowStart (target-radio=99)
+    // -- la ventana [99,98] queda invertida, duración <= 0.
+    targetSeconds: 100.0, videoDurationSeconds: 98.0, maxDistanceSeconds: 1.0,
   });
-  check("ventana de búsqueda vacía: no llama al extractor en absoluto", called === false);
-  check("ventana de búsqueda vacía: devuelve el límite seguro sin tocar", result.seconds === 30.0 && result.refined === false);
-  __setPcmExtractorForTesting(null);
+  check("ventana degenerada por duración del video: no llama al detector", called === false);
+  check("ventana degenerada: found=false", result.found === false);
+  __setSilenceDetectorForTesting(null);
 }
 
+check("constante expuesta: SILENCE_SEARCH_RADIUS_SECONDS = 1.0", SILENCE_SEARCH_RADIUS_SECONDS === 1.0);
+
+// --- refineCutsWithRealSilence: orquesta ambos bordes de cada corte ---
+
 {
-  // El extractor (FFmpeg) falla -- se captura, no se propaga, no se
-  // inventa un punto: se usa el límite seguro por palabra.
-  __setPcmExtractorForTesting(async () => {
-    throw new Error("ffmpeg no encontrado (simulado)");
+  // Ambos bordes encuentran una pausa real -- el corte usa los puntos
+  // reales, incluso si caen afuera del rango "seguro por palabra"
+  // original (precisión (a): ya no limitado por Whisper).
+  __setSilenceDetectorForTesting(async ({ windowStart }) => {
+    // Devuelve una pausa centrada en el punto pedido, sin importar
+    // dónde cae la ventana -- simplifica el escenario de prueba.
+    return fakeStderr((windowStart + 0.9).toFixed(2), (windowStart + 1.1).toFixed(2));
   });
-  let threw = false;
-  let result;
-  try {
-    result = await refineEdgeAcoustically({
-      ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-      wordSafeSeconds: 30.0, safeMin: 29.5, safeMax: 30.5,
-    });
-  } catch {
-    threw = true;
-  }
-  check("si FFmpeg falla, refineEdgeAcoustically SÍ propaga el error (lo maneja quien lo llama, no acá)", threw === true);
-  __setPcmExtractorForTesting(null);
-}
-
-// --- refineCutsAcoustically: orquesta ambos bordes de cada corte ---
-
-{
-  // Ambos bordes encuentran una pausa real -- el corte final usa los
-  // puntos refinados, con log de ambas decisiones.
-  __setPcmExtractorForTesting(async ({ durationSeconds }) => buildPausePatternPcm(durationSeconds));
   const logs = [];
-  const { cuts, cutIssues } = await refineCutsAcoustically({
-    cuts: [{ id: "c1", startSeconds: 10.0, endSeconds: 20.0 }],
-    edgeBounds: { c1: { start: { min: 9.5, max: 10.5 }, end: { min: 19.5, max: 20.5 } } },
+  const { cuts, cutIssues } = await refineCutsWithRealSilence({
+    cuts: [{ id: "ai-cut-0", startSeconds: 29.68, endSeconds: 30.71 }],
     videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
-    minCutSeconds: 0.15,
     log: (msg) => logs.push(msg),
   });
-  check("ambos bordes refinados: el corte sobrevive", cuts.length === 1);
-  check("ambos bordes refinados: sin cutIssues", cutIssues.length === 0);
-  check("ambos bordes refinados: se logueó la decisión de cada borde", logs.some((l) => l.includes("borde inicio")) && logs.some((l) => l.includes("borde final")));
-  __setPcmExtractorForTesting(null);
+  check("ambos bordes con pausa real: el corte sobrevive", cuts.length === 1);
+  check("ambos bordes con pausa real: sin cutIssues", cutIssues.length === 0);
+  check("ambos bordes con pausa real: se logueó el desfase de cada borde", logs.some((l) => l.includes("desfase")));
+  __setSilenceDetectorForTesting(null);
 }
 
 {
-  // El análisis acústico falla para un corte -- se usa el límite
-  // seguro por palabra para ESE corte (no rompe los demás), y queda
-  // registrado en el log (no en cutIssues: el corte en sí sigue siendo
-  // válido, solo no se pudo refinar más).
-  __setPcmExtractorForTesting(async () => {
+  // Un borde no encuentra pausa real -- se descarta el corte ENTERO
+  // (precisión (a): "si no hay pausa, no cortes: conserva el audio").
+  __setSilenceDetectorForTesting(async ({ windowStart }) => (windowStart < 20 ? "" : fakeStderr((windowStart + 0.1).toFixed(2), (windowStart + 0.3).toFixed(2))));
+  const { cuts, cutIssues } = await refineCutsWithRealSilence({
+    cuts: [{ id: "ai-cut-x", startSeconds: 10.0, endSeconds: 25.0 }],
+    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
+  });
+  check("un borde sin pausa real: el corte se descarta entero", cuts.length === 0);
+  check("un borde sin pausa real: queda registrado en cutIssues", cutIssues.length === 1 && cutIssues[0].includes("ai-cut-x"));
+  __setSilenceDetectorForTesting(null);
+}
+
+{
+  // El análisis de audio falla (FFmpeg no disponible/archivo inexistente)
+  // -- se conserva el audio (se descarta el corte), se registra.
+  __setSilenceDetectorForTesting(async () => {
     throw new Error("ffmpeg no disponible (simulado)");
   });
   const logs = [];
-  const { cuts, cutIssues } = await refineCutsAcoustically({
-    cuts: [{ id: "c1", startSeconds: 10.0, endSeconds: 20.0 }],
-    edgeBounds: { c1: { start: { min: 9.5, max: 10.5 }, end: { min: 19.5, max: 20.5 } } },
+  const { cuts, cutIssues } = await refineCutsWithRealSilence({
+    cuts: [{ id: "ai-cut-y", startSeconds: 10.0, endSeconds: 11.0 }],
     videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
-    minCutSeconds: 0.15,
     log: (msg) => logs.push(msg),
   });
-  check("falla el análisis acústico: el corte sobrevive con sus límites seguros por palabra (sin refinar)", cuts.length === 1 && cuts[0].startSeconds === 10.0 && cuts[0].endSeconds === 20.0);
-  check("falla el análisis acústico: no genera cutIssues (el corte sigue siendo válido)", cutIssues.length === 0);
-  check("falla el análisis acústico: queda registrado en el log", logs.some((l) => l.includes("falló")));
-  __setPcmExtractorForTesting(null);
+  check("falla el análisis: el corte se descarta (se conserva el audio)", cuts.length === 0);
+  check("falla el análisis: queda registrado en cutIssues", cutIssues.some((i) => i.includes("ai-cut-y")));
+  check("falla el análisis: también queda en el log", logs.some((l) => l.includes("falló")));
+  __setSilenceDetectorForTesting(null);
 }
 
 {
-  // Un corte sin edgeBounds (p.ej. ya fue descartado por
-  // snapCutsToWordBoundaries antes de llegar acá) pasa sin tocar.
-  const { cuts } = await refineCutsAcoustically({
-    cuts: [{ id: "sin-bounds", startSeconds: 5.0, endSeconds: 5.3 }],
-    edgeBounds: {},
-    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
-    minCutSeconds: 0.15,
+  // Las pausas reales elegidas en cada borde terminan cruzadas
+  // (inicio después del final) -- se descarta, nunca se deja un corte
+  // invertido. refineCutsWithRealSilence llama primero al borde de
+  // inicio y después al de final (orden fijo) -- se usa un contador
+  // para responder distinto a cada uno sin depender de inferir la
+  // ventana (start target=20.0 -> se le da una pausa tarde, 20.25-20.35;
+  // end target=20.3 -> se le da una pausa temprana, 19.9-20.0 -- quedan
+  // cruzadas: inicio elegido 20.3 > final elegido 19.95).
+  let callCount = 0;
+  __setSilenceDetectorForTesting(async () => {
+    callCount++;
+    return callCount === 1 ? fakeStderr("20.25", "20.35") : fakeStderr("19.9", "20.0");
   });
-  check("corte sin edgeBounds: pasa sin tocar", cuts.length === 1 && cuts[0].startSeconds === 5.0 && cuts[0].endSeconds === 5.3);
+  const { cuts, cutIssues } = await refineCutsWithRealSilence({
+    cuts: [{ id: "ai-cut-cross", startSeconds: 20.0, endSeconds: 20.5 }],
+    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
+  });
+  check("pausas cruzadas: el corte se descarta", cuts.length === 0);
+  check("pausas cruzadas: queda registrado en cutIssues", cutIssues.some((i) => i.includes("cruzan")));
+  __setSilenceDetectorForTesting(null);
 }
 
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);
