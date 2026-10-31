@@ -1066,12 +1066,28 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
   const { adjustedCuts, cutIssues, wordsNearEdges } = buildSnapCutsDiagnostic(cuts, job.transcriptWords);
 
   let acousticNote = null;
+  // finalCuts: los cortes EFECTIVOS que de verdad usaría producción --
+  // corte por la MISMA función que usan planEditIfNeeded/POST /replan
+  // (refineCutsWithRealSilence), nunca una reimplementación aparte
+  // para este diagnóstico (pedido explícito del operador).
+  let finalCuts = adjustedCuts;
+  let allDiscardReasons = [...cutIssues];
   if (typeof job.input.baseVideo !== "string") {
     acousticNote = 'Este job no tiene "input.baseVideo" (sin video real en disco) -- se omite el análisis de audio real, solo se devuelve el diagnóstico por palabra.';
   } else {
     const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
     const ffmpegPathForAudio = resolveCompositorFfmpeg();
     const ffmpegEnvForAudio = binaryEnv(ffmpegPathForAudio);
+
+    const finalResult = await refineCutsWithRealSilence({
+      cuts: adjustedCuts,
+      videoPath,
+      videoDurationSeconds: job.input.durationInSeconds,
+      ffmpegPath: ffmpegPathForAudio,
+      ffmpegEnv: ffmpegEnvForAudio,
+    });
+    finalCuts = finalResult.cuts;
+    allDiscardReasons = [...allDiscardReasons, ...finalResult.cutIssues];
 
     for (const edge of wordsNearEdges) {
       if (edge.discarded) {
@@ -1093,11 +1109,17 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
           nearestRealPauseSeconds: nearest ? Number(nearest.chosenSeconds.toFixed(3)) : null,
           // Si esa pausa caería dentro de la ventana que de verdad usa
           // producción (+-1s) -- si no, producción descartaría este
-          // corte en vez de usarla (precisión A del operador).
+          // corte en vez de usarla (precisión A del operador). El
+          // mismo dato ya queda reflejado en finalCuts/discardedCuts
+          // arriba (vía la función real) -- esto es solo contexto por
+          // borde.
           wouldUseInProduction: Boolean(nearest && nearest.distanceSeconds <= SILENCE_SEARCH_RADIUS_SECONDS),
-          // Desfase entre el límite "seguro por palabra" (Whisper) y la
-          // pausa real más cercana -- lo que pide medir la precisión B.
-          whisperVsRealOffsetSeconds: nearest ? Number((nearest.chosenSeconds - edge.adjustedSeconds).toFixed(3)) : null,
+          // Distancia (con signo) desde el límite "seguro por palabra"
+          // hasta el CENTRO de la pausa real más cercana dentro de
+          // +-3s -- NO es una medición del desfase de Whisper: si no
+          // hay ninguna pausa real cerca, esto queda en null y no dice
+          // nada sobre si Whisper está o no desfasado en ese punto.
+          distanceToNearestRealPauseSeconds: nearest ? Number((nearest.chosenSeconds - edge.adjustedSeconds).toFixed(3)) : null,
         };
       } catch (err) {
         edge.silenceAnalysis = { error: String(err.message ?? err) };
@@ -1105,12 +1127,25 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
     }
   }
 
+  // Todo corte pedido que no sobrevivió en finalCuts queda identificado
+  // acá con su motivo -- nunca debería desaparecer sin aparecer en
+  // ninguno de los dos arrays (ni finalCuts ni discardedCuts).
+  const survivingIds = new Set(finalCuts.map((c) => c.id));
+  const discardedCuts = cuts
+    .filter((c) => !survivingIds.has(c.id))
+    .map((c) => ({
+      cutId: c.id,
+      reason: allDiscardReasons.find((r) => r.includes(`"${c.id}"`)) ?? "descartado -- motivo no encontrado en los registros, revisar manualmente.",
+    }));
+
   res.json({
     jobId,
     originalCuts: cuts,
     adjustedCuts,
     cutIssues,
     wordsNearEdges,
+    finalCuts,
+    discardedCuts,
     acousticNote,
   });
 });
