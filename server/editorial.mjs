@@ -32,6 +32,15 @@ const MIN_ZOOM_SECONDS = Number(process.env.EDITORIAL_MIN_ZOOM_SECONDS ?? 2);
 // mergeNearbyGaplessCuts(). Mismo valor que MIN_CUT_SECONDS por ahora,
 // pero es una constante aparte a propósito: miden cosas distintas.
 const CUT_MERGE_GAP_SECONDS = Number(process.env.EDITORIAL_CUT_MERGE_GAP_SECONDS ?? 0.15);
+// Defecto real sobre el render de dopamina (job ff69b475/a416b0e): un
+// corte terminaba DENTRO de la palabra "Cameron" (de la repetición
+// corregida que sí sobrevive), comiéndose sus primeras sílabas -- el
+// audio final sonaba "...ron Sepah" en vez de "...Cameron Sepah". Este
+// margen es lo que se deja de colchón entre el borde de un corte y la
+// palabra conservada más cercana (ver snapCutsToWordBoundaries).
+const CUT_WORD_BOUNDARY_MARGIN_SECONDS = Number(
+  process.env.EDITORIAL_CUT_WORD_BOUNDARY_MARGIN_SECONDS ?? 0.1,
+);
 // Tope de duración para los 3 CTA obligatorios (corrida real sobre el
 // job ff69b475, layout screen-share): el modelo propuso CTA de 53-54s
 // -- todo el tramo del discurso, no el llamado puntual -- en vez de los
@@ -615,6 +624,134 @@ export const mergeNearbyGaplessCuts = (cuts, transcriptWords) => {
   }
 
   return { cuts: merged, mergeLog };
+};
+
+/**
+ * Ajusta cada corte para que ningún borde caiga DENTRO de una palabra
+ * real de la transcripción -- defecto real: un corte terminaba a mitad
+ * de "Cameron" (la repetición corregida que sí sobrevive) y se comía
+ * sus primeras sílabas. Solo RECORTA el corte hacia adentro (nunca lo
+ * agranda, nunca elimina más de lo que el modelo pidió):
+ *   - si una palabra "straddlea" el INICIO del corte (empezó antes pero
+ *     todavía no terminó cuando el corte arranca), el inicio se empuja
+ *     hasta después de que esa palabra termine, más un margen.
+ *   - si una palabra "straddlea" el FINAL del corte (empezó antes de
+ *     que el corte termine pero sigue después), el final se adelanta
+ *     hasta antes de que esa palabra arranque, menos un margen -- este
+ *     es exactamente el caso real del defecto.
+ * Un corte que ya no toca ninguna palabra en sus bordes queda intacto.
+ * Si después de ajustar no queda al menos MIN_CUT_SECONDS de corte real
+ * (el margen de seguridad se comió todo el corte), se descarta entero y
+ * queda registrado -- nunca se deja un borde inseguro solo por no
+ * perder el corte.
+ *
+ * Sin `transcriptWords` no hay forma de verificar esto (mismo criterio
+ * conservador que mergeNearbyGaplessCuts): los cortes se devuelven sin
+ * tocar.
+ *
+ * Deliberadamente LOCAL a cada corte -- no considera si una palabra
+ * "conservada" para este corte en realidad desaparece por otro corte
+ * vecino; eso sería ampliar el alcance de esta corrección.
+ */
+export const snapCutsToWordBoundaries = (cuts, transcriptWords) => {
+  const hasWords = Array.isArray(transcriptWords) && transcriptWords.length > 0;
+  if (!hasWords) {
+    return { cuts, cutIssues: [] };
+  }
+
+  const sortedWords = [...transcriptWords].sort((a, b) => a.startMs - b.startMs);
+  const cutIssues = [];
+  const snapped = [];
+
+  for (const cut of cuts) {
+    // La palabra que se solapa con el INICIO del corte -- empieza antes
+    // de que el corte arranque, pero todavía no terminó. El corte no
+    // puede arrancar en medio de ella.
+    const straddleAtStart = sortedWords.find(
+      (w) => w.startMs / 1000 < cut.startSeconds && w.endMs / 1000 > cut.startSeconds,
+    );
+    // La palabra que se solapa con el FINAL del corte -- ya empezó antes
+    // de que el corte termine, pero sigue después. Este es el caso real
+    // del defecto: el corte terminaba a mitad de "Cameron".
+    const straddleAtEnd = sortedWords.find(
+      (w) => w.startMs / 1000 < cut.endSeconds && w.endMs / 1000 > cut.endSeconds,
+    );
+
+    const newStart = straddleAtStart
+      ? Math.max(cut.startSeconds, straddleAtStart.endMs / 1000 + CUT_WORD_BOUNDARY_MARGIN_SECONDS)
+      : cut.startSeconds;
+    const newEnd = straddleAtEnd
+      ? Math.min(cut.endSeconds, straddleAtEnd.startMs / 1000 - CUT_WORD_BOUNDARY_MARGIN_SECONDS)
+      : cut.endSeconds;
+
+    if (newEnd - newStart < MIN_CUT_SECONDS) {
+      cutIssues.push(
+        `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s${cut.reason ? `, ${cut.reason}` : ""}): no se pudo ajustar a un límite de palabra seguro (quedaba menos de ${(MIN_CUT_SECONDS * 1000).toFixed(0)}ms de corte real tras dejar el margen) -- descartado para no arriesgar cortar una palabra.`,
+      );
+      continue;
+    }
+
+    if (newStart !== cut.startSeconds || newEnd !== cut.endSeconds) {
+      snapped.push({ ...cut, startSeconds: newStart, endSeconds: newEnd });
+    } else {
+      snapped.push(cut);
+    }
+  }
+
+  return { cuts: snapped, cutIssues };
+};
+
+const SNAP_CUTS_EDGE_WINDOW_SECONDS = 2;
+
+/**
+ * Diagnóstico de solo lectura sobre un ajuste de cortes a límites de
+ * palabra -- para POST /jobs/:id/snap-cuts (server/index.mjs), donde
+ * quien llama no puede inspeccionar `transcriptWords` directamente
+ * (puede ser enorme) pero necesita ver exactamente qué palabra cae en
+ * cada borde de cada corte. Función pura, sin llamar al modelo, sin
+ * tocar ningún job -- separada de snapCutsToWordBoundaries para que la
+ * ruta HTTP solo se encargue de las preocupaciones de HTTP (404/409/
+ * 400) y esto se pueda testear sin levantar el servidor.
+ */
+export const buildSnapCutsDiagnostic = (cuts, transcriptWords) => {
+  // Redondeo SOLO para la presentación de este diagnóstico -- sumar/
+  // restar el margen en segundos deja ruido de punto flotante
+  // (29.700000000000003); snapCutsToWordBoundaries en sí no se toca,
+  // sigue devolviendo los números exactos para quien los persista.
+  const round3 = (n) => (typeof n === "number" ? Number(n.toFixed(3)) : n);
+
+  const { cuts: rawAdjustedCuts, cutIssues } = snapCutsToWordBoundaries(cuts, transcriptWords);
+  const adjustedCuts = rawAdjustedCuts.map((c) => ({ ...c, startSeconds: round3(c.startSeconds), endSeconds: round3(c.endSeconds) }));
+
+  const wordsNearEdges = cuts.flatMap((cut) => {
+    const adjusted = rawAdjustedCuts.find((c) => c.id === cut.id) ?? null;
+    const toWindow = (edgeSeconds) =>
+      extractExcerpt(transcriptWords, edgeSeconds, SNAP_CUTS_EDGE_WINDOW_SECONDS).map((w) => ({
+        text: w.text,
+        startSeconds: round3(w.startMs / 1000),
+        endSeconds: round3(w.endMs / 1000),
+      }));
+    return [
+      {
+        cutId: cut.id,
+        edge: "start",
+        originalSeconds: cut.startSeconds,
+        adjustedSeconds: adjusted ? round3(adjusted.startSeconds) : null,
+        discarded: adjusted === null,
+        wordsNearby: toWindow(cut.startSeconds),
+      },
+      {
+        cutId: cut.id,
+        edge: "end",
+        originalSeconds: cut.endSeconds,
+        adjustedSeconds: adjusted ? round3(adjusted.endSeconds) : null,
+        discarded: adjusted === null,
+        wordsNearby: toWindow(cut.endSeconds),
+      },
+    ];
+  });
+
+  return { adjustedCuts, cutIssues, wordsNearEdges };
 };
 
 const callModel = async ({ anthropic, prompt, model, maxTokens }) => {

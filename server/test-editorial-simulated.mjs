@@ -10,6 +10,8 @@ import {
   planEdit,
   parseEditorialResponse,
   mergeNearbyGaplessCuts,
+  snapCutsToWordBoundaries,
+  buildSnapCutsDiagnostic,
   clampCtaDuration,
   __setAnthropicClientForTesting,
 } from "./editorial.mjs";
@@ -56,6 +58,7 @@ const check = (label, cond) => {
     console.log(`ok: ${label}`);
   }
 };
+const approx = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
 
 // 1. Respuesta válida y limpia.
 {
@@ -682,6 +685,129 @@ const makeSequencedFakeClient = (responses) => {
     "duración editada: igual con la lista cruda (anidada) o con la ya unificada",
     timelineFromRaw.outputDurationInSeconds === timelineFromMerged.outputDurationInSeconds,
   );
+}
+
+// --- snapCutsToWordBoundaries: defecto real del render de dopamina
+// (job ff69b475/a416b0e) -- un corte terminaba a mitad de "Cameron" (la
+// repetición corregida que sí sobrevive) y se comía sus primeras
+// sílabas. El sonido final era "...ron Sepah" en vez de "...Cameron
+// Sepah". ---
+
+const w = (text, startSec, endSec) => ({ text, startMs: startSec * 1000, endMs: endSec * 1000, timestampMs: null, confidence: null });
+
+{
+  // Reproduce la forma exacta del defecto real: el FINAL del corte cae
+  // dentro de la palabra "cameron2" (la que sí sobrevive).
+  const words = [
+    w("doctor", 28.0, 28.5),
+    w("cameron1", 28.6, 29.2), // falso comienzo, se va a eliminar
+    w("sepa", 29.3, 29.6),
+    w("de", 29.65, 29.8),
+    w("la", 29.85, 30.1),
+    w("cameron2", 30.2, 30.8), // la que sobrevive -- NO se puede clipear
+    w("sepah", 30.9, 31.4),
+  ];
+  const cuts = [{ id: "c1", startSeconds: 29.25, endSeconds: 30.3 }]; // 30.3 cae DENTRO de cameron2
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check("final que cae dentro de una palabra: se adelanta a antes de que empiece esa palabra", result.cuts.length === 1 && approx(result.cuts[0].endSeconds, 30.1));
+  check("final ajustado: respeta el margen de 0.1s antes de la palabra protegida (30.2 - 0.1)", approx(result.cuts[0].endSeconds, 30.2 - 0.1));
+  check("inicio del corte: sin cambios, no había ninguna palabra solapada ahí", result.cuts[0].startSeconds === 29.25);
+  check("sin cutIssues: el corte se pudo ajustar sin descartarlo", result.cutIssues.length === 0);
+}
+
+{
+  // El INICIO del corte cae dentro de una palabra -- se empuja hacia
+  // adelante, nunca se agranda el corte hacia atrás.
+  const words = [w("palabra1", 5.0, 5.4), w("repetida", 5.5, 6.0), w("palabra3", 6.3, 6.7)];
+  const cuts = [{ id: "c2", startSeconds: 5.35, endSeconds: 6.0 }]; // 5.35 cae DENTRO de "palabra1"
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check("inicio que cae dentro de una palabra: se empuja a después de que termine esa palabra", result.cuts.length === 1 && approx(result.cuts[0].startSeconds, 5.4 + 0.1));
+  check("final del corte: sin cambios", result.cuts[0].endSeconds === 6.0);
+}
+
+{
+  // Corte ya limpio (ningún borde toca una palabra): queda intacto.
+  const words = [w("a", 1.0, 1.5), w("b", 1.9, 2.3)];
+  const cuts = [{ id: "c3", startSeconds: 1.5, endSeconds: 1.8 }];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check("corte limpio: no se toca", result.cuts.length === 1 && result.cuts[0].startSeconds === 1.5 && result.cuts[0].endSeconds === 1.8);
+  check("corte limpio: sin cutIssues", result.cutIssues.length === 0);
+}
+
+{
+  // Ambos bordes solapados y el margen de seguridad se come todo el
+  // corte -- no hay forma de cumplir la regla sin arriesgar una
+  // palabra, se descarta entero y queda registrado.
+  const words = [w("straddleStart", 1.40, 1.55), w("straddleEnd", 1.58, 1.9)];
+  const cuts = [{ id: "c4", startSeconds: 1.5, endSeconds: 1.65, reason: "corte de prueba" }];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check("corte imposible de ajustar: se descarta entero", result.cuts.length === 0);
+  check("corte descartado: queda registrado en cutIssues, nunca se deja un borde inseguro", result.cutIssues.length === 1 && result.cutIssues[0].includes("c4"));
+}
+
+{
+  // Sin transcriptWords: no hay forma de verificar, se devuelve igual
+  // (mismo criterio conservador que mergeNearbyGaplessCuts).
+  const cuts = [{ id: "c5", startSeconds: 10, endSeconds: 11 }];
+  const result = snapCutsToWordBoundaries(cuts, undefined);
+  check("sin transcriptWords: los cortes no se tocan", result.cuts.length === 1 && result.cuts[0].startSeconds === 10 && result.cuts[0].endSeconds === 11);
+  check("sin transcriptWords: sin cutIssues", result.cutIssues.length === 0);
+}
+
+{
+  // Varios cortes: solo el que de verdad tiene un borde comprometido se
+  // ajusta, los demás quedan igual.
+  const words = [w("x", 50.0, 50.4), w("y", 50.42, 50.9)];
+  const cuts = [
+    { id: "ok1", startSeconds: 0, endSeconds: 1 }, // lejos de cualquier palabra
+    { id: "bad", startSeconds: 50.1, endSeconds: 50.5 }, // ambos bordes solapan x/y
+  ];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check("varios cortes: el que no toca ninguna palabra queda igual", result.cuts.some((c) => c.id === "ok1" && c.startSeconds === 0 && c.endSeconds === 1));
+}
+
+// --- buildSnapCutsDiagnostic: para POST /jobs/:id/snap-cuts (diagnóstico
+// de solo lectura, sin llamar al modelo, sin tocar el job) ---
+
+{
+  // Caso real: el final del corte cae dentro de "cameron2" -- el
+  // diagnóstico tiene que mostrar exactamente esa palabra en la ventana
+  // de +-2s del borde final, y reflejar el ajuste.
+  const words = [
+    w("doctor", 28.0, 28.5),
+    w("cameron1", 28.6, 29.2),
+    w("sepa", 29.3, 29.6),
+    w("de", 29.65, 29.8),
+    w("la", 29.85, 30.1),
+    w("cameron2", 30.2, 30.8),
+    w("sepah", 30.9, 31.4),
+  ];
+  const cuts = [{ id: "ai-cut-0", startSeconds: 29.25, endSeconds: 30.71 }];
+  const result = buildSnapCutsDiagnostic(cuts, words);
+  check("diagnóstico: ajustedCuts tiene el corte recortado (endSeconds antes de cameron2)", result.adjustedCuts.length === 1 && approx(result.adjustedCuts[0].endSeconds, 30.1));
+  check("diagnóstico: sin cutIssues (el corte se pudo ajustar, no se descartó)", result.cutIssues.length === 0);
+
+  const endEdge = result.wordsNearEdges.find((e) => e.cutId === "ai-cut-0" && e.edge === "end");
+  check("diagnóstico: el borde final conserva el valor ORIGINAL pedido (30.71), no el ajustado", endEdge.originalSeconds === 30.71);
+  check("diagnóstico: el borde final muestra el valor ajustado (antes de cameron2)", approx(endEdge.adjustedSeconds, 30.1));
+  check("diagnóstico: no está marcado como descartado", endEdge.discarded === false);
+  check("diagnóstico: la ventana de +-2s alrededor de 30.71 incluye 'cameron2' con sus tiempos exactos", endEdge.wordsNearby.some((w) => w.text === "cameron2" && w.startSeconds === 30.2 && w.endSeconds === 30.8));
+  check("diagnóstico: la ventana también incluye 'sepah' (la palabra siguiente)", endEdge.wordsNearby.some((w) => w.text === "sepah"));
+
+  const startEdge = result.wordsNearEdges.find((e) => e.cutId === "ai-cut-0" && e.edge === "start");
+  check("diagnóstico: el borde de inicio no se tocó (29.25, sin palabra solapada ahí)", startEdge.originalSeconds === 29.25 && startEdge.adjustedSeconds === 29.25);
+}
+
+{
+  // Corte que termina siendo descartado -- el diagnóstico lo marca
+  // explícitamente, con adjustedSeconds en null (no inventa un valor).
+  const words = [w("straddleStart", 1.40, 1.55), w("straddleEnd", 1.58, 1.9)];
+  const cuts = [{ id: "c4", startSeconds: 1.5, endSeconds: 1.65 }];
+  const result = buildSnapCutsDiagnostic(cuts, words);
+  check("diagnóstico: corte descartado -> adjustedCuts vacío", result.adjustedCuts.length === 0);
+  check("diagnóstico: corte descartado -> cutIssues con el motivo", result.cutIssues.length === 1);
+  const edges = result.wordsNearEdges.filter((e) => e.cutId === "c4");
+  check("diagnóstico: ambos bordes marcados discarded=true, adjustedSeconds=null", edges.every((e) => e.discarded === true && e.adjustedSeconds === null));
 }
 
 // 4. Zoom con escala fuera de límites de seguridad se recorta, no se descarta.

@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
-import { planEdit, mergeNearbyGaplessCuts } from "./editorial.mjs";
+import { planEdit, mergeNearbyGaplessCuts, snapCutsToWordBoundaries, buildSnapCutsDiagnostic } from "./editorial.mjs";
 import { buildTimeline } from "./timeline.mjs";
 import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee, computePendingResources } from "./cta-guarantee.mjs";
 
@@ -552,7 +552,15 @@ const planEditIfNeeded = async (jobId, job) => {
   for (const line of mergeLog) {
     console.log(`[job ${jobId}]   ${line}`);
   }
-  for (const cut of mergedCuts) {
+  // Defecto real (job ff69b475/a416b0e): un corte terminaba dentro de la
+  // palabra "Cameron" y se comía sus primeras sílabas. Ningún borde de
+  // corte puede caer dentro de una palabra -- se recorta hacia adentro
+  // con margen, o se descarta entero si no hay forma segura de hacerlo.
+  const { cuts: snappedCuts, cutIssues: snapCutIssues } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
+  for (const issue of snapCutIssues) {
+    console.log(`[job ${jobId}]   ${issue}`);
+  }
+  for (const cut of snappedCuts) {
     console.log(
       `[job ${jobId}]   corte ${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s: ${cut.reason ?? "(sin razón)"}`,
     );
@@ -570,7 +578,8 @@ const planEditIfNeeded = async (jobId, job) => {
     );
   }
 
-  job.cuts = mergedCuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
+  job.cuts = snappedCuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
+  job.cutIssues = [...plan.cutIssues, ...snapCutIssues];
   job.zooms = plan.zooms.map(({ id, startSeconds, endSeconds, fromScale, toScale, origin }) => ({
     id,
     startSeconds,
@@ -916,7 +925,11 @@ app.post("/jobs/:id/replan", async (req, res) => {
     for (const line of mergeLog) {
       console.log(`[replan ${jobId}]   ${line}`);
     }
-    const timeline = buildTimeline(job.input.durationInSeconds, mergedCuts);
+    const { cuts: snappedCuts, cutIssues: snapCutIssues } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
+    for (const issue of snapCutIssues) {
+      console.log(`[replan ${jobId}]   ${issue}`);
+    }
+    const timeline = buildTimeline(job.input.durationInSeconds, snappedCuts);
     const { resources, droppedCount, ctaIssues } = remapResourcesWithCtaGuarantee({
       resources: plan.resources,
       timeline,
@@ -942,7 +955,8 @@ app.post("/jobs/:id/replan", async (req, res) => {
       jobId,
       layout: layout ?? null,
       ...plan,
-      cuts: mergedCuts,
+      cuts: snappedCuts,
+      cutIssues: [...plan.cutIssues, ...snapCutIssues],
       resources,
       ctaIssues,
       pendingResources,
@@ -952,6 +966,52 @@ app.post("/jobs/:id/replan", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err.message ?? err) });
   }
+});
+
+/**
+ * Diagnóstico de solo lectura: corre snapCutsToWordBoundaries() sobre
+ * cortes que manda quien llama (NO job.cuts -- el job puede ser de
+ * antes de que existiera esta corrección, o quien llama puede estar
+ * probando valores que todavía no se persistieron), usando las
+ * transcriptWords YA guardadas del job. No llama al modelo, no cuesta
+ * nada, no persiste ni modifica el job -- existe para poder ver
+ * exactamente qué palabra cae en cada borde sin tener que exponer el
+ * array completo de transcriptWords (puede ser enorme) por otro canal.
+ */
+app.post("/jobs/:id/snap-cuts", async (req, res) => {
+  const jobId = req.params.id;
+  let job;
+  try {
+    job = JSON.parse(await fsp.readFile(jobFilePath(jobId), "utf8"));
+  } catch {
+    return res.status(404).json({ error: "jobId desconocido (sin archivo de job en disco)." });
+  }
+  if (!Array.isArray(job.transcriptWords) || job.transcriptWords.length === 0) {
+    return res.status(409).json({
+      error:
+        'Este job no tiene "transcriptWords" guardadas -- puede ser que se transcribió con una versión anterior que no las guardaba (solo "captions" agrupadas por línea). No se puede ajustar cortes a límites de palabra sin esto; haría falta regenerar la transcripción.',
+    });
+  }
+
+  const cuts = req.body?.cuts;
+  if (!Array.isArray(cuts) || cuts.length === 0) {
+    return res.status(400).json({ error: 'Body inválido: se espera {"cuts": [{"id", "startSeconds", "endSeconds"}, ...]}.' });
+  }
+  for (const cut of cuts) {
+    if (!cut || typeof cut.id !== "string" || !Number.isFinite(cut.startSeconds) || !Number.isFinite(cut.endSeconds)) {
+      return res.status(400).json({ error: `Corte inválido: cada elemento necesita "id" (string), "startSeconds" y "endSeconds" (number). Recibido: ${JSON.stringify(cut)}` });
+    }
+  }
+
+  const { adjustedCuts, cutIssues, wordsNearEdges } = buildSnapCutsDiagnostic(cuts, job.transcriptWords);
+
+  res.json({
+    jobId,
+    originalCuts: cuts,
+    adjustedCuts,
+    cutIssues,
+    wordsNearEdges,
+  });
 });
 
 /**
