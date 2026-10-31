@@ -52,26 +52,48 @@ console.log(`usando FFmpeg real: ${ffmpegPath}`);
 const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "vf-audio-regression-"));
 
 /**
- * Construye un WAV sintético concatenando tramos de "voz" (tono
- * sine continuo) y "pausa real" (anullsrc, silencio digital) -- con el
- * FFmpeg REAL (mismo binario que producción). `segments`: lista de
- * {kind: "voice"|"silence", durationSeconds}.
+ * Construye un WAV sintético concatenando tramos de "voz" (tono sine
+ * continuo), "pausa real" (anullsrc, silencio digital) o "ruido de
+ * fondo bajo sin pausas reales" (dos tonos mezclados y atenuados) --
+ * con el FFmpeg REAL (mismo binario que producción). `segments`: lista
+ * de {kind: "voice"|"silence"|"noise", durationSeconds, amplitude?}.
  */
 const buildSyntheticFixture = async (name, segments) => {
   const outputPath = path.join(tmpDir, `${name}.wav`);
   const inputArgs = [];
-  const filterParts = [];
+  const stageFilters = [];
+  const segmentLabels = [];
+  let inputIndex = 0;
+
   segments.forEach((seg, i) => {
+    const label = `seg${i}`;
     if (seg.kind === "voice") {
       inputArgs.push("-f", "lavfi", "-i", `sine=frequency=220:sample_rate=${SAMPLE_RATE}:duration=${seg.durationSeconds}`);
+      stageFilters.push(`[${inputIndex}:a]anull[${label}]`);
+      inputIndex += 1;
     } else if (seg.kind === "noise") {
-      inputArgs.push("-f", "lavfi", "-i", `anoisesrc=sample_rate=${SAMPLE_RATE}:duration=${seg.durationSeconds}:amplitude=${seg.amplitude ?? 0.05}`);
+      // "anoisesrc" NO está en la lista de filtros habilitados del FFmpeg
+      // de producción (confirmado en CI: "No such filter: 'anoisesrc'").
+      // Se simula "ruido de fondo bajo, sin pausas reales" mezclando dos
+      // tonos de baja amplitud en frecuencias no relacionadas (evita que
+      // se cancelen periódicamente y generen silencios falsos) -- "sine",
+      // "volume" y "amix" sí están confirmados en el FFmpeg de producción.
+      inputArgs.push(
+        "-f", "lavfi", "-i", `sine=frequency=137:sample_rate=${SAMPLE_RATE}:duration=${seg.durationSeconds}`,
+        "-f", "lavfi", "-i", `sine=frequency=211:sample_rate=${SAMPLE_RATE}:duration=${seg.durationSeconds}`,
+      );
+      stageFilters.push(`[${inputIndex}:a][${inputIndex + 1}:a]amix=inputs=2,volume=${seg.amplitude ?? 0.06}[${label}]`);
+      inputIndex += 2;
     } else {
       inputArgs.push("-f", "lavfi", "-i", `anullsrc=sample_rate=${SAMPLE_RATE}:channel_layout=mono:duration=${seg.durationSeconds}`);
+      stageFilters.push(`[${inputIndex}:a]anull[${label}]`);
+      inputIndex += 1;
     }
-    filterParts.push(`[${i}:a]`);
+    segmentLabels.push(`[${label}]`);
   });
-  const filterComplex = segments.length === 1 ? `${filterParts[0]}anull[outa]` : `${filterParts.join("")}concat=n=${segments.length}:v=0:a=1[outa]`;
+
+  const concatStage = segments.length === 1 ? `${segmentLabels[0]}anull[outa]` : `${segmentLabels.join("")}concat=n=${segments.length}:v=0:a=1[outa]`;
+  const filterComplex = `${stageFilters.join(";")};${concatStage}`;
   const args = [
     "-y",
     ...inputArgs,
@@ -127,6 +149,8 @@ try {
     ffmpegEnv,
   });
   casoBResult = { ...result, fixture };
+  console.log(`[debug caso B] pauseMap.intervals=${JSON.stringify(result.pauseMap.intervals)}`);
+  console.log(`[debug caso B] cutIssues=${JSON.stringify(result.cutIssues)}`);
   check("caso B (pues): hay exactamente 1 pausa real detectada", result.pauseMap.intervals.length === 1, `intervals=${JSON.stringify(result.pauseMap.intervals)}`);
   check("caso B (pues): el corte SOBREVIVE, ajustado a la pausa real", result.cuts.length === 1, `cuts=${JSON.stringify(result.cuts)}`);
   if (result.cuts.length === 1) {
