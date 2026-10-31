@@ -176,45 +176,90 @@ export const findNearestRealPause = (intervals, targetSeconds) => {
 };
 
 /**
- * Busca la pausa real más cercana a `targetSeconds`, dentro de
- * +-`maxDistanceSeconds` (precisión (a): 1.0s por defecto, ya NO
- * limitado al rango "seguro por palabra" de Whisper). Devuelve `null`
- * si no hay ninguna pausa confirmada dentro de esa distancia --
- * requisito del dictamen: "si no existe un punto seguro, conservar el
- * fragmento hablado", nunca se inventa un punto.
+ * Mapa de pausas reales de TODO el video, calculado UNA SOLA VEZ
+ * (dictamen de solución estructural, 31-oct-2026, sección 2) -- antes,
+ * cada borde de cada corte disparaba su propia llamada a FFmpeg sobre
+ * una ventana angosta; ahora se corre `silencedetect` una sola vez
+ * sobre el audio completo y el resultado se reutiliza en planificación,
+ * edición, diagnóstico y validación (sección 2 del dictamen) sin volver
+ * a invocar FFmpeg.
+ *
+ * `noiseDb`/`minDurationSeconds` son un punto de partida (los
+ * propuestos originalmente), NO valores universales -- quien llama
+ * puede pasar otros según el audio (ruido de fondo, etc.). Un video sin
+ * ninguna pausa detectable (o con tanto ruido que ninguna calce el
+ * umbral) simplemente devuelve `intervals: []` -- el resto del sistema
+ * ya maneja ese caso sin inventar una pausa (ver findNearestRealPause).
  */
-export const findRealPauseNearEdge = async ({
+export const computeFullPauseMap = async ({
   ffmpegPath,
   ffmpegEnv,
   videoPath,
-  targetSeconds,
-  maxDistanceSeconds = SILENCE_SEARCH_RADIUS_SECONDS,
+  videoDurationSeconds,
   noiseDb = SILENCE_NOISE_DB,
   minDurationSeconds = SILENCE_MIN_DURATION_SECONDS,
-  videoDurationSeconds,
 }) => {
-  const windowStart = Math.max(0, targetSeconds - maxDistanceSeconds);
-  const windowEndRaw = targetSeconds + maxDistanceSeconds;
-  const windowEnd = typeof videoDurationSeconds === "number" ? Math.min(videoDurationSeconds, windowEndRaw) : windowEndRaw;
-  const windowDuration = windowEnd - windowStart;
-  if (windowDuration <= 0) {
-    return { found: false, intervals: [] };
-  }
+  const stderrText = await detectSilences({
+    ffmpegPath,
+    ffmpegEnv,
+    videoPath,
+    windowStart: 0,
+    windowDuration: videoDurationSeconds,
+    noiseDb,
+    minDurationSeconds,
+  });
+  const intervals = parseSilenceDetectOutput(stderrText, 0, videoDurationSeconds);
+  return { intervals, noiseDb, minDurationSeconds, videoDurationSeconds, computedAt: new Date().toISOString() };
+};
 
-  const stderrText = await detectSilences({ ffmpegPath, ffmpegEnv, videoPath, windowStart, windowDuration, noiseDb, minDurationSeconds });
-  const intervals = parseSilenceDetectOutput(stderrText, windowStart, windowDuration);
-  const nearest = findNearestRealPause(intervals, targetSeconds);
+/**
+ * Todos los intervalos de un mapa de pausas, ordenados por cercanía a
+ * `targetSeconds` (distancia 0 si el punto ya cae dentro). Función
+ * PURA -- a diferencia de findNearestRealPause (que solo devuelve el
+ * más cercano), esto expone la lista completa para que quien llama
+ * pueda intentar el segundo candidato si el primero falla una
+ * verificación downstream (puerta de calidad, sección 4 del dictamen:
+ * "intentar una corrección segura dentro del intervalo permitido").
+ */
+export const rankPauseCandidates = (intervals, targetSeconds) => {
+  if (!intervals || intervals.length === 0) return [];
+  return intervals
+    .map((iv) => {
+      const distanceSeconds = targetSeconds < iv.start ? iv.start - targetSeconds : targetSeconds > iv.end ? targetSeconds - iv.end : 0;
+      return { interval: iv, distanceSeconds, chosenSeconds: (iv.start + iv.end) / 2 };
+    })
+    .sort((a, b) => a.distanceSeconds - b.distanceSeconds);
+};
 
-  if (!nearest || nearest.distanceSeconds > maxDistanceSeconds) {
-    return { found: false, intervals };
+/**
+ * Busca, DENTRO de un mapa de pausas ya calculado, el borde seguro más
+ * cercano a `targetSeconds` dentro de +-`maxDistanceSeconds`. Función
+ * PURA y SÍNCRONA (sin FFmpeg) -- reemplaza al viejo `findRealPauseNearEdge`,
+ * que repetía una llamada a FFmpeg por cada borde; ahora el mapa ya
+ * cubre todo el video (sección 2 del dictamen), así que esto es una
+ * simple búsqueda en memoria. `excludeCandidate` (opcional, comparado
+ * por referencia) permite pedir "el siguiente candidato" cuando el
+ * elegido anteriormente falló la puerta de calidad.
+ */
+export const findSafeEdgeInMap = (pauseMap, targetSeconds, maxDistanceSeconds = SILENCE_SEARCH_RADIUS_SECONDS, skip = 0) => {
+  const candidates = rankPauseCandidates(pauseMap.intervals, targetSeconds).filter((c) => c.distanceSeconds <= maxDistanceSeconds);
+  if (candidates.length <= skip) {
+    return { found: false, candidates };
   }
-  return { found: true, seconds: nearest.chosenSeconds, interval: nearest.interval, intervals };
+  const chosen = candidates[skip];
+  return { found: true, seconds: chosen.chosenSeconds, interval: chosen.interval, candidate: chosen, candidates };
 };
 
 /**
  * Corrige TODOS los cortes usando pausas reales como fuente principal
  * (precisión (a) del operador) -- para el pipeline real
  * (planEditIfNeeded/POST /jobs/:id/replan en index.mjs).
+ *
+ * Solución estructural (dictamen 31-oct-2026, sección 2): el mapa de
+ * pausas se calcula UNA SOLA VEZ (una sola llamada a FFmpeg sobre todo
+ * el video) -- quien llama puede pasarlo ya calculado (`pauseMap`,
+ * para reutilizarlo con el diagnóstico y la puerta de calidad del
+ * mismo job) o dejar que esta función lo calcule si no lo recibe.
  *
  * Para cada borde de cada corte: busca la pausa real más cercana
  * dentro de +-SILENCE_SEARCH_RADIUS_SECONDS, centrada en el límite ya
@@ -230,60 +275,75 @@ export const findRealPauseNearEdge = async ({
  */
 export const refineCutsWithRealSilence = async ({
   cuts,
+  pauseMap,
   videoPath,
   videoDurationSeconds,
   ffmpegPath,
   ffmpegEnv,
   log = () => {},
 }) => {
+  let map = pauseMap;
+  try {
+    if (!map) {
+      map = await computeFullPauseMap({ ffmpegPath, ffmpegEnv, videoPath, videoDurationSeconds });
+    }
+  } catch (err) {
+    log(`mapa de pausas reales: el análisis de audio falló (${err.message ?? err}) -- se conservan todos los cortes propuestos sin confirmar acústicamente.`);
+    return {
+      cuts: [],
+      cutIssues: cuts.map(
+        (cut) =>
+          `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s): no se pudo calcular el mapa de pausas reales (${err.message ?? err}) -- se conserva el audio en vez de arriesgar un corte sin confirmar.`,
+      ),
+      pauseMap: null,
+    };
+  }
+
   const cutIssues = [];
   const refined = [];
 
   for (const cut of cuts) {
-    try {
-      const startResult = await findRealPauseNearEdge({
-        ffmpegPath, ffmpegEnv, videoPath, videoDurationSeconds,
-        targetSeconds: cut.startSeconds,
-      });
-      const endResult = await findRealPauseNearEdge({
-        ffmpegPath, ffmpegEnv, videoPath, videoDurationSeconds,
-        targetSeconds: cut.endSeconds,
-      });
+    const startResult = findSafeEdgeInMap(map, cut.startSeconds);
+    const endResult = findSafeEdgeInMap(map, cut.endSeconds);
 
-      if (!startResult.found || !endResult.found) {
-        cutIssues.push(
-          `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s${cut.reason ? `, ${cut.reason}` : ""}): ` +
-            `${!startResult.found ? "no se encontró una pausa real confirmada cerca del inicio" : ""}` +
-            `${!startResult.found && !endResult.found ? " ni cerca del final" : !endResult.found ? "no se encontró una pausa real confirmada cerca del final" : ""}` +
-            ` (ventana de ±${SILENCE_SEARCH_RADIUS_SECONDS}s) -- se conserva el audio hablado en vez de forzar un corte sin confirmar.`,
-        );
-        continue;
-      }
-
-      log(
-        `corte "${cut.id}" borde inicio: pausa real confirmada en ${startResult.seconds.toFixed(3)}s ` +
-          `(antes: ${cut.startSeconds.toFixed(3)}s, desfase ${Math.abs(startResult.seconds - cut.startSeconds).toFixed(3)}s).`,
-      );
-      log(
-        `corte "${cut.id}" borde final: pausa real confirmada en ${endResult.seconds.toFixed(3)}s ` +
-          `(antes: ${cut.endSeconds.toFixed(3)}s, desfase ${Math.abs(endResult.seconds - cut.endSeconds).toFixed(3)}s).`,
-      );
-
-      if (endResult.seconds - startResult.seconds <= 0) {
-        cutIssues.push(
-          `corte "${cut.id}": las pausas reales encontradas en cada borde se cruzan (inicio ${startResult.seconds.toFixed(3)}s, final ${endResult.seconds.toFixed(3)}s) -- descartado, se conserva el audio.`,
-        );
-        continue;
-      }
-
-      refined.push({ ...cut, startSeconds: startResult.seconds, endSeconds: endResult.seconds });
-    } catch (err) {
-      log(`corte "${cut.id}": el análisis de audio real falló (${err.message ?? err}) -- se conserva el audio, no se corta sin confirmar.`);
+    if (!startResult.found || !endResult.found) {
       cutIssues.push(
-        `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s): el análisis de audio real falló (${err.message ?? err}) -- se conserva el audio en vez de arriesgar un corte sin confirmar.`,
+        `corte "${cut.id}" (${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s${cut.reason ? `, ${cut.reason}` : ""}): ` +
+          `${!startResult.found ? "no se encontró una pausa real confirmada cerca del inicio" : ""}` +
+          `${!startResult.found && !endResult.found ? " ni cerca del final" : !endResult.found ? "no se encontró una pausa real confirmada cerca del final" : ""}` +
+          ` (ventana de ±${SILENCE_SEARCH_RADIUS_SECONDS}s) -- se conserva el audio hablado en vez de forzar un corte sin confirmar.`,
       );
+      continue;
     }
+
+    log(
+      `corte "${cut.id}" borde inicio: pausa real confirmada en ${startResult.seconds.toFixed(3)}s ` +
+        `(antes: ${cut.startSeconds.toFixed(3)}s, desfase ${Math.abs(startResult.seconds - cut.startSeconds).toFixed(3)}s).`,
+    );
+    log(
+      `corte "${cut.id}" borde final: pausa real confirmada en ${endResult.seconds.toFixed(3)}s ` +
+        `(antes: ${cut.endSeconds.toFixed(3)}s, desfase ${Math.abs(endResult.seconds - cut.endSeconds).toFixed(3)}s).`,
+    );
+
+    if (endResult.seconds - startResult.seconds <= 0) {
+      cutIssues.push(
+        `corte "${cut.id}": las pausas reales encontradas en cada borde se cruzan (inicio ${startResult.seconds.toFixed(3)}s, final ${endResult.seconds.toFixed(3)}s) -- descartado, se conserva el audio.`,
+      );
+      continue;
+    }
+
+    // Se guardan los candidatos de cada borde (no solo el elegido) --
+    // la puerta de calidad (quality-gate.mjs) los usa para "intentar
+    // una corrección segura dentro del intervalo permitido" (sección 4
+    // del dictamen) antes de descartar un corte que falle el empalme.
+    refined.push({
+      ...cut,
+      startSeconds: startResult.seconds,
+      endSeconds: endResult.seconds,
+      _startCandidates: startResult.candidates,
+      _endCandidates: endResult.candidates,
+    });
   }
 
-  return { cuts: refined, cutIssues };
+  return { cuts: refined, cutIssues, pauseMap: map };
 };

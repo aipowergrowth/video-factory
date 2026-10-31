@@ -1,18 +1,20 @@
-// PRUEBA SIMULADA -- no llama a FFmpeg real (no hay uno funcional en
-// este entorno de desarrollo, ver informe; y el ffmpeg REAL de
-// producción además resultó estar compilado con --disable-muxers, sin
-// el muxer "s16le" que usaba la versión anterior de este archivo).
-// Prueba la lógica PURA de parseo/decisión (parseSilenceDetectOutput,
-// findNearestRealPause) con texto de stderr sintético, y el CONTROL DE
-// FLUJO de findRealPauseNearEdge/refineCutsWithRealSilence inyectando
-// un detector de silencios falso (__setSilenceDetectorForTesting,
-// mismo patrón que __setAnthropicClientForTesting en editorial.mjs) --
-// la invocación REAL de FFmpeg (realDetectSilences) queda sin probar
-// acá a propósito, revisada por lectura cuidadosa en vez de ejecución.
+// PRUEBA SIMULADA -- no llama a FFmpeg real. Prueba la lógica PURA de
+// parseo/decisión (parseSilenceDetectOutput, findNearestRealPause,
+// rankPauseCandidates, findSafeEdgeInMap) con texto de stderr
+// sintético, y el CONTROL DE FLUJO de computeFullPauseMap/
+// refineCutsWithRealSilence inyectando un detector de silencios falso
+// (__setSilenceDetectorForTesting, mismo patrón que
+// __setAnthropicClientForTesting en editorial.mjs). La prueba de
+// FFmpeg real contra el mismo binario/imagen que producción vive en
+// server/test-audio-regression.mjs (corre en GitHub Actions, ver
+// .github/workflows/audio-regression-tests.yml) -- este archivo cubre
+// la lógica, aquel cubre el comportamiento real de FFmpeg.
 import {
   parseSilenceDetectOutput,
   findNearestRealPause,
-  findRealPauseNearEdge,
+  rankPauseCandidates,
+  findSafeEdgeInMap,
+  computeFullPauseMap,
   refineCutsWithRealSilence,
   __setSilenceDetectorForTesting,
   SILENCE_SEARCH_RADIUS_SECONDS,
@@ -95,145 +97,135 @@ const fakeStderr = (startStr, endStr) =>
   check("sin intervalos: devuelve null", findNearestRealPause([], 10) === null);
 }
 
-// --- findRealPauseNearEdge: control de flujo con detector simulado ---
+// --- rankPauseCandidates / findSafeEdgeInMap: búsqueda en el mapa ya calculado ---
 
 {
-  __setSilenceDetectorForTesting(async () => fakeStderr("29.68", "30.24"));
-  const result = await findRealPauseNearEdge({
-    ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-    targetSeconds: 29.9,
-  });
-  check("pausa real encontrada dentro de la distancia máxima: found=true", result.found === true);
-  check("pausa real encontrada: el punto elegido es el centro del intervalo (29.96)", approx(result.seconds, 29.96));
-  __setSilenceDetectorForTesting(null);
+  const intervals = [{ start: 10.0, end: 10.2 }, { start: 29.2, end: 29.4 }, { start: 30.6, end: 30.9 }];
+  const ranked = rankPauseCandidates(intervals, 29.5);
+  check("rankPauseCandidates: devuelve los 3, ordenados por distancia", ranked.length === 3 && ranked[0].interval.start === 29.2 && ranked[1].interval.start === 30.6);
 }
 
 {
-  // La pausa detectada está fuera de la ventana realmente analizada
-  // (más lejos del objetivo que SILENCE_SEARCH_RADIUS_SECONDS) -- un
-  // ffmpeg real nunca reportaría algo fuera de lo que se le pidió
-  // analizar, así que el detector simulado respeta la ventana pedida.
-  __setSilenceDetectorForTesting(async ({ windowStart, windowDuration }) => {
-    const windowEnd = windowStart + windowDuration;
-    // La única pausa real de este audio está en 29.68-30.24 -- el
-    // detector solo la "ve" si cae dentro de la ventana que se le pidió.
-    if (29.68 >= windowStart && 30.24 <= windowEnd) return fakeStderr("29.68", "30.24");
-    return "";
-  });
-  const result = await findRealPauseNearEdge({
-    ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-    targetSeconds: 29.9, maxDistanceSeconds: 0.01,
-  });
-  check("pausa fuera de la ventana realmente analizada: found=false", result.found === false);
-  __setSilenceDetectorForTesting(null);
+  check("rankPauseCandidates: lista vacía con intervals vacío", rankPauseCandidates([], 10).length === 0);
 }
 
 {
-  // Sin ninguna pausa detectada -- found=false, nunca se inventa un punto.
-  __setSilenceDetectorForTesting(async () => "sin silencios en este tramo\n");
-  const result = await findRealPauseNearEdge({
-    ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-    targetSeconds: 50.0,
-  });
-  check("sin pausas detectadas: found=false", result.found === false);
-  __setSilenceDetectorForTesting(null);
+  const map = { intervals: [{ start: 29.2, end: 29.4 }, { start: 30.6, end: 30.9 }] };
+  const result = findSafeEdgeInMap(map, 29.5, 1.0);
+  check("findSafeEdgeInMap: found=true con el candidato más cercano", result.found === true && approx(result.seconds, 29.3));
 }
 
 {
-  // Ventana recortada por la duración real del video (videoDurationSeconds)
-  // hasta degenerar -- ni siquiera llama al detector.
-  let called = false;
-  __setSilenceDetectorForTesting(async () => {
-    called = true;
-    return "";
-  });
-  const result = await findRealPauseNearEdge({
-    ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4",
-    // videoDurationSeconds (98) menor que windowStart (target-radio=99)
-    // -- la ventana [99,98] queda invertida, duración <= 0.
-    targetSeconds: 100.0, videoDurationSeconds: 98.0, maxDistanceSeconds: 1.0,
-  });
-  check("ventana degenerada por duración del video: no llama al detector", called === false);
-  check("ventana degenerada: found=false", result.found === false);
-  __setSilenceDetectorForTesting(null);
+  const map = { intervals: [{ start: 29.2, end: 29.4 }, { start: 30.6, end: 30.9 }] };
+  const result = findSafeEdgeInMap(map, 29.5, 0.05); // ninguno cae dentro de 50ms
+  check("findSafeEdgeInMap: found=false si ningún candidato entra en la distancia máxima", result.found === false);
+}
+
+{
+  // skip=1: pide el SEGUNDO candidato (para "la siguiente pausa
+  // candidata" que usa la puerta de calidad cuando el primero falla
+  // su propia verificación).
+  const map = { intervals: [{ start: 29.2, end: 29.4 }, { start: 29.6, end: 29.9 }, { start: 35.0, end: 35.2 }] };
+  const first = findSafeEdgeInMap(map, 29.5, 1.0, 0);
+  const second = findSafeEdgeInMap(map, 29.5, 1.0, 1);
+  check("findSafeEdgeInMap: skip=0 elige el más cercano", approx(first.seconds, 29.3));
+  check("findSafeEdgeInMap: skip=1 elige el segundo más cercano, no el mismo", approx(second.seconds, 29.75) && second.seconds !== first.seconds);
 }
 
 check("constante expuesta: SILENCE_SEARCH_RADIUS_SECONDS = 1.0", SILENCE_SEARCH_RADIUS_SECONDS === 1.0);
 
-// --- refineCutsWithRealSilence: orquesta ambos bordes de cada corte ---
+// --- computeFullPauseMap: UNA sola llamada al detector sobre todo el video ---
 
 {
-  // Ambos bordes encuentran una pausa real -- el corte usa los puntos
-  // reales, incluso si caen afuera del rango "seguro por palabra"
-  // original (precisión (a): ya no limitado por Whisper).
-  __setSilenceDetectorForTesting(async ({ windowStart }) => {
-    // Devuelve una pausa centrada en el punto pedido, sin importar
-    // dónde cae la ventana -- simplifica el escenario de prueba.
-    return fakeStderr((windowStart + 0.9).toFixed(2), (windowStart + 1.1).toFixed(2));
+  let calls = 0;
+  let receivedWindow = null;
+  __setSilenceDetectorForTesting(async ({ windowStart, windowDuration }) => {
+    calls++;
+    receivedWindow = { windowStart, windowDuration };
+    return fakeStderr("29.68", "30.24") + fakeStderr("109.1", "109.9");
+  });
+  const map = await computeFullPauseMap({ ffmpegPath: "fake", ffmpegEnv: {}, videoPath: "fake.mp4", videoDurationSeconds: 759.27 });
+  check("computeFullPauseMap: UNA sola llamada al detector (no una por borde)", calls === 1);
+  check("computeFullPauseMap: la ventana pedida cubre TODO el video (0 a la duración completa)", receivedWindow.windowStart === 0 && receivedWindow.windowDuration === 759.27);
+  check("computeFullPauseMap: se parsean los 2 intervalos reportados", map.intervals.length === 2);
+  __setSilenceDetectorForTesting(null);
+}
+
+// --- refineCutsWithRealSilence: calcula el mapa UNA vez y lo reutiliza para todos los cortes ---
+
+{
+  // Ambos bordes de los DOS cortes encuentran pausa real en el MISMO
+  // mapa -- precisión (a): ya no limitado por el rango "seguro por
+  // palabra" de Whisper. Un solo llamado al detector para ambos cortes
+  // (antes: hasta 4 llamadas, una por borde).
+  let calls = 0;
+  __setSilenceDetectorForTesting(async () => {
+    calls++;
+    return fakeStderr("29.58", "29.78") + fakeStderr("30.6", "30.82") + fakeStderr("49.9", "50.1") + fakeStderr("54.9", "55.1");
   });
   const logs = [];
-  const { cuts, cutIssues } = await refineCutsWithRealSilence({
-    cuts: [{ id: "ai-cut-0", startSeconds: 29.68, endSeconds: 30.71 }],
-    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
+  const { cuts, cutIssues, pauseMap } = await refineCutsWithRealSilence({
+    cuts: [
+      { id: "ai-cut-0", startSeconds: 29.68, endSeconds: 30.71 },
+      { id: "ai-cut-1", startSeconds: 50.0, endSeconds: 55.0 },
+    ],
+    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {}, videoDurationSeconds: 759.27,
     log: (msg) => logs.push(msg),
   });
-  check("ambos bordes con pausa real: el corte sobrevive", cuts.length === 1);
-  check("ambos bordes con pausa real: sin cutIssues", cutIssues.length === 0);
-  check("ambos bordes con pausa real: se logueó el desfase de cada borde", logs.some((l) => l.includes("desfase")));
+  check("refineCutsWithRealSilence: una sola llamada al detector para TODOS los cortes", calls === 1);
+  check("ambos cortes con ambos bordes con pausa real: los dos sobreviven", cuts.length === 2);
+  check("ambos cortes con pausa real: sin cutIssues", cutIssues.length === 0);
+  check("ambos cortes con pausa real: se logueó el desfase de cada borde", logs.some((l) => l.includes("desfase")));
+  check("refineCutsWithRealSilence: expone el mapa calculado para reutilizarlo (diagnóstico/puerta de calidad)", pauseMap && pauseMap.intervals.length === 4);
+  check("cada corte conserva sus candidatos por borde (para la puerta de calidad)", Array.isArray(cuts[0]._startCandidates) && Array.isArray(cuts[0]._endCandidates));
   __setSilenceDetectorForTesting(null);
 }
 
 {
   // Un borde no encuentra pausa real -- se descarta el corte ENTERO
   // (precisión (a): "si no hay pausa, no cortes: conserva el audio").
-  __setSilenceDetectorForTesting(async ({ windowStart }) => (windowStart < 20 ? "" : fakeStderr((windowStart + 0.1).toFixed(2), (windowStart + 0.3).toFixed(2))));
+  // Solo hay una pausa real en todo el "video" (24.9-25.1) -- el borde
+  // final (25.0) la encuentra, el de inicio (10.0) no tiene nada cerca.
+  __setSilenceDetectorForTesting(async () => fakeStderr("24.9", "25.1"));
   const { cuts, cutIssues } = await refineCutsWithRealSilence({
     cuts: [{ id: "ai-cut-x", startSeconds: 10.0, endSeconds: 25.0 }],
-    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
+    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {}, videoDurationSeconds: 100,
   });
   check("un borde sin pausa real: el corte se descarta entero", cuts.length === 0);
   check("un borde sin pausa real: queda registrado en cutIssues", cutIssues.length === 1 && cutIssues[0].includes("ai-cut-x"));
-  __setSilenceDetectorForTesting(null);
 }
 
 {
   // El análisis de audio falla (FFmpeg no disponible/archivo inexistente)
-  // -- se conserva el audio (se descarta el corte), se registra.
+  // -- se conservan TODOS los cortes propuestos (se descartan), se registra.
   __setSilenceDetectorForTesting(async () => {
     throw new Error("ffmpeg no disponible (simulado)");
   });
   const logs = [];
-  const { cuts, cutIssues } = await refineCutsWithRealSilence({
+  const { cuts, cutIssues, pauseMap } = await refineCutsWithRealSilence({
     cuts: [{ id: "ai-cut-y", startSeconds: 10.0, endSeconds: 11.0 }],
-    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
+    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {}, videoDurationSeconds: 100,
     log: (msg) => logs.push(msg),
   });
-  check("falla el análisis: el corte se descarta (se conserva el audio)", cuts.length === 0);
-  check("falla el análisis: queda registrado en cutIssues", cutIssues.some((i) => i.includes("ai-cut-y")));
-  check("falla el análisis: también queda en el log", logs.some((l) => l.includes("falló")));
+  check("falla el cálculo del mapa: el corte se descarta (se conserva el audio)", cuts.length === 0);
+  check("falla el cálculo del mapa: queda registrado en cutIssues", cutIssues.some((i) => i.includes("ai-cut-y")));
+  check("falla el cálculo del mapa: también queda en el log", logs.some((l) => l.includes("falló")));
+  check("falla el cálculo del mapa: pauseMap queda en null", pauseMap === null);
   __setSilenceDetectorForTesting(null);
 }
 
 {
-  // Las pausas reales elegidas en cada borde terminan cruzadas
-  // (inicio después del final) -- se descarta, nunca se deja un corte
-  // invertido. refineCutsWithRealSilence llama primero al borde de
-  // inicio y después al de final (orden fijo) -- se usa un contador
-  // para responder distinto a cada uno sin depender de inferir la
-  // ventana (start target=20.0 -> se le da una pausa tarde, 20.25-20.35;
-  // end target=20.3 -> se le da una pausa temprana, 19.9-20.0 -- quedan
-  // cruzadas: inicio elegido 20.3 > final elegido 19.95).
-  let callCount = 0;
-  __setSilenceDetectorForTesting(async () => {
-    callCount++;
-    return callCount === 1 ? fakeStderr("20.25", "20.35") : fakeStderr("19.9", "20.0");
-  });
+  // Un corte muy corto cuyos DOS bordes terminan resolviendo a la MISMA
+  // pausa real (único candidato cercano a ambos) -- los dos convergen
+  // en su centro (20.3s), dejando un corte de largo <= 0. Se descarta,
+  // nunca se deja un corte invertido o vacío.
+  __setSilenceDetectorForTesting(async () => fakeStderr("20.25", "20.35"));
   const { cuts, cutIssues } = await refineCutsWithRealSilence({
-    cuts: [{ id: "ai-cut-cross", startSeconds: 20.0, endSeconds: 20.5 }],
-    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {},
+    cuts: [{ id: "ai-cut-cross", startSeconds: 20.0, endSeconds: 20.6 }],
+    videoPath: "fake.mp4", ffmpegPath: "fake", ffmpegEnv: {}, videoDurationSeconds: 100,
   });
-  check("pausas cruzadas: el corte se descarta", cuts.length === 0);
-  check("pausas cruzadas: queda registrado en cutIssues", cutIssues.some((i) => i.includes("cruzan")));
+  check("pausas convergentes: el corte se descarta", cuts.length === 0);
+  check("pausas convergentes: queda registrado en cutIssues", cutIssues.some((i) => i.includes("cruzan")));
   __setSilenceDetectorForTesting(null);
 }
 

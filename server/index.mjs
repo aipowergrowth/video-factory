@@ -6,7 +6,6 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
-import { createRequire } from "node:module";
 import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
 import { planEdit, mergeNearbyGaplessCuts, snapCutsToWordBoundaries, buildSnapCutsDiagnostic } from "./editorial.mjs";
@@ -14,13 +13,13 @@ import { buildTimeline } from "./timeline.mjs";
 import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee, computePendingResources } from "./cta-guarantee.mjs";
 import {
   refineCutsWithRealSilence,
-  findRealPauseNearEdge,
-  findNearestRealPause,
+  rankPauseCandidates,
   SILENCE_WIDE_REPORT_RADIUS_SECONDS,
   SILENCE_SEARCH_RADIUS_SECONDS,
 } from "./audio-analysis.mjs";
+import { runQualityGateWithRemediation } from "./quality-gate.mjs";
+import { resolveCompositorFfprobe, resolveCompositorFfmpeg, binaryEnv } from "./compositor.mjs";
 
-const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -111,41 +110,14 @@ const safeRename = async (src, dest) => {
   }
 };
 
-const resolveCompositorBinary = (name) => {
-  const bin = process.platform === "win32" ? `${name}.exe` : name;
-  if (REMOTION_BINARIES_DIRECTORY) {
-    return path.join(REMOTION_BINARIES_DIRECTORY, bin);
-  }
-
-  const candidates = [
-    "@remotion/compositor-linux-x64-gnu",
-    "@remotion/compositor-linux-x64-musl",
-    "@remotion/compositor-linux-arm64-gnu",
-    "@remotion/compositor-linux-arm64-musl",
-    "@remotion/compositor-darwin-x64",
-    "@remotion/compositor-darwin-arm64",
-    "@remotion/compositor-win32-x64-msvc",
-  ];
-  for (const pkg of candidates) {
-    try {
-      const mod = require(pkg);
-      return path.join(mod.dir, bin);
-    } catch {
-      // Paquete no instalado para esta plataforma/arquitectura; probar el siguiente.
-    }
-  }
-  throw new Error("No se encontró ningún @remotion/compositor-* instalado.");
-};
-
-const resolveCompositorFfprobe = () => resolveCompositorBinary("ffprobe");
-const resolveCompositorFfmpeg = () => resolveCompositorBinary("ffmpeg");
-
-/** macOS (solo desarrollo local) necesita esta variable para encontrar
- * los .dylib que viven junto al binario; en Linux no hace falta. */
-const binaryEnv = (binaryPath) =>
-  process.platform === "darwin"
-    ? { ...process.env, DYLD_LIBRARY_PATH: path.dirname(binaryPath) }
-    : process.env;
+// resolveCompositorFfprobe/resolveCompositorFfmpeg/binaryEnv viven en
+// ./compositor.mjs (extraídas para que test-audio-regression.mjs, que
+// corre en GitHub Actions, resuelva el binario de FFmpeg con la MISMA
+// lógica que producción, en vez de reimplementarla aparte). Este
+// wrapper solo aplica REMOTION_BINARIES_DIRECTORY, que index.mjs ya
+// traía como variable de entorno propia.
+const resolveFfprobe = () => resolveCompositorFfprobe({ binariesDirectory: REMOTION_BINARIES_DIRECTORY });
+const resolveFfmpeg = () => resolveCompositorFfmpeg({ binariesDirectory: REMOTION_BINARIES_DIRECTORY });
 
 /**
  * Códec del video y su duración real, en una sola pasada de ffprobe. La
@@ -154,7 +126,7 @@ const binaryEnv = (binaryPath) =>
  * escribe a mano, y más fiable también para la subida directa.
  */
 const probeVideoInfo = async (filePath) => {
-  const ffprobePath = resolveCompositorFfprobe();
+  const ffprobePath = resolveFfprobe();
   const env = binaryEnv(ffprobePath);
   const { stdout } = await execFileAsync(
     ffprobePath,
@@ -415,7 +387,7 @@ const transcribeJobIfNeeded = async (jobId, job) => {
     .then(JSON.parse)
     .catch(() => []);
 
-  const ffmpegPath = resolveCompositorFfmpeg();
+  const ffmpegPath = resolveFfmpeg();
   const result = await transcribeVideo({
     videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
     corrections,
@@ -581,18 +553,47 @@ const planEditIfNeeded = async (jobId, job) => {
   // seguros por palabra, igual que antes de esta corrección.
   let acousticCuts = snappedCuts;
   let acousticCutIssues = [];
+  let qualityGateIncidents = [];
   if (typeof job.input.baseVideo === "string") {
-    const ffmpegPathForAudio = resolveCompositorFfmpeg();
+    const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
+    const ffmpegPathForAudio = resolveFfmpeg();
+    const ffmpegEnvForAudio = binaryEnv(ffmpegPathForAudio);
     ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsWithRealSilence({
       cuts: snappedCuts,
-      videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
+      videoPath,
       videoDurationSeconds: job.input.durationInSeconds,
       ffmpegPath: ffmpegPathForAudio,
-      ffmpegEnv: binaryEnv(ffmpegPathForAudio),
+      ffmpegEnv: ffmpegEnvForAudio,
       log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
     }));
+
+    // Puerta automática de calidad (dictamen 31-oct-2026, sección 4):
+    // antes de persistir los cortes definitivos, se arma la pista de
+    // audio EDITADA con exactamente esos cortes y se verifica que no
+    // haya empalmes defectuosos ni silencios anormales. Si algo falla,
+    // esta función ya intenta su propia corrección (siguiente pausa
+    // candidata) o descarta el corte -- lo que llega acá en `.cuts` es
+    // lo que de verdad se renderiza.
+    const gateResult = await runQualityGateWithRemediation({
+      ffmpegPath: ffmpegPathForAudio,
+      ffmpegEnv: ffmpegEnvForAudio,
+      videoPath,
+      cuts: acousticCuts,
+      videoDurationSeconds: job.input.durationInSeconds,
+      log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
+    });
+    acousticCuts = gateResult.cuts;
+    qualityGateIncidents = gateResult.incidents;
+    console.log(
+      `[job ${jobId}] puerta de calidad: ${gateResult.ok ? "OK" : "NO SUPERADA"} tras ${gateResult.rounds} ronda(s)${gateResult.stoppedReason ? ` -- ${gateResult.stoppedReason}` : ""}.`,
+    );
+    if (!gateResult.ok) {
+      throw new Error(
+        `La puerta de calidad del audio no se pudo resolver automáticamente: ${gateResult.stoppedReason}`,
+      );
+    }
   }
-  for (const issue of acousticCutIssues) {
+  for (const issue of [...acousticCutIssues, ...qualityGateIncidents]) {
     console.log(`[job ${jobId}]   ${issue}`);
   }
   for (const cut of acousticCuts) {
@@ -614,7 +615,7 @@ const planEditIfNeeded = async (jobId, job) => {
   }
 
   job.cuts = acousticCuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
-  job.cutIssues = [...plan.cutIssues, ...snapCutIssues, ...acousticCutIssues];
+  job.cutIssues = [...plan.cutIssues, ...snapCutIssues, ...acousticCutIssues, ...qualityGateIncidents];
   job.zooms = plan.zooms.map(({ id, startSeconds, endSeconds, fromScale, toScale, origin }) => ({
     id,
     startSeconds,
@@ -966,16 +967,34 @@ app.post("/jobs/:id/replan", async (req, res) => {
     }
     let acousticCuts = snappedCuts;
     let acousticCutIssues = [];
+    let qualityGate = null;
     if (typeof job.input.baseVideo === "string") {
-      const ffmpegPathForAudio = resolveCompositorFfmpeg();
+      const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
+      const ffmpegPathForAudio = resolveFfmpeg();
+      const ffmpegEnvForAudio = binaryEnv(ffmpegPathForAudio);
       ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsWithRealSilence({
         cuts: snappedCuts,
-        videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
+        videoPath,
         videoDurationSeconds: job.input.durationInSeconds,
         ffmpegPath: ffmpegPathForAudio,
-        ffmpegEnv: binaryEnv(ffmpegPathForAudio),
+        ffmpegEnv: ffmpegEnvForAudio,
         log: (msg) => console.log(`[replan ${jobId}]   ${msg}`),
       }));
+
+      // Mismo gate que correría el render real -- en /replan es solo
+      // diagnóstico (no persiste nada), para que el operador vea el
+      // resultado ANTES de autorizar la única replanificación real
+      // (sección 7 del dictamen, ~US$0.30).
+      const gateResult = await runQualityGateWithRemediation({
+        ffmpegPath: ffmpegPathForAudio,
+        ffmpegEnv: ffmpegEnvForAudio,
+        videoPath,
+        cuts: acousticCuts,
+        videoDurationSeconds: job.input.durationInSeconds,
+        log: (msg) => console.log(`[replan ${jobId}]   ${msg}`),
+      });
+      acousticCuts = gateResult.cuts;
+      qualityGate = { ok: gateResult.ok, rounds: gateResult.rounds, incidents: gateResult.incidents, stoppedReason: gateResult.stoppedReason ?? null };
     }
     for (const issue of acousticCutIssues) {
       console.log(`[replan ${jobId}]   ${issue}`);
@@ -1008,6 +1027,7 @@ app.post("/jobs/:id/replan", async (req, res) => {
       ...plan,
       cuts: acousticCuts,
       cutIssues: [...plan.cutIssues, ...snapCutIssues, ...acousticCutIssues],
+      qualityGate,
       resources,
       ctaIssues,
       pendingResources,
@@ -1072,11 +1092,12 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
   // para este diagnóstico (pedido explícito del operador).
   let finalCuts = adjustedCuts;
   let allDiscardReasons = [...cutIssues];
+  let qualityGate = null;
   if (typeof job.input.baseVideo !== "string") {
     acousticNote = 'Este job no tiene "input.baseVideo" (sin video real en disco) -- se omite el análisis de audio real, solo se devuelve el diagnóstico por palabra.';
   } else {
     const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
-    const ffmpegPathForAudio = resolveCompositorFfmpeg();
+    const ffmpegPathForAudio = resolveFfmpeg();
     const ffmpegEnvForAudio = binaryEnv(ffmpegPathForAudio);
 
     const finalResult = await refineCutsWithRealSilence({
@@ -1086,45 +1107,63 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
       ffmpegPath: ffmpegPathForAudio,
       ffmpegEnv: ffmpegEnvForAudio,
     });
-    finalCuts = finalResult.cuts;
     allDiscardReasons = [...allDiscardReasons, ...finalResult.cutIssues];
 
+    // Puerta de calidad sobre los cortes finales -- mismo mecanismo que
+    // correría el render real, para que este diagnóstico de solo
+    // lectura muestre también si el empalme resultante pasaría la
+    // verificación automática (o qué corrección/descarte aplicaría).
+    if (finalResult.cuts.length > 0) {
+      const gateResult = await runQualityGateWithRemediation({
+        ffmpegPath: ffmpegPathForAudio,
+        ffmpegEnv: ffmpegEnvForAudio,
+        videoPath,
+        cuts: finalResult.cuts,
+        videoDurationSeconds: job.input.durationInSeconds,
+      });
+      finalCuts = gateResult.cuts;
+      qualityGate = { ok: gateResult.ok, rounds: gateResult.rounds, incidents: gateResult.incidents, stoppedReason: gateResult.stoppedReason ?? null };
+      allDiscardReasons = [...allDiscardReasons, ...gateResult.incidents];
+    } else {
+      finalCuts = finalResult.cuts;
+    }
+
+    // Mapa de pausas reales calculado UNA SOLA VEZ por refineCutsWithRealSilence
+    // -- se reutiliza acá para el contexto por borde (+-3s), en vez de
+    // volver a invocar FFmpeg para cada uno (antes: 1 llamada por
+    // borde; ahora: 0, ya está calculado).
     for (const edge of wordsNearEdges) {
       if (edge.discarded) {
         edge.silenceAnalysis = null;
         continue;
       }
-      try {
-        const wide = await findRealPauseNearEdge({
-          ffmpegPath: ffmpegPathForAudio,
-          ffmpegEnv: ffmpegEnvForAudio,
-          videoPath,
-          targetSeconds: edge.adjustedSeconds,
-          maxDistanceSeconds: SILENCE_WIDE_REPORT_RADIUS_SECONDS,
-          videoDurationSeconds: job.input.durationInSeconds,
-        });
-        const nearest = findNearestRealPause(wide.intervals, edge.adjustedSeconds);
-        edge.silenceAnalysis = {
-          realPausesWithin3s: wide.intervals.map((iv) => ({ start: Number(iv.start.toFixed(3)), end: Number(iv.end.toFixed(3)) })),
-          nearestRealPauseSeconds: nearest ? Number(nearest.chosenSeconds.toFixed(3)) : null,
-          // Si esa pausa caería dentro de la ventana que de verdad usa
-          // producción (+-1s) -- si no, producción descartaría este
-          // corte en vez de usarla (precisión A del operador). El
-          // mismo dato ya queda reflejado en finalCuts/discardedCuts
-          // arriba (vía la función real) -- esto es solo contexto por
-          // borde.
-          wouldUseInProduction: Boolean(nearest && nearest.distanceSeconds <= SILENCE_SEARCH_RADIUS_SECONDS),
-          // Distancia (con signo) desde el límite "seguro por palabra"
-          // hasta el CENTRO de la pausa real más cercana dentro de
-          // +-3s -- NO es una medición del desfase de Whisper: si no
-          // hay ninguna pausa real cerca, esto queda en null y no dice
-          // nada sobre si Whisper está o no desfasado en ese punto.
-          distanceToNearestRealPauseSeconds: nearest ? Number((nearest.chosenSeconds - edge.adjustedSeconds).toFixed(3)) : null,
-        };
-      } catch (err) {
-        edge.silenceAnalysis = { error: String(err.message ?? err) };
+      if (!finalResult.pauseMap) {
+        edge.silenceAnalysis = { error: "no se pudo calcular el mapa de pausas reales para este video (ver acousticNote / cutIssues)." };
+        continue;
       }
+      const candidates = rankPauseCandidates(finalResult.pauseMap.intervals, edge.adjustedSeconds).filter(
+        (c) => c.distanceSeconds <= SILENCE_WIDE_REPORT_RADIUS_SECONDS,
+      );
+      const nearest = candidates[0] ?? null;
+      edge.silenceAnalysis = {
+        realPausesWithin3s: candidates.map((c) => ({ start: Number(c.interval.start.toFixed(3)), end: Number(c.interval.end.toFixed(3)) })),
+        nearestRealPauseSeconds: nearest ? Number(nearest.chosenSeconds.toFixed(3)) : null,
+        // Si esa pausa caería dentro de la ventana que de verdad usa
+        // producción (+-1s) -- si no, producción descartaría este
+        // corte en vez de usarla (precisión A del operador). El
+        // mismo dato ya queda reflejado en finalCuts/discardedCuts
+        // arriba (vía la función real) -- esto es solo contexto por
+        // borde.
+        wouldUseInProduction: Boolean(nearest && nearest.distanceSeconds <= SILENCE_SEARCH_RADIUS_SECONDS),
+        // Distancia (con signo) desde el límite "seguro por palabra"
+        // hasta el CENTRO de la pausa real más cercana dentro de
+        // +-3s -- NO es una medición del desfase de Whisper: si no
+        // hay ninguna pausa real cerca, esto queda en null y no dice
+        // nada sobre si Whisper está o no desfasado en ese punto.
+        distanceToNearestRealPauseSeconds: nearest ? Number((nearest.chosenSeconds - edge.adjustedSeconds).toFixed(3)) : null,
+      };
     }
+
   }
 
   // Todo corte pedido que no sobrevivió en finalCuts queda identificado
@@ -1147,6 +1186,7 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
     finalCuts,
     discardedCuts,
     acousticNote,
+    qualityGate,
   });
 });
 

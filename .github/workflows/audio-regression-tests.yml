@@ -1,0 +1,57 @@
+name: Pruebas de audio (lógica + regresión con FFmpeg real)
+
+# Corre en un runner Linux x64 -- `npm ci` instala
+# @remotion/compositor-linux-x64-gnu, el MISMO paquete (mismo FFmpeg)
+# que la imagen Docker de producción (node:22-bookworm-slim, también
+# glibc/x64). Esto es lo que permite verificar aquí, de verdad, lo que
+# en una máquina de desarrollo macOS no se puede ejecutar (ver
+# server/test-audio-regression.mjs).
+#
+# Mandato de autonomía del operador (31-oct-2026): "crea en GitHub
+# Actions... un flujo de pruebas de regresión con audio real corto, que
+# puedas lanzar y leer tú mismo". Los fragmentos de audio son
+# sintéticos (tonos/silencios generados con FFmpeg) -- no hay voz real
+# de nadie en este repositorio público.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - ".github/workflows/audio-regression-tests.yml"
+  pull_request:
+    paths:
+      - "server/**"
+  workflow_dispatch: {}
+
+jobs:
+  audio-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - run: npm ci
+
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      - name: eslint (src)
+        run: npx eslint src
+
+      - name: Mostrar qué @remotion/compositor-* se instaló (debe ser -linux-x64-gnu, igual que producción)
+        run: ls node_modules/@remotion | grep compositor
+
+      - name: Pruebas de lógica (detector/ejecutor de FFmpeg simulado)
+        run: |
+          node server/test-timeline.mjs
+          node server/test-cta-guarantee.mjs
+          node server/test-editorial-simulated.mjs
+          node server/test-drive-simulated.mjs
+          node server/test-audio-analysis.mjs
+          node server/test-quality-gate.mjs
+
+      - name: Pruebas de regresión con audio real (mismo FFmpeg que producción)
+        run: node server/test-audio-regression.mjs
