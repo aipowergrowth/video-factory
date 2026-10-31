@@ -21,7 +21,7 @@ const RETRY_MAX_TOKENS = Number(process.env.EDITORIAL_RETRY_MAX_TOKENS ?? 32000)
 // (ese es para fusionar rangos que ya se tocan, no para juzgar si un corte
 // propuesto vale la pena). Un corte más corto que esto casi nunca aísla
 // una muletilla/palabra completa -- es ruido de redondeo del modelo.
-const MIN_CUT_SECONDS = Number(process.env.EDITORIAL_MIN_CUT_SECONDS ?? 0.15);
+export const MIN_CUT_SECONDS = Number(process.env.EDITORIAL_MIN_CUT_SECONDS ?? 0.15);
 // Corrección del dictamen de cierre de talking-head (30-oct-2026): un
 // zoom de menos de 2s apenas se percibe como énfasis -- se extiende
 // hacia adelante igual que un CTA corto; solo se descarta si no hay
@@ -645,6 +645,16 @@ export const mergeNearbyGaplessCuts = (cuts, transcriptWords) => {
  * queda registrado -- nunca se deja un borde inseguro solo por no
  * perder el corte.
  *
+ * Defecto real corregido (precisión del operador sobre el endpoint
+ * snap-cuts, 30-oct-2026): con palabras pegadas (sin hueco real entre
+ * ellas), el margen fijo de 0.1s empujaba el borde adentro de la
+ * PALABRA SIGUIENTE en vez de dejarlo en el límite -- exactamente el
+ * mismo tipo de defecto que esto existe para evitar, pero producido
+ * por el propio margen. Ahora el margen efectivo en cada borde es
+ * `Math.min(margen deseado, hueco real disponible)`: si no hay hueco,
+ * el margen efectivo es 0 y el borde queda EXACTO en el límite de la
+ * palabra (nunca adentro de ninguna de las dos).
+ *
  * Sin `transcriptWords` no hay forma de verificar esto (mismo criterio
  * conservador que mergeNearbyGaplessCuts): los cortes se devuelven sin
  * tocar.
@@ -652,37 +662,71 @@ export const mergeNearbyGaplessCuts = (cuts, transcriptWords) => {
  * Deliberadamente LOCAL a cada corte -- no considera si una palabra
  * "conservada" para este corte en realidad desaparece por otro corte
  * vecino; eso sería ampliar el alcance de esta corrección.
+ *
+ * Además de `cuts`/`cutIssues`, devuelve `edgeBounds`: por cada corte
+ * que sobrevivió, el rango [min,max] dentro del cual CUALQUIER punto
+ * es seguro por palabra para cada borde -- lo usa el refinamiento
+ * acústico (ver audio-analysis.mjs) para saber hasta dónde puede
+ * buscar una pausa real sin arriesgar nunca cortar una palabra, sin
+ * duplicar esta lógica.
  */
 export const snapCutsToWordBoundaries = (cuts, transcriptWords) => {
   const hasWords = Array.isArray(transcriptWords) && transcriptWords.length > 0;
   if (!hasWords) {
-    return { cuts, cutIssues: [] };
+    return { cuts, cutIssues: [], edgeBounds: {} };
   }
 
   const sortedWords = [...transcriptWords].sort((a, b) => a.startMs - b.startMs);
   const cutIssues = [];
   const snapped = [];
+  const edgeBounds = {};
+
+  const findStraddleIndex = (seconds) =>
+    sortedWords.findIndex((w) => w.startMs / 1000 < seconds && w.endMs / 1000 > seconds);
 
   for (const cut of cuts) {
     // La palabra que se solapa con el INICIO del corte -- empieza antes
     // de que el corte arranque, pero todavía no terminó. El corte no
     // puede arrancar en medio de ella.
-    const straddleAtStart = sortedWords.find(
-      (w) => w.startMs / 1000 < cut.startSeconds && w.endMs / 1000 > cut.startSeconds,
-    );
+    const startIdx = findStraddleIndex(cut.startSeconds);
     // La palabra que se solapa con el FINAL del corte -- ya empezó antes
     // de que el corte termine, pero sigue después. Este es el caso real
     // del defecto: el corte terminaba a mitad de "Cameron".
-    const straddleAtEnd = sortedWords.find(
-      (w) => w.startMs / 1000 < cut.endSeconds && w.endMs / 1000 > cut.endSeconds,
-    );
+    const endIdx = findStraddleIndex(cut.endSeconds);
 
-    const newStart = straddleAtStart
-      ? Math.max(cut.startSeconds, straddleAtStart.endMs / 1000 + CUT_WORD_BOUNDARY_MARGIN_SECONDS)
-      : cut.startSeconds;
-    const newEnd = straddleAtEnd
-      ? Math.min(cut.endSeconds, straddleAtEnd.startMs / 1000 - CUT_WORD_BOUNDARY_MARGIN_SECONDS)
-      : cut.endSeconds;
+    // Piso del inicio: justo después de la palabra que lo solapa (si
+    // hay una). El margen nunca puede pasar de la palabra SIGUIENTE a
+    // esa -- si no hay hueco real antes de ella, el margen efectivo es 0.
+    let startFloor = cut.startSeconds;
+    let startCeiling = startIdx === -1 ? cut.endSeconds : Infinity; // hasta dónde puede buscar el refinamiento acústico
+    if (startIdx !== -1) {
+      const straddleWord = sortedWords[startIdx];
+      const nextWord = sortedWords[startIdx + 1];
+      const gapToNext = nextWord
+        ? Math.max(0, nextWord.startMs / 1000 - straddleWord.endMs / 1000)
+        : Infinity;
+      const margin = Math.min(CUT_WORD_BOUNDARY_MARGIN_SECONDS, gapToNext);
+      startFloor = Math.max(cut.startSeconds, straddleWord.endMs / 1000 + margin);
+      startCeiling = nextWord ? nextWord.startMs / 1000 : Infinity;
+    }
+
+    // Techo del final: justo antes de la palabra que lo solapa (si hay
+    // una) -- mismo criterio de margen clamped al hueco real.
+    let endCeiling = cut.endSeconds;
+    let endFloor = endIdx === -1 ? cut.startSeconds : -Infinity;
+    if (endIdx !== -1) {
+      const straddleWord = sortedWords[endIdx];
+      const prevWord = sortedWords[endIdx - 1];
+      const gapToPrev = prevWord
+        ? Math.max(0, straddleWord.startMs / 1000 - prevWord.endMs / 1000)
+        : Infinity;
+      const margin = Math.min(CUT_WORD_BOUNDARY_MARGIN_SECONDS, gapToPrev);
+      endCeiling = Math.min(cut.endSeconds, straddleWord.startMs / 1000 - margin);
+      endFloor = prevWord ? prevWord.endMs / 1000 : -Infinity;
+    }
+
+    const newStart = startFloor;
+    const newEnd = endCeiling;
 
     if (newEnd - newStart < MIN_CUT_SECONDS) {
       cutIssues.push(
@@ -691,6 +735,11 @@ export const snapCutsToWordBoundaries = (cuts, transcriptWords) => {
       continue;
     }
 
+    edgeBounds[cut.id] = {
+      start: { min: startFloor, max: Math.min(startCeiling, newEnd) },
+      end: { min: Math.max(endFloor, newStart), max: endCeiling },
+    };
+
     if (newStart !== cut.startSeconds || newEnd !== cut.endSeconds) {
       snapped.push({ ...cut, startSeconds: newStart, endSeconds: newEnd });
     } else {
@@ -698,7 +747,7 @@ export const snapCutsToWordBoundaries = (cuts, transcriptWords) => {
     }
   }
 
-  return { cuts: snapped, cutIssues };
+  return { cuts: snapped, cutIssues, edgeBounds };
 };
 
 const SNAP_CUTS_EDGE_WINDOW_SECONDS = 2;
@@ -720,7 +769,7 @@ export const buildSnapCutsDiagnostic = (cuts, transcriptWords) => {
   // sigue devolviendo los números exactos para quien los persista.
   const round3 = (n) => (typeof n === "number" ? Number(n.toFixed(3)) : n);
 
-  const { cuts: rawAdjustedCuts, cutIssues } = snapCutsToWordBoundaries(cuts, transcriptWords);
+  const { cuts: rawAdjustedCuts, cutIssues, edgeBounds } = snapCutsToWordBoundaries(cuts, transcriptWords);
   const adjustedCuts = rawAdjustedCuts.map((c) => ({ ...c, startSeconds: round3(c.startSeconds), endSeconds: round3(c.endSeconds) }));
 
   const wordsNearEdges = cuts.flatMap((cut) => {
@@ -751,7 +800,7 @@ export const buildSnapCutsDiagnostic = (cuts, transcriptWords) => {
     ];
   });
 
-  return { adjustedCuts, cutIssues, wordsNearEdges };
+  return { adjustedCuts, cutIssues, wordsNearEdges, edgeBounds };
 };
 
 const callModel = async ({ anthropic, prompt, model, maxTokens }) => {

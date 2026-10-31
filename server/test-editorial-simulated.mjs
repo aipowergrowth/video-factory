@@ -725,6 +725,85 @@ const w = (text, startSec, endSec) => ({ text, startMs: startSec * 1000, endMs: 
   check("final del corte: sin cambios", result.cuts[0].endSeconds === 6.0);
 }
 
+// --- Defecto real encontrado por el operador en el endpoint snap-cuts
+// (ae40a93): con palabras PEGADAS (sin hueco real entre ellas), el
+// margen de 0.1s empujaba el borde DENTRO de la palabra siguiente --
+// exactamente el defecto que esta función existe para evitar, ahora
+// producido por su propio margen. Casos reales del job 578818c7. ---
+
+{
+  // ai-cut-0: 29.5-30.71 (reportado). La palabra previa a "cameron2"
+  // termina justo donde "cameron2" empieza (29.68, sin hueco) -- el
+  // viejo código daba 29.68+0.1=29.78, DENTRO de cameron2 (29.68-30.24).
+  // El final del corte (31.0) cae en un hueco amplio, lejos de toda
+  // palabra, para aislar la prueba al borde de INICIO únicamente.
+  const words = [
+    w("previa", 29.3, 29.68),
+    w("cameron2", 29.68, 30.24),
+    w("sepah", 30.3, 30.7),
+  ];
+  const cuts = [{ id: "ai-cut-0", startSeconds: 29.5, endSeconds: 31.0 }];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check(
+    "palabras pegadas (sin hueco): el margen efectivo es 0, el borde queda EXACTO en el límite (29.68), nunca dentro de 'cameron2'",
+    result.cuts.length === 1 && approx(result.cuts[0].startSeconds, 29.68),
+  );
+  check("palabras pegadas: el borde ajustado NO cae dentro de cameron2 (29.68-30.24)", result.cuts[0].startSeconds <= 29.68);
+}
+
+{
+  // ai-cut-1: 109.26-109.86 (reportado). Misma forma con "pues"
+  // (109.40-109.84) pegada a la palabra anterior -- el viejo código
+  // daba 109.40+0.1=109.5, DENTRO de "pues". Final lejos de toda
+  // palabra, para aislar la prueba al borde de inicio.
+  const words = [
+    w("previa", 109.0, 109.4),
+    w("pues", 109.4, 109.84),
+    w("siguiente", 109.9, 110.3),
+  ];
+  const cuts = [{ id: "ai-cut-1", startSeconds: 109.26, endSeconds: 112.0 }];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check(
+    "caso real de 'pues': el borde queda EXACTO en 109.40, nunca dentro de 'pues' (109.40-109.84)",
+    result.cuts.length === 1 && approx(result.cuts[0].startSeconds, 109.4),
+  );
+}
+
+{
+  // El mismo defecto, pero en el borde FINAL de un corte (margen hacia
+  // atrás contra la palabra anterior pegada).
+  const words = [w("antes", 10.0, 10.5), w("pegada", 10.5, 11.0), w("despues", 11.3, 11.7)];
+  // El final original (10.55) cae dentro de "pegada" (10.5-11.0). El
+  // inicio (8.0) está lejos de toda palabra, para aislar la prueba al
+  // borde final únicamente.
+  const cuts = [{ id: "c-end", startSeconds: 8.0, endSeconds: 10.55 }];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check(
+    "final contra palabras pegadas: queda EXACTO en 10.5 (inicio de 'pegada'), margen efectivo 0",
+    result.cuts.length === 1 && approx(result.cuts[0].endSeconds, 10.5),
+  );
+}
+
+{
+  // Cuando SÍ hay hueco real (mayor al margen), el margen completo se
+  // sigue aplicando como antes -- esto no debe regresionar.
+  const words = [w("a", 1.0, 1.4), w("b", 2.0, 2.4)]; // hueco de 0.6s entre ellas
+  // 1.3 cae dentro de "a"; el final (3.0) queda lejos de toda palabra.
+  const cuts = [{ id: "c-gap", startSeconds: 1.3, endSeconds: 3.0 }];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check("con hueco real amplio: el margen completo de 0.1s se aplica igual que siempre", approx(result.cuts[0].startSeconds, 1.5));
+}
+
+{
+  // edgeBounds: expone el rango seguro por borde para que el
+  // refinamiento acústico sepa hasta dónde puede buscar sin arriesgar
+  // nunca una palabra.
+  const words = [w("previa", 29.3, 29.68), w("cameron2", 29.68, 30.24)];
+  const cuts = [{ id: "ai-cut-0", startSeconds: 29.5, endSeconds: 31.0 }];
+  const result = snapCutsToWordBoundaries(cuts, words);
+  check("edgeBounds: el piso del inicio nunca es menor al límite seguro (29.68)", result.edgeBounds["ai-cut-0"].start.min === 29.68);
+}
+
 {
   // Corte ya limpio (ningún borde toca una palabra): queda intacto.
   const words = [w("a", 1.0, 1.5), w("b", 1.9, 2.3)];

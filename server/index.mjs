@@ -9,9 +9,10 @@ import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { downloadFileWithRetry, uploadFile } from "./drive.mjs";
 import { transcribeVideo } from "./transcribe.mjs";
-import { planEdit, mergeNearbyGaplessCuts, snapCutsToWordBoundaries, buildSnapCutsDiagnostic } from "./editorial.mjs";
+import { planEdit, mergeNearbyGaplessCuts, snapCutsToWordBoundaries, buildSnapCutsDiagnostic, MIN_CUT_SECONDS } from "./editorial.mjs";
 import { buildTimeline } from "./timeline.mjs";
 import { relocateToNearestSurvivingInterval, remapResourcesWithCtaGuarantee, computePendingResources } from "./cta-guarantee.mjs";
+import { refineCutsAcoustically, refineEdgeAcoustically } from "./audio-analysis.mjs";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -556,11 +557,37 @@ const planEditIfNeeded = async (jobId, job) => {
   // palabra "Cameron" y se comía sus primeras sílabas. Ningún borde de
   // corte puede caer dentro de una palabra -- se recorta hacia adentro
   // con margen, o se descarta entero si no hay forma segura de hacerlo.
-  const { cuts: snappedCuts, cutIssues: snapCutIssues } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
+  const { cuts: snappedCuts, cutIssues: snapCutIssues, edgeBounds } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
   for (const issue of snapCutIssues) {
     console.log(`[job ${jobId}]   ${issue}`);
   }
-  for (const cut of snappedCuts) {
+  // Los tiempos de Whisper pueden estar desfasados del audio real
+  // (defecto real: "Cameron Sepah" sonaba cortado aunque el ajuste por
+  // palabra ya se había aplicado) -- dentro del rango ya garantizado
+  // seguro por palabra (nunca afuera de él), se busca el punto de
+  // menor energía real del audio con FFmpeg. Nunca se sale del rango
+  // seguro, así que esto solo puede mejorar la precisión, nunca
+  // reintroducir el corte de una palabra. Sin un video real en disco
+  // (job de prueba sin `input.baseVideo`) se omite -- quedan los
+  // cortes ya seguros por palabra, igual que antes de esta corrección.
+  let acousticCuts = snappedCuts;
+  let acousticCutIssues = [];
+  if (typeof job.input.baseVideo === "string") {
+    const ffmpegPathForAudio = resolveCompositorFfmpeg();
+    ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsAcoustically({
+      cuts: snappedCuts,
+      edgeBounds,
+      videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
+      ffmpegPath: ffmpegPathForAudio,
+      ffmpegEnv: binaryEnv(ffmpegPathForAudio),
+      minCutSeconds: MIN_CUT_SECONDS,
+      log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
+    }));
+  }
+  for (const issue of acousticCutIssues) {
+    console.log(`[job ${jobId}]   ${issue}`);
+  }
+  for (const cut of acousticCuts) {
     console.log(
       `[job ${jobId}]   corte ${cut.startSeconds.toFixed(2)}-${cut.endSeconds.toFixed(2)}s: ${cut.reason ?? "(sin razón)"}`,
     );
@@ -578,8 +605,8 @@ const planEditIfNeeded = async (jobId, job) => {
     );
   }
 
-  job.cuts = snappedCuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
-  job.cutIssues = [...plan.cutIssues, ...snapCutIssues];
+  job.cuts = acousticCuts.map(({ id, startSeconds, endSeconds }) => ({ id, startSeconds, endSeconds }));
+  job.cutIssues = [...plan.cutIssues, ...snapCutIssues, ...acousticCutIssues];
   job.zooms = plan.zooms.map(({ id, startSeconds, endSeconds, fromScale, toScale, origin }) => ({
     id,
     startSeconds,
@@ -925,11 +952,28 @@ app.post("/jobs/:id/replan", async (req, res) => {
     for (const line of mergeLog) {
       console.log(`[replan ${jobId}]   ${line}`);
     }
-    const { cuts: snappedCuts, cutIssues: snapCutIssues } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
+    const { cuts: snappedCuts, cutIssues: snapCutIssues, edgeBounds } = snapCutsToWordBoundaries(mergedCuts, job.transcriptWords);
     for (const issue of snapCutIssues) {
       console.log(`[replan ${jobId}]   ${issue}`);
     }
-    const timeline = buildTimeline(job.input.durationInSeconds, snappedCuts);
+    let acousticCuts = snappedCuts;
+    let acousticCutIssues = [];
+    if (typeof job.input.baseVideo === "string") {
+      const ffmpegPathForAudio = resolveCompositorFfmpeg();
+      ({ cuts: acousticCuts, cutIssues: acousticCutIssues } = await refineCutsAcoustically({
+        cuts: snappedCuts,
+        edgeBounds,
+        videoPath: path.join(PROJECT_ROOT, "public", job.input.baseVideo),
+        ffmpegPath: ffmpegPathForAudio,
+        ffmpegEnv: binaryEnv(ffmpegPathForAudio),
+        minCutSeconds: MIN_CUT_SECONDS,
+        log: (msg) => console.log(`[replan ${jobId}]   ${msg}`),
+      }));
+    }
+    for (const issue of acousticCutIssues) {
+      console.log(`[replan ${jobId}]   ${issue}`);
+    }
+    const timeline = buildTimeline(job.input.durationInSeconds, acousticCuts);
     const { resources, droppedCount, ctaIssues } = remapResourcesWithCtaGuarantee({
       resources: plan.resources,
       timeline,
@@ -955,8 +999,8 @@ app.post("/jobs/:id/replan", async (req, res) => {
       jobId,
       layout: layout ?? null,
       ...plan,
-      cuts: snappedCuts,
-      cutIssues: [...plan.cutIssues, ...snapCutIssues],
+      cuts: acousticCuts,
+      cutIssues: [...plan.cutIssues, ...snapCutIssues, ...acousticCutIssues],
       resources,
       ctaIssues,
       pendingResources,
@@ -977,6 +1021,13 @@ app.post("/jobs/:id/replan", async (req, res) => {
  * nada, no persiste ni modifica el job -- existe para poder ver
  * exactamente qué palabra cae en cada borde sin tener que exponer el
  * array completo de transcriptWords (puede ser enorme) por otro canal.
+ *
+ * Precisión B del operador (30-oct-2026): si el job tiene un video
+ * real en disco (`input.baseVideo`), además corre el análisis de
+ * energía acústica real sobre cada borde -- devuelve el perfil en dB y
+ * el punto elegido, para poder verificar sin tener que escuchar el
+ * audio completo. Sigue sin llamar al modelo, sin costo, sin persistir
+ * ni modificar nada.
  */
 app.post("/jobs/:id/snap-cuts", async (req, res) => {
   const jobId = req.params.id;
@@ -1003,7 +1054,41 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
     }
   }
 
-  const { adjustedCuts, cutIssues, wordsNearEdges } = buildSnapCutsDiagnostic(cuts, job.transcriptWords);
+  const { adjustedCuts, cutIssues, wordsNearEdges, edgeBounds } = buildSnapCutsDiagnostic(cuts, job.transcriptWords);
+
+  let acousticNote = null;
+  if (typeof job.input.baseVideo !== "string") {
+    acousticNote = 'Este job no tiene "input.baseVideo" (sin video real en disco) -- se omite el análisis acústico, solo se devuelve el diagnóstico por palabra.';
+  } else {
+    const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
+    const ffmpegPathForAudio = resolveCompositorFfmpeg();
+    const ffmpegEnvForAudio = binaryEnv(ffmpegPathForAudio);
+
+    for (const edge of wordsNearEdges) {
+      const bounds = edgeBounds[edge.cutId]?.[edge.edge];
+      if (edge.discarded || !bounds) {
+        edge.acoustic = null;
+        continue;
+      }
+      try {
+        const result = await refineEdgeAcoustically({
+          ffmpegPath: ffmpegPathForAudio,
+          ffmpegEnv: ffmpegEnvForAudio,
+          videoPath,
+          wordSafeSeconds: edge.adjustedSeconds,
+          safeMin: bounds.min,
+          safeMax: bounds.max,
+        });
+        edge.acoustic = {
+          refined: result.refined,
+          chosenSeconds: Number(result.seconds.toFixed(3)),
+          profileDb: result.profile.map((f) => ({ offsetSeconds: f.offsetSeconds, db: f.db })),
+        };
+      } catch (err) {
+        edge.acoustic = { error: String(err.message ?? err) };
+      }
+    }
+  }
 
   res.json({
     jobId,
@@ -1011,6 +1096,7 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
     adjustedCuts,
     cutIssues,
     wordsNearEdges,
+    acousticNote,
   });
 });
 
