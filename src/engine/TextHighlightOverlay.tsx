@@ -10,7 +10,7 @@ import { useEngineTheme } from "./theme/ThemeContext";
  * render mostraba cosas como "Texto resaltado: '...'" literalmente en
  * pantalla). `VideoEngine.tsx` ya garantiza que este componente solo
  * recibe recursos CON `displayText` -- si no lo trae, queda pendiente
- * de 3B en vez de llegar acá (ver cta-guarantee.mjs#isRenderableIn3A).
+ * de 3B en vez de llegar acá (ver cta-guarantee.mjs#isRenderableByEngine).
  * Arriba, centrado -- nunca abajo, para no competir con los subtítulos.
  */
 export const TextHighlightOverlay: React.FC<{ resource: Resource }> = ({

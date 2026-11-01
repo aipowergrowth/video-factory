@@ -1,0 +1,73 @@
+{
+  "channel": "a-mi-no-me-cuadra",
+  "destination": "youtube-16-9",
+  "input": {
+    "type": "recorded-video",
+    "baseVideo": "uploads/videos/b3601795-d1fb-400b-ad5c-b518855775dd.mp4",
+    "durationInSeconds": 759.27
+  },
+  "overlays": [],
+  "captions": [],
+  "skipTranscription": true,
+  "skipEditorialAI": true,
+  "cuts": [],
+  "zooms": [],
+  "resources": [
+    {
+      "id": "test-broll-0",
+      "startSeconds": 60,
+      "endSeconds": 64,
+      "type": "broll",
+      "description": "PRUEBA TÉCNICA (no editorial): verificar adquisición de B-roll contra Pixabay y su inserción en el motor.",
+      "visualQuery": "ilustración 3D de una molécula de dopamina en el cerebro",
+      "editorialGoal": "comprehension",
+      "segment": "development",
+      "intensity": "moderate",
+      "veracityRequirement": "illustrative-ok",
+      "essential": false
+    },
+    {
+      "id": "test-image-0",
+      "startSeconds": 120,
+      "endSeconds": 125,
+      "type": "image",
+      "description": "PRUEBA TÉCNICA (no editorial): verificar adquisición de una imagen fija contra Pixabay.",
+      "visualQuery": "persona corriendo al amanecer en un parque",
+      "editorialGoal": "emotion",
+      "segment": "development",
+      "intensity": "moderate",
+      "veracityRequirement": "illustrative-ok",
+      "essential": false
+    },
+    {
+      "id": "test-image-sin-resultado",
+      "startSeconds": 150,
+      "endSeconds": 154,
+      "type": "image",
+      "description": "PRUEBA TÉCNICA (no editorial): consulta deliberadamente sin relación visual real, para confirmar que el sistema RECHAZA insertar algo genérico y lo deja pendiente con motivo.",
+      "visualQuery": "xyzzy inexistente consulta sin sentido 12345",
+      "editorialGoal": "context",
+      "segment": "development",
+      "intensity": "subtle",
+      "veracityRequirement": "illustrative-ok",
+      "essential": false
+    },
+    {
+      "id": "test-graphic-0",
+      "startSeconds": 200,
+      "endSeconds": 204,
+      "type": "graphic",
+      "description": "PRUEBA TÉCNICA (no editorial): dato de prueba, NO una cifra real citada por el presentador -- solo para confirmar que GraphicOverlay renderiza graphicVariant/graphicData sin tocar ningún banco externo.",
+      "graphicVariant": "stat",
+      "graphicData": { "value": "100%", "label": "dato de prueba técnica (no editorial)" },
+      "editorialGoal": "evidence",
+      "segment": "development",
+      "intensity": "moderate",
+      "veracityRequirement": "illustrative-ok",
+      "essential": false
+    }
+  ],
+  "pendingResources": [],
+  "ctaIssues": [],
+  "planOnly": true
+}

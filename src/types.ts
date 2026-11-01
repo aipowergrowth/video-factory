@@ -165,11 +165,11 @@ export type EngineJob = {
   zooms?: ZoomKeyframe[];
   /**
    * Recursos de la IA editorial ya en tiempo de SALIDA (ver tipo `Resource`
-   * arriba) -- Fase 3A solo renderiza los que tengan `ctaPosition` o
-   * `type === "text-highlight"`; el resto son `pendingResources`.
+   * arriba) -- solo se renderizan los que pasan `isRenderableByEngine`
+   * más abajo; el resto son `pendingResources`.
    */
   resources?: Resource[];
-  /** Recursos que la IA editorial decidió pero Fase 3A no renderiza todavía. */
+  /** Recursos que la IA editorial decidió pero el motor no renderiza todavía. */
   pendingResources?: PendingResource[];
 };
 
@@ -261,15 +261,107 @@ export type Resource = {
    * el defecto real que llevó a este campo: el render mostraba cosas
    * como "Texto resaltado: '...'" literalmente en pantalla). Para
    * `text-highlight` es obligatorio -- sin esto, el recurso queda
-   * pendiente de 3B (ver `cta-guarantee.mjs#isRenderableIn3A`), nunca se
+   * pendiente de 3B (ver `cta-guarantee.mjs#isRenderableByEngine`), nunca se
    * usa `description` como reemplazo. Para CTA es opcional: si falta, el
    * motor usa la frase fija del canal (`ChannelProfile.theme.defaultCtaText`).
    */
   displayText?: string;
+
+  /**
+   * Fase 3B (31-oct-2026), solo para `type: "broll" | "image"`: consulta
+   * concreta y VISUAL para buscar en un banco de medios (hoy, Pixabay) --
+   * distinta de `description` (que es prosa editorial, "por qué" se
+   * necesita el recurso, no "qué buscar"). Ejemplo: "ilustración 3D de
+   * una molécula de dopamina", no "mostrar el concepto para reforzar la
+   * comprensión". Sin esto, no hay nada bueno que buscar -- el recurso
+   * queda pendiente (ver `server/resource-acquisition.mjs`).
+   */
+  visualQuery?: string;
+
+  /**
+   * Fase 3B, solo para `type: "graphic"`: qué variante generar con los
+   * componentes YA existentes (`src/graphics/Chart.tsx`/`CycleDiagram.tsx`/
+   * `StatCallout.tsx`) y sus datos. Los valores de `graphicData` deben
+   * ser cifras/pasos que el presentador menciona realmente en la
+   * transcripción -- NUNCA inventados para completar un gráfico (misma
+   * exigencia que `displayText` en `text-highlight`). Sin esto (o con
+   * datos no verificables), el recurso queda pendiente, nunca se adivina.
+   */
+  graphicVariant?: "chart" | "cycle" | "stat";
+  graphicData?: ChartGraphicProps | CycleGraphicProps | StatGraphicProps;
+
+  /**
+   * Fase 3B: presente cuando `visualQuery` se resolvió contra un banco
+   * externo real -- registro de procedencia/licencia obligatorio por
+   * recurso (nunca se usa un recurso sin esto). `localPath` es una ruta
+   * dentro de `public/`, consumible por `staticFile()` (mismo patrón que
+   * `input.baseVideo`).
+   */
+  resolvedAsset?: {
+    provider: "pixabay";
+    assetId: number;
+    pageUrl: string;
+    localPath: string;
+    mediaType: "photo" | "illustration" | "video";
+    author: string;
+    licenseName: string;
+    licenseUrl: string;
+    attributionRequired: boolean;
+    downloadedAt: string;
+  };
+
+  /**
+   * Fase 3B: si la adquisición automática no encontró un resultado
+   * suficientemente pertinente (o falló la búsqueda/descarga), el motivo
+   * específico -- reemplaza el motivo genérico de Fase 3B en
+   * `pendingResources` cuando está presente (ver
+   * `cta-guarantee.mjs#computePendingResources`).
+   */
+  acquisitionFailureReason?: string;
 };
 
 /**
- * Recurso que la IA editorial decidió pero que Fase 3A todavía no puede
+ * Misma función (a propósito duplicada, no importada) en
+ * `server/cta-guarantee.mjs` -- mismo motivo que `shouldBurnCaptions`
+ * más arriba. Si una cambia, la otra debe cambiar igual.
+ */
+export const isValidGraphicData = (
+  variant: Resource["graphicVariant"],
+  data: Resource["graphicData"],
+): boolean => {
+  if (!data || typeof data !== "object") return false;
+  if (variant === "chart") {
+    const chart = data as ChartGraphicProps;
+    return (
+      Array.isArray(chart.data) &&
+      chart.data.length > 0 &&
+      chart.data.every((d) => d && typeof d.label === "string" && typeof d.value === "number" && Number.isFinite(d.value))
+    );
+  }
+  if (variant === "cycle") {
+    const cycle = data as CycleGraphicProps;
+    return Array.isArray(cycle.steps) && cycle.steps.length > 0 && cycle.steps.every((s) => typeof s === "string" && s.trim().length > 0);
+  }
+  if (variant === "stat") {
+    const stat = data as StatGraphicProps;
+    return typeof stat.value === "string" && stat.value.trim().length > 0 && typeof stat.label === "string" && stat.label.trim().length > 0;
+  }
+  return false;
+};
+
+/**
+ * Misma función (a propósito duplicada) en
+ * `server/cta-guarantee.mjs#isRenderableByEngine` -- qué recursos puede
+ * pintar hoy el motor. Si una cambia, la otra debe cambiar igual.
+ */
+export const isRenderableByEngine = (resource: Resource): boolean =>
+  Boolean(resource.ctaPosition) ||
+  (resource.type === "text-highlight" && Boolean(resource.displayText)) ||
+  (resource.type === "graphic" && isValidGraphicData(resource.graphicVariant, resource.graphicData)) ||
+  ((resource.type === "broll" || resource.type === "image") && Boolean(resource.resolvedAsset));
+
+/**
+ * Recurso que la IA editorial decidió pero que el motor todavía no puede
  * representar visualmente (ver `server/cta-guarantee.mjs#computePendingResources`).
  * Puramente informativo para el job/informe humano -- este motor NO lo lee
  * ni intenta renderizarlo.

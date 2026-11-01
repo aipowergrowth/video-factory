@@ -1,6 +1,6 @@
 import { AbsoluteFill, Sequence, useVideoConfig } from "remotion";
-import type { Caption, ChannelProfile, EngineJob } from "../types";
-import { shouldBurnCaptions } from "../types";
+import type { Caption, ChannelProfile, EngineJob, Resource } from "../types";
+import { shouldBurnCaptions, isRenderableByEngine } from "../types";
 import { secondsToFrames } from "../lib/time";
 import { OverlayRenderer } from "./OverlayRenderer";
 import { ResourceRenderer } from "./ResourceRenderer";
@@ -10,6 +10,22 @@ import { Source } from "./sources/Source";
 import { ThemeProvider, DEFAULT_THEME } from "./theme/ThemeContext";
 import { getDurationInSeconds } from "./getDurationInSeconds";
 import { buildTimeline, remapRangeToOutput } from "./timeline";
+
+/** `resource.startSeconds`/`endSeconds` ya vienen en tiempo de SALIDA -- ver el comentario grande más abajo. */
+const renderResourceSequence = (resource: Resource, fps: number) => {
+  const from = secondsToFrames(resource.startSeconds, fps);
+  const durationInFrames = secondsToFrames(resource.endSeconds - resource.startSeconds, fps);
+  if (durationInFrames <= 0) {
+    return null;
+  }
+  return (
+    <Sequence key={resource.id} from={from} durationInFrames={durationInFrames}>
+      <Fade durationInFrames={durationInFrames}>
+        <ResourceRenderer resource={resource} />
+      </Fade>
+    </Sequence>
+  );
+};
 
 export type VideoEngineProps = {
   jobFile: string;
@@ -60,18 +76,20 @@ export const VideoEngine: React.FC<VideoEngineProps> = ({
   // de SALIDA -- el servidor (cta-guarantee.mjs) ya corrió
   // remapRangeToOutput (y la reubicación por corte, si hacía falta) antes
   // de persistir el job. Volver a remapear acá aplicaría el
-  // desplazamiento de los cortes dos veces. Fase 3A solo renderiza CTA
-  // (cualquier `type` con `ctaPosition`) y `text-highlight` CON
-  // `displayText` -- un text-highlight sin `displayText` no se puede
-  // mostrar sin inventar texto, así que queda en `job.pendingResources`
-  // (el servidor ya lo clasificó así -- MISMA regla acá, ver
-  // cta-guarantee.mjs#isRenderableIn3A). `job.pendingResources` es solo
-  // para el informe humano, este motor nunca lo lee.
-  const renderableResources = (job.resources ?? []).filter(
-    (resource) =>
-      Boolean(resource.ctaPosition) ||
-      (resource.type === "text-highlight" && Boolean(resource.displayText)),
-  );
+  // desplazamiento de los cortes dos veces. `isRenderableByEngine`
+  // (compartida con cta-guarantee.mjs) decide qué se puede pintar hoy; el
+  // resto queda en `job.pendingResources` -- solo para el informe
+  // humano, este motor nunca lo lee.
+  //
+  // Orden de pintado (Fase 3B, 31-oct-2026): broll/image se pintan
+  // PRIMERO (ocupan el cuadro completo, son el contenido de fondo) y
+  // CTA/graphic/text-highlight DESPUÉS, para que estos últimos queden
+  // siempre encima sin importar en qué orden el planificador los haya
+  // propuesto -- los subtítulos ya iban al final (ver más abajo), esto
+  // extiende la misma garantía al resto de los recursos en primer plano.
+  const renderableResources = (job.resources ?? []).filter(isRenderableByEngine);
+  const backgroundResources = renderableResources.filter((r) => r.type === "broll" || r.type === "image");
+  const foregroundResources = renderableResources.filter((r) => r.type !== "broll" && r.type !== "image");
 
   const captionsInOutputTime: Caption[] = (job.captions ?? []).flatMap(
     (caption) => {
@@ -106,24 +124,9 @@ export const VideoEngine: React.FC<VideoEngineProps> = ({
           );
         })}
 
-        {renderableResources.map((resource) => {
-          const from = secondsToFrames(resource.startSeconds, fps);
-          const durationInFrames = secondsToFrames(
-            resource.endSeconds - resource.startSeconds,
-            fps,
-          );
-          if (durationInFrames <= 0) {
-            return null;
-          }
+        {backgroundResources.map((resource) => renderResourceSequence(resource, fps))}
 
-          return (
-            <Sequence key={resource.id} from={from} durationInFrames={durationInFrames}>
-              <Fade durationInFrames={durationInFrames}>
-                <ResourceRenderer resource={resource} />
-              </Fade>
-            </Sequence>
-          );
-        })}
+        {foregroundResources.map((resource) => renderResourceSequence(resource, fps))}
 
         {shouldBurnCaptions(job) && captionsInOutputTime.length > 0 ? (
           <Captions captions={captionsInOutputTime} />

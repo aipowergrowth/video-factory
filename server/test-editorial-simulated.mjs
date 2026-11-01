@@ -1094,6 +1094,76 @@ const w = (text, startSec, endSec) => ({ text, startMs: startSec * 1000, endMs: 
   check("sin displayText: queda undefined (nunca se usa description como reemplazo)", plan.resources[0].displayText === undefined);
 }
 
+// 4g. Fase 3B (31-oct-2026): "visualQuery" (broll/image) y
+// "graphicVariant"/"graphicData" (graphic) se parsean tal cual cuando
+// son válidos, y NUNCA se inventan si faltan o están mal formados.
+{
+  const withVisualQueryAndGraphic = JSON.stringify({
+    cuts: [], zooms: [],
+    resources: [
+      {
+        startSeconds: 5, endSeconds: 8,
+        type: "broll",
+        description: "Mostrar el concepto para reforzar la comprensión",
+        visualQuery: "ilustración 3D de una molécula de dopamina",
+        editorialGoal: "comprehension", segment: "development",
+      },
+      {
+        startSeconds: 30, endSeconds: 34,
+        type: "graphic",
+        description: "Destacar la cifra que dio el presentador",
+        graphicVariant: "stat",
+        graphicData: { value: "73%", label: "de los pacientes mejoró" },
+        editorialGoal: "evidence", segment: "development",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(withVisualQueryAndGraphic, 200);
+  const broll = plan.resources.find((r) => r.type === "broll");
+  const graphic = plan.resources.find((r) => r.type === "graphic");
+  check("broll: visualQuery se parsea tal cual, distinto de description", broll && broll.visualQuery === "ilustración 3D de una molécula de dopamina" && broll.description !== broll.visualQuery);
+  check("graphic: graphicVariant/graphicData válidos se parsean tal cual", graphic && graphic.graphicVariant === "stat" && graphic.graphicData.value === "73%");
+}
+
+{
+  // graphicData con forma inválida para la variante declarada (chart sin
+  // "data"): se descartan graphicVariant Y graphicData juntos -- nunca
+  // se intenta completar lo que falta, el recurso queda sin datos
+  // (pendiente, con un motivo claro) en vez de con datos a medias.
+  const invalidGraphic = JSON.stringify({
+    cuts: [], zooms: [],
+    resources: [
+      {
+        startSeconds: 10, endSeconds: 14,
+        type: "graphic",
+        description: "Comparar dos cifras",
+        graphicVariant: "chart",
+        graphicData: { title: "sin la propiedad 'data'" },
+        editorialGoal: "evidence", segment: "development",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(invalidGraphic, 200);
+  check("graphic con graphicData inválido: graphicVariant NO se conserva", plan.resources[0].graphicVariant === undefined);
+  check("graphic con graphicData inválido: graphicData NO se conserva", plan.resources[0].graphicData === undefined);
+}
+
+{
+  // Sin visualQuery en absoluto (broll/image): queda undefined, nunca
+  // se completa con description.
+  const withoutVisualQuery = JSON.stringify({
+    cuts: [], zooms: [],
+    resources: [
+      { startSeconds: 1, endSeconds: 3, type: "image", description: "Una foto relevante", editorialGoal: "context", segment: "intro" },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(withoutVisualQuery, 200);
+  check("sin visualQuery: queda undefined (nunca se usa description como reemplazo)", plan.resources[0].visualQuery === undefined);
+}
+
 // 5. Respuesta que no es JSON en absoluto: debe fallar con un error claro, no silenciosamente.
 {
   let threw = false;

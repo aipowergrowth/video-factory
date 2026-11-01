@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildTimeline, mapOutputToSource } from "./timeline.mjs";
+import { isValidGraphicData } from "./cta-guarantee.mjs";
 
 const DEFAULT_MODEL = process.env.EDITORIAL_MODEL ?? "claude-sonnet-5";
 // Bug real en producción: con la transcripción palabra por palabra de un
@@ -118,6 +119,10 @@ const RESOURCE_TYPES = [
 const EDITORIAL_GOALS = ["evidence", "comprehension", "context", "emotion", "emphasis", "transition"];
 const SEGMENTS = ["intro", "development", "demonstration", "transition", "closing"];
 const INTENSITIES = ["subtle", "moderate", "prominent"];
+// Fase 3B (31-oct-2026): variantes de "graphic" que el motor ya sabe
+// dibujar con componentes existentes (src/graphics/) -- ver isValidGraphicData
+// en cta-guarantee.mjs/types.ts (misma validación, duplicada a propósito).
+const GRAPHIC_VARIANTS = ["chart", "cycle", "stat"];
 const VERACITY_REQUIREMENTS = ["must-be-real", "illustrative-ok"];
 
 const buildPrompt = ({
@@ -207,6 +212,24 @@ Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que lo
 - Para cualquier recurso con "ctaPosition" (CTA): "displayText" es una frase corta (como un cartel, no una oración larga) que invite a la acción -- nunca un enlace, un @usuario ni un nombre de perfil inventado. Si el presentador no dio pie a una frase concreta, podés omitir "displayText" en el CTA (el sistema usa una frase fija del canal) -- nunca inventes un dato de contacto para rellenarlo.
 - Para los demás tipos de recurso (broll, image, graphic, document-reference, transition, music, sfx), "displayText" no aplica -- no lo incluyas.
 
+## "visualQuery" (solo para "broll" e "image"): qué buscar, no por qué
+
+Para recursos de tipo "broll" o "image", además de "description" (tu nota editorial de POR QUÉ hace falta el recurso), completá "visualQuery": una frase CONCRETA y VISUAL de qué buscar en un banco de imágenes/videos -- lo que realmente se ve en pantalla, no el razonamiento editorial. El sistema usa "visualQuery" tal cual para buscar, nunca "description".
+
+Mal: "Mostrar el concepto para reforzar la comprensión del espectador." Bien: "ilustración 3D de una molécula de dopamina" o "persona corriendo al amanecer en un parque".
+
+Si no podés describir con precisión qué debería verse (una escena, un objeto, un lugar concreto), no propongas el recurso -- "visualQuery" vago devuelve resultados irrelevantes y el sistema los rechaza (no inserta algo genérico solo por rellenar).
+
+## "graphicVariant"/"graphicData" (solo para "graphic"): datos reales, nunca inventados
+
+Para recursos de tipo "graphic", el sistema ya sabe dibujar tres variantes con los componentes existentes del motor -- elegí UNA en "graphicVariant" y completá "graphicData" con la forma exacta que corresponda:
+
+- "chart": \`{ "title"?: string, "unit"?: string, "data": [{ "label": string, "value": number }] }\` -- una comparación o serie de valores.
+- "cycle": \`{ "title"?: string, "steps": string[] }\` -- una secuencia de pasos o etapas.
+- "stat": \`{ "value": string, "label": string }\` -- un número o cifra destacada con su descripción.
+
+Regla innegociable, misma exigencia que "displayText" en "text-highlight": cada valor, cifra o paso en "graphicData" tiene que ser algo que el presentador diga REALMENTE en la transcripción -- nunca una cifra, porcentaje o paso que vos completes para que el gráfico se vea completo. Si el presentador no da suficientes datos concretos y verificables para armar la variante elegida, NO propongas el recurso "graphic" (proponé "text-highlight" en su lugar, si corresponde, o nada). Un gráfico con un solo dato real vale más que uno con datos inventados.
+
 ## Llamados a la acción (CTA): tu responsabilidad acá es el cierre y el inicio SOLO si hay invitación verbal
 
 Regla global, para todos los canales: todo video debe llevar un llamado a
@@ -277,7 +300,10 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
       "essential": boolean,
       "provenanceNotes": "qué tipo de licencia hace falta, máximo 15 palabras",
       "ctaPosition": "start" | "end" | null,
-      "displayText": "texto EXACTO a mostrar en pantalla (solo text-highlight y CTA, ver arriba) | null"
+      "displayText": "texto EXACTO a mostrar en pantalla (solo text-highlight y CTA, ver arriba) | null",
+      "visualQuery": "qué buscar en un banco de imágenes/video, concreto y visual (solo broll/image, ver arriba) | null",
+      "graphicVariant": "${GRAPHIC_VARIANTS.join('" | "')}" | null,
+      "graphicData": "objeto con la forma exacta de graphicVariant, con datos REALES dichos por el presentador (solo graphic, ver arriba) | null"
     }
   ],
   "notes": "resumen breve de tu criterio editorial para que un humano lo revise"
@@ -525,6 +551,18 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
         // El texto EXACTO que se muestra en pantalla -- NUNCA
         // `description` (esa es prosa para el editor, ver Fase 3A).
         displayText: typeof resource.displayText === "string" ? resource.displayText : undefined,
+        // Fase 3B (31-oct-2026): consulta visual para broll/image (NUNCA
+        // `description`, que es prosa editorial, no una búsqueda).
+        visualQuery: typeof resource.visualQuery === "string" && resource.visualQuery.trim().length > 0 ? resource.visualQuery.trim() : undefined,
+        // graphicVariant/graphicData viajan juntos: si la forma no es
+        // válida para la variante declarada, se descartan LOS DOS --
+        // nunca se intenta "arreglar" datos a medio completar; el
+        // recurso queda pendiente con un motivo claro (ver
+        // cta-guarantee.mjs#computePendingResources), no se inventa el
+        // resto.
+        ...(GRAPHIC_VARIANTS.includes(resource.graphicVariant) && isValidGraphicData(resource.graphicVariant, resource.graphicData)
+          ? { graphicVariant: resource.graphicVariant, graphicData: resource.graphicData }
+          : {}),
       },
       durationInSeconds,
     );

@@ -20,6 +20,7 @@ import {
 import { runQualityGateWithRemediation } from "./quality-gate.mjs";
 import { resolveCompositorFfprobe, resolveCompositorFfmpeg, binaryEnv } from "./compositor.mjs";
 import { shouldBurnCaptions, buildSrt } from "./subtitles.mjs";
+import { acquireResourcesForJob, readPixabayApiKey } from "./resource-acquisition.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,6 +32,16 @@ const UPLOADS_VIDEOS_DIR =
   process.env.UPLOADS_VIDEOS_DIR ??
   path.join(PROJECT_ROOT, "public/uploads/videos");
 const OUTPUTS_DIR = process.env.OUTPUTS_DIR ?? "/data/outputs";
+// Fase 3B (31-oct-2026): adquisición de broll/image contra Pixabay.
+// Ambos dentro de public/uploads (mismo volumen persistente que ya
+// existe -- fabrica_videos_inputs en docker-stack.yml -- sin volumen
+// nuevo). RESOURCE_CACHE_DIR guarda resultados de búsqueda por 24h
+// (exigencia de los términos de Pixabay); RESOURCE_ASSETS_DIR guarda el
+// archivo YA descargado de cada recurso resuelto.
+const RESOURCE_CACHE_DIR =
+  process.env.RESOURCE_CACHE_DIR ?? path.join(PROJECT_ROOT, "public/uploads/resource-cache");
+const RESOURCE_ASSETS_DIR =
+  process.env.RESOURCE_ASSETS_DIR ?? path.join(PROJECT_ROOT, "public/uploads/resources");
 const RENDER_CONCURRENCY = Number(process.env.RENDER_CONCURRENCY ?? 1);
 // Medido con el video real de 12 min (dopamina): con concurrencia por
 // defecto (varias pestañas de Chrome decodificando el MISMO video base en
@@ -89,7 +100,7 @@ const WHISPER_MODEL = process.env.WHISPER_MODEL ?? "small";
 // equivalente). Lección aprendida renderizando el primer video real.
 const ALLOWED_VIDEO_CODECS = new Set(["h264", "vp8", "vp9", "av1"]);
 
-for (const dir of [UPLOADS_JOBS_DIR, UPLOADS_VIDEOS_DIR, OUTPUTS_DIR]) {
+for (const dir of [UPLOADS_JOBS_DIR, UPLOADS_VIDEOS_DIR, OUTPUTS_DIR, RESOURCE_CACHE_DIR, RESOURCE_ASSETS_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -675,6 +686,71 @@ const planEditIfNeeded = async (jobId, job) => {
 };
 
 /**
+ * Fase 3B (31-oct-2026): resuelve contra Pixabay los recursos `broll`/
+ * `image` que todavía no tengan `resolvedAsset` -- corre SIEMPRE, no
+ * solo cuando `planEditIfNeeded` llamó al modelo (un job con `resources`
+ * puestos a mano, como la prueba corta de esta entrega, también pasa
+ * por acá; es idempotente -- un recurso ya resuelto o ya marcado como
+ * fallido no se vuelve a tocar). El planificador sigue siendo el único
+ * que decide qué recurso usar, dónde va y cuánto dura -- esto solo
+ * responde de dónde sale el archivo.
+ *
+ * "essential" sin alternativa válida detiene el job (regla vigente,
+ * dictamen de Fase 3B) -- pero SOLO para este caso nuevo (broll/image
+ * sin resultado en Pixabay). Un `document-reference`/`graphic` esencial
+ * pendiente sigue como siempre (se registra, no detiene) -- no es parte
+ * de este alcance y no debe cambiar de comportamiento sin que se pida.
+ */
+const acquireResourcesIfNeeded = async (jobId, job) => {
+  throwIfCancelled(jobId);
+  const needsAcquisition = (job.resources ?? []).some(
+    (r) => (r.type === "broll" || r.type === "image") && !r.resolvedAsset && !r.acquisitionFailureReason,
+  );
+  if (!needsAcquisition) return job;
+
+  const apiKey = readPixabayApiKey();
+  let updatedResources = job.resources;
+  let issues = [];
+  if (!apiKey) {
+    console.log(`[job ${jobId}] sin clave de Pixabay configurada (PIXABAY_API_KEY_FILE) -- los recursos broll/image quedan pendientes.`);
+    updatedResources = (job.resources ?? []).map((r) =>
+      (r.type === "broll" || r.type === "image") && !r.resolvedAsset && !r.acquisitionFailureReason
+        ? { ...r, acquisitionFailureReason: "no se pudo adquirir: falta configurar la clave de Pixabay en el servicio." }
+        : r,
+    );
+  } else {
+    ({ resources: updatedResources, issues } = await acquireResourcesForJob({
+      resources: job.resources,
+      apiKey,
+      cacheDir: RESOURCE_CACHE_DIR,
+      assetsDir: RESOURCE_ASSETS_DIR,
+      jobId,
+      log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
+    }));
+    for (const issue of issues) {
+      console.log(`[job ${jobId}]   ${issue}`);
+    }
+  }
+
+  job.resources = updatedResources;
+  job.pendingResources = computePendingResources(updatedResources, (msg) => console.log(`[job ${jobId}] ${msg}`));
+  await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
+
+  const unresolvedEssential = updatedResources.filter(
+    (r) => (r.type === "broll" || r.type === "image") && r.essential && !r.resolvedAsset,
+  );
+  if (unresolvedEssential.length > 0) {
+    throw new Error(
+      `${unresolvedEssential.length} recurso(s) esencial(es) de tipo broll/image no se pudieron adquirir: ` +
+        unresolvedEssential.map((r) => `"${r.id}" (${r.acquisitionFailureReason ?? "sin motivo registrado"})`).join("; ") +
+        " -- se detiene el job, pide resolución (otra consulta visual, o resolverlo a mano) antes de reintentar.",
+    );
+  }
+
+  return job;
+};
+
+/**
  * Verifica técnicamente el MP4 final (duración/resolución/códec) y, si
  * hay una carpeta de Drive configurada, lo sube ahí -- para poder
  * revisarlo/aprobarlo sin acceso al VPS. Lo llama automáticamente
@@ -773,6 +849,7 @@ const processQueue = () => {
     await resolveJobInput(jobId, job);
     await transcribeJobIfNeeded(jobId, job);
     await planEditIfNeeded(jobId, job);
+    await acquireResourcesIfNeeded(jobId, job);
     throwIfCancelled(jobId);
 
     // Para validar transcripción + plan editorial sin comprometerse a un

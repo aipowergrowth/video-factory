@@ -6,7 +6,8 @@ import { buildTimeline } from "./timeline.mjs";
 import {
   relocateToNearestSurvivingInterval,
   remapResourcesWithCtaGuarantee,
-  isRenderableIn3A,
+  isRenderableByEngine,
+  isValidGraphicData,
   computePendingResources,
 } from "./cta-guarantee.mjs";
 
@@ -142,15 +143,58 @@ const noopLog = () => {};
   check("CTA de inicio ausente (ahora obligatorio): también queda en ctaIssues", ctaIssues.some((i) => i.includes('"start"')));
 }
 
-// --- Fase 3A (autorizada 30-oct-2026): qué se renderiza, qué queda pendiente de 3B ---
+// --- Fase 3A (autorizada 30-oct-2026): qué se renderiza, qué queda pendiente ---
 
 {
-  check("CTA (cualquier type) es renderizable en 3A, aunque no traiga displayText", isRenderableIn3A({ type: "graphic", ctaPosition: "start" }));
-  check("text-highlight CON displayText es renderizable en 3A", isRenderableIn3A({ type: "text-highlight", displayText: "hola" }));
-  check("text-highlight SIN displayText NO es renderizable (nunca se usa description)", !isRenderableIn3A({ type: "text-highlight", description: "texto resaltado: algo" }));
-  check("broll sin CTA NO es renderizable en 3A", !isRenderableIn3A({ type: "broll" }));
-  check("document-reference NO es renderizable en 3A", !isRenderableIn3A({ type: "document-reference" }));
-  check("graphic sin CTA NO es renderizable en 3A", !isRenderableIn3A({ type: "graphic" }));
+  check("CTA (cualquier type) es renderizable, aunque no traiga displayText", isRenderableByEngine({ type: "graphic", ctaPosition: "start" }));
+  check("text-highlight CON displayText es renderizable", isRenderableByEngine({ type: "text-highlight", displayText: "hola" }));
+  check("text-highlight SIN displayText NO es renderizable (nunca se usa description)", !isRenderableByEngine({ type: "text-highlight", description: "texto resaltado: algo" }));
+  check("broll sin CTA y sin resolvedAsset NO es renderizable", !isRenderableByEngine({ type: "broll" }));
+  check("document-reference NO es renderizable", !isRenderableByEngine({ type: "document-reference" }));
+  check("graphic sin CTA y sin datos estructurados NO es renderizable", !isRenderableByEngine({ type: "graphic" }));
+}
+
+// --- Fase 3B (31-oct-2026): graphic con datos estructurados, broll/image ya resueltos ---
+
+{
+  check("isValidGraphicData: chart con datos válidos", isValidGraphicData("chart", { data: [{ label: "Dopamina", value: 42 }] }));
+  check("isValidGraphicData: chart sin array 'data' es inválido", !isValidGraphicData("chart", { title: "sin datos" }));
+  check("isValidGraphicData: chart con un valor no numérico es inválido", !isValidGraphicData("chart", { data: [{ label: "x", value: "42" }] }));
+  check("isValidGraphicData: cycle con pasos válidos", isValidGraphicData("cycle", { steps: ["uno", "dos"] }));
+  check("isValidGraphicData: cycle con un paso vacío es inválido", !isValidGraphicData("cycle", { steps: ["uno", "  "] }));
+  check("isValidGraphicData: stat con value/label válidos", isValidGraphicData("stat", { value: "73%", label: "de los pacientes" }));
+  check("isValidGraphicData: stat sin label es inválido", !isValidGraphicData("stat", { value: "73%" }));
+  check("isValidGraphicData: variante desconocida es inválida", !isValidGraphicData("mapa", { data: [] }));
+
+  check(
+    "graphic CON datos estructurados válidos es renderizable",
+    isRenderableByEngine({ type: "graphic", graphicVariant: "stat", graphicData: { value: "73%", label: "de los pacientes" } }),
+  );
+  check(
+    "graphic con graphicVariant pero datos inválidos NO es renderizable",
+    !isRenderableByEngine({ type: "graphic", graphicVariant: "chart", graphicData: { data: [] } }),
+  );
+  check(
+    "broll CON resolvedAsset (Pixabay) es renderizable",
+    isRenderableByEngine({ type: "broll", resolvedAsset: { provider: "pixabay", localPath: "uploads/resources/x.mp4" } }),
+  );
+  check(
+    "image CON resolvedAsset es renderizable",
+    isRenderableByEngine({ type: "image", resolvedAsset: { provider: "pixabay", localPath: "uploads/resources/x.jpg" } }),
+  );
+  check(
+    "image sin resolvedAsset (adquisición no corrió o falló) NO es renderizable",
+    !isRenderableByEngine({ type: "image", visualQuery: "molécula de dopamina" }),
+  );
+}
+
+{
+  // El motivo específico de una adquisición fallida reemplaza al genérico.
+  const resources = [
+    { id: "r1", type: "broll", description: "b-roll de un laboratorio", essential: false, acquisitionFailureReason: 'no se encontró en Pixabay un resultado con buena coincidencia de palabras clave para "laboratorio de neurociencia".' },
+  ];
+  const pending = computePendingResources(resources, () => {});
+  check("motivo de adquisición fallida se usa tal cual, no el genérico", pending[0].reason.includes("Pixabay"));
 }
 
 {

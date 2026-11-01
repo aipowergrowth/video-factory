@@ -1,14 +1,26 @@
 import type { Resource } from "../types";
 import { CtaOverlay } from "./CtaOverlay";
 import { TextHighlightOverlay } from "./TextHighlightOverlay";
+import { ImageOverlay } from "./ImageOverlay";
+import { BRollOverlay } from "./BRollOverlay";
+import { Chart } from "../graphics/Chart";
+import { CycleDiagram } from "../graphics/CycleDiagram";
+import { StatCallout } from "../graphics/StatCallout";
 
 /**
- * Despacha un `Resource` al componente que sabe representarlo. Fase 3A
- * solo cubre CTA (cualquier `type` con `ctaPosition`) y `text-highlight`
- * -- `VideoEngine.tsx` ya filtra para que solo esos dos casos lleguen
- * acá; el resto (broll/image/graphic sin CTA/document-reference/etc.)
- * queda pendiente de Fase 3B, registrado en `job.pendingResources` por
- * el servidor, nunca inventado ni omitido en silencio.
+ * Despacha un `Resource` al componente que sabe representarlo.
+ * `VideoEngine.tsx` ya filtra con `isRenderableByEngine` para que solo
+ * lleguen acá los que de verdad se pueden pintar -- el resto queda en
+ * `job.pendingResources`, nunca inventado ni omitido en silencio.
+ *
+ * Fase 3B (31-oct-2026): `broll`/`image` reutilizan los componentes YA
+ * existentes para `job.overlays` (`BRollOverlay`/`ImageOverlay`, hasta
+ * ahora solo usados con recursos puestos a mano) -- adaptando
+ * `resource.resolvedAsset.localPath` a la misma forma `{ src, style }`
+ * que esos componentes ya esperan. `graphic` reutiliza los componentes
+ * YA existentes de `src/graphics/` (los mismos que usa `OverlayRenderer`
+ * para `job.overlays`) -- cero componentes nuevos para ninguno de los
+ * dos casos.
  */
 export const ResourceRenderer: React.FC<{ resource: Resource }> = ({
   resource,
@@ -18,6 +30,24 @@ export const ResourceRenderer: React.FC<{ resource: Resource }> = ({
   }
   if (resource.type === "text-highlight") {
     return <TextHighlightOverlay resource={resource} />;
+  }
+  if (resource.type === "graphic") {
+    switch (resource.graphicVariant) {
+      case "chart":
+        return <Chart graphic={resource.graphicData as React.ComponentProps<typeof Chart>["graphic"]} />;
+      case "cycle":
+        return <CycleDiagram graphic={resource.graphicData as React.ComponentProps<typeof CycleDiagram>["graphic"]} />;
+      case "stat":
+        return <StatCallout graphic={resource.graphicData as React.ComponentProps<typeof StatCallout>["graphic"]} />;
+      default:
+        return null;
+    }
+  }
+  if (resource.type === "image" && resource.resolvedAsset) {
+    return <ImageOverlay overlay={{ id: resource.id, type: "image", startSeconds: 0, durationSeconds: 0, src: resource.resolvedAsset.localPath }} />;
+  }
+  if (resource.type === "broll" && resource.resolvedAsset) {
+    return <BRollOverlay overlay={{ id: resource.id, type: "broll", startSeconds: 0, durationSeconds: 0, src: resource.resolvedAsset.localPath, muted: true }} />;
   }
   return null;
 };
