@@ -1,9 +1,13 @@
 // PRUEBA DE REGRESIÓN CON REMOTION REAL (criterio 6 del dictamen de
-// subtítulos, 31-oct-2026): renderiza un cuadro fijo de dos jobs
-// IDÉNTICOS salvo el destino (youtube-16-9 / vertical-9-16) y confirma,
-// mirando los píxeles reales del cuadro, que el de YouTube sale SIN
-// subtítulos pegados y el vertical SÍ los lleva (así la prueba no pasa
-// "por accidente" si el renderizador fallara en silencio para ambos).
+// subtítulos, 31-oct-2026, más la verificación de render de "graphic"
+// del dictamen de Fase 3B, mismo día): renderiza un cuadro fijo de dos
+// jobs IDÉNTICOS salvo el destino (youtube-16-9 / vertical-9-16) y
+// confirma, mirando los píxeles reales del cuadro, que el de YouTube
+// sale SIN subtítulos pegados y el vertical SÍ los lleva (así la
+// prueba no pasa "por accidente" si el renderizador fallara en
+// silencio para ambos). Además renderiza un tercer job con un recurso
+// `graphic`/`stat` (sin tocar ningún banco externo) para confirmar que
+// `ResourceRenderer` de verdad lo despacha a un componente visible.
 //
 // Corre en GitHub Actions (.github/workflows/captions-destination-test.yml)
 // con Chrome headless real (`npx remotion browser ensure`, lo mismo que
@@ -75,6 +79,44 @@ for (const destination of ["youtube-16-9", "vertical-9-16"]) {
   await fs.writeFile(path.join(PROJECT_ROOT, "public", relPath), JSON.stringify(makeJob(destination), null, 2));
   jobPaths[destination] = relPath;
 }
+
+// Fase 3B (31-oct-2026): confirma con un render REAL (no solo tsc) que
+// ResourceRenderer de verdad despacha "graphic" a los componentes
+// existentes (Chart/CycleDiagram/StatCallout) -- sin tocar ningún banco
+// externo, no hace falta clave de Pixabay para esta prueba.
+const graphicJobRelPath = `${FIXTURES_REL_DIR}/graphic-test.json`;
+await fs.writeFile(
+  path.join(PROJECT_ROOT, "public", graphicJobRelPath),
+  JSON.stringify(
+    {
+      channel: "a-mi-no-me-cuadra",
+      destination: "youtube-16-9",
+      input: { type: "recorded-video", baseVideo: BASE_VIDEO_REL, durationInSeconds: 3 },
+      overlays: [],
+      captions: [],
+      cuts: [],
+      zooms: [],
+      resources: [
+        {
+          id: "test-graphic",
+          startSeconds: 0,
+          endSeconds: 3,
+          type: "graphic",
+          description: "prueba de render real",
+          graphicVariant: "stat",
+          graphicData: { value: "73%", label: "prueba de render real" },
+          editorialGoal: "evidence",
+          segment: "development",
+          intensity: "moderate",
+          veracityRequirement: "illustrative-ok",
+          essential: false,
+        },
+      ],
+    },
+    null,
+    2,
+  ),
+);
 
 /** Cuadro en frame 15 (0.5s a 30fps) -- bien dentro de la ventana del subtítulo (0-3000ms). */
 const renderStill = async (jobFileRelPath, outputPngPath) => {
@@ -169,16 +211,17 @@ const readPngAsRgb = async (pngPath) => decodePng(await fs.readFile(pngPath));
 
 /**
  * Cuenta píxeles "blanco-ish" (los tres canales por encima del umbral)
- * dentro de la franja inferior donde Captions.tsx ancla el subtítulo
- * (`justifyContent: "flex-end", paddingBottom: 60`) -- el color de
- * fondo del cuadro (negro) y el de la caja del subtítulo
- * (`rgba(0,0,0,0.6)`, semitransparente sobre negro) son indistinguibles
- * por color; el TEXTO blanco (`captionTextColor`) sí lo es.
+ * dentro de una franja vertical del cuadro (fracción de alto 0-1) -- el
+ * fondo negro del cuadro y las cajas semitransparentes (`rgba(0,0,0,x)`)
+ * son indistinguibles por color del fondo; el TEXTO claro (blanco en
+ * `Captions`, gris claro `#d8d8dc` en la etiqueta de `StatCallout`) sí
+ * lo es.
  */
-const countWhitePixelsInCaptionBand = ({ width, height, channels, pixels }, threshold = 200) => {
-  const bandTop = Math.floor(height * 0.75);
+const countWhitePixelsInBand = ({ width, height, channels, pixels }, { topFraction, bottomFraction }, threshold = 200) => {
+  const bandTop = Math.floor(height * topFraction);
+  const bandBottom = Math.floor(height * bottomFraction);
   let count = 0;
-  for (let y = bandTop; y < height; y++) {
+  for (let y = bandTop; y < bandBottom; y++) {
     for (let x = 0; x < width; x++) {
       const offset = (y * width + x) * channels;
       if (pixels[offset] >= threshold && pixels[offset + 1] >= threshold && pixels[offset + 2] >= threshold) {
@@ -188,6 +231,8 @@ const countWhitePixelsInCaptionBand = ({ width, height, channels, pixels }, thre
   }
   return count;
 };
+const countWhitePixelsInCaptionBand = (frame, threshold) => countWhitePixelsInBand(frame, { topFraction: 0.75, bottomFraction: 1 }, threshold);
+const countWhitePixelsInCenterBand = (frame, threshold) => countWhitePixelsInBand(frame, { topFraction: 0.35, bottomFraction: 0.65 }, threshold);
 
 for (const [destination, jobRelPath] of Object.entries(jobPaths)) {
   const pngPath = path.join(FIXTURES_DIR, `${destination}.png`);
@@ -207,6 +252,20 @@ for (const [destination, jobRelPath] of Object.entries(jobPaths)) {
     check("youtube-16-9: el MP4 sale SIN subtítulos pegados (sin píxeles de texto en la franja)", whitePixels === 0, `whitePixels=${whitePixels}`);
   } else {
     check("vertical-9-16: SÍ lleva subtítulos pegados (hay píxeles de texto en la franja)", whitePixels > 50, `whitePixels=${whitePixels}`);
+  }
+}
+
+{
+  const pngPath = path.join(FIXTURES_DIR, "graphic-test.png");
+  try {
+    await renderStill(graphicJobRelPath, pngPath);
+    check("graphic (stat): el still de Remotion se renderizó sin error", true);
+    const frame = await readPngAsRgb(pngPath);
+    const whitePixels = countWhitePixelsInCenterBand(frame);
+    console.log(`[graphic-test] píxeles "blanco-ish" en la franja central: ${whitePixels}`);
+    check("graphic (stat): ResourceRenderer despachó a StatCallout -- hay contenido visible en el centro del cuadro", whitePixels > 20, `whitePixels=${whitePixels}`);
+  } catch (err) {
+    check("graphic (stat): el still de Remotion se renderizó sin error", false, String(err.message ?? err));
   }
 }
 
