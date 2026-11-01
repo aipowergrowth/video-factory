@@ -46,9 +46,14 @@ const baseVideoPath = path.join(PROJECT_ROOT, "public", BASE_VIDEO_REL);
 
 // Video sintético: 3s, fondo negro, sin audio -- solo hace falta una
 // imagen decodificable, el contenido no importa para esta prueba.
+// "color" NO está en la lista de filtros habilitados del FFmpeg de
+// producción (confirmado en CI: "No such filter: 'color'") -- "nullsrc"
+// sí lo está y produce frames negros; se limita la duración con `-t`
+// (opción de salida, no depende de qué filtros estén habilitados) en
+// vez de un parámetro del propio filtro.
 await execFileAsync(
   ffmpegPath,
-  ["-y", "-f", "lavfi", "-i", "color=c=black:s=640x360:rate=30:duration=3", "-pix_fmt", "yuv420p", "-c:v", "libx264", baseVideoPath],
+  ["-y", "-f", "lavfi", "-i", "nullsrc=size=640x360:rate=30", "-t", "3", "-pix_fmt", "yuv420p", "-c:v", "libx264", baseVideoPath],
   { env: ffmpegEnv },
 );
 
