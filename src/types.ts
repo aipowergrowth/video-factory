@@ -148,6 +148,17 @@ export type EngineJob = {
   overlays: Overlay[];
   /** Subtítulos sincronizados. Estructura lista; puede ir vacío. */
   captions?: Caption[];
+  /**
+   * Si los subtítulos van pegados a la imagen o no. Decisión de Alex
+   * (31-oct-2026): YouTube ya muestra los suyos (y su traducción) encima
+   * de los que el motor pegara, y se ven dobles -- por defecto
+   * `youtube-16-9` NO pega subtítulos (el servidor entrega un .srt
+   * aparte, ver server/subtitles.mjs) y `vertical-9-16` SÍ los pega,
+   * como siempre. Este campo fuerza lo contrario en un job concreto; si
+   * no se da, el valor por defecto sale de `destination`
+   * (`shouldBurnCaptions` más abajo).
+   */
+  burnCaptions?: boolean;
   /** Tramos a eliminar del video base. Vacío o ausente = sin cortes. */
   cuts?: Cut[];
   /** Zooms tipo Ken Burns sobre el video base. */
@@ -161,6 +172,15 @@ export type EngineJob = {
   /** Recursos que la IA editorial decidió pero Fase 3A no renderiza todavía. */
   pendingResources?: PendingResource[];
 };
+
+/**
+ * Misma función (a propósito duplicada, no importada) en
+ * `server/subtitles.mjs` -- el servidor corre con `node` plano y no
+ * puede importar este `.ts` (mismo motivo que `engine/timeline.ts` vs.
+ * `server/timeline.mjs`). Si una cambia, la otra debe cambiar igual.
+ */
+export const shouldBurnCaptions = (job: Pick<EngineJob, "destination" | "burnCaptions">): boolean =>
+  job.burnCaptions ?? job.destination !== "youtube-16-9";
 
 /** Perfil editorial de un canal — vive fuera del código, en public/channels. */
 export type ChannelProfile = {

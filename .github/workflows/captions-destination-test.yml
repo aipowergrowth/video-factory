@@ -1,0 +1,38 @@
+name: Subtítulos pegados según destino (Remotion real)
+
+# Verifica, renderizando de verdad (Chrome headless real, mismo FFmpeg
+# que producción), que youtube-16-9 sale SIN subtítulos pegados y
+# vertical-9-16 SÍ -- decisión de Alex (31-oct-2026). No se puede probar
+# esto en la máquina de desarrollo (macOS 12, sin Remotion funcional,
+# ver README.md) -- por eso corre acá.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "server/subtitles.mjs"
+      - "server/test-captions-render.mjs"
+      - ".github/workflows/captions-destination-test.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "server/subtitles.mjs"
+  workflow_dispatch: {}
+
+jobs:
+  captions-render-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - run: npm ci
+
+      - name: Descargar Chrome Headless Shell (mismo paso que el Dockerfile de producción)
+        run: npx remotion browser ensure
+
+      - name: Render de prueba por destino (confirma subtítulos pegados/no pegados)
+        run: node server/test-captions-render.mjs

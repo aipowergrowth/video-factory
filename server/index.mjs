@@ -19,6 +19,7 @@ import {
 } from "./audio-analysis.mjs";
 import { runQualityGateWithRemediation } from "./quality-gate.mjs";
 import { resolveCompositorFfprobe, resolveCompositorFfmpeg, binaryEnv } from "./compositor.mjs";
+import { shouldBurnCaptions, buildSrt } from "./subtitles.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -717,9 +718,45 @@ const finalizeJobOutput = async (jobId) => {
     }
   }
 
+  // Decisión de Alex (31-oct-2026): youtube-16-9 no lleva subtítulos
+  // pegados (YouTube ya muestra los suyos encima) -- en su lugar se
+  // entrega un .srt aparte, con el mismo nombre base que el MP4, en la
+  // misma carpeta de Drive. vertical-9-16 sigue llevándolos pegados y
+  // NO genera .srt (no hace falta: ya están en la imagen).
+  let srtOutput;
+  try {
+    const job = JSON.parse(await fsp.readFile(jobFilePath(jobId), "utf8"));
+    if (Array.isArray(job.captions) && job.captions.length > 0 && !shouldBurnCaptions(job)) {
+      const timeline = buildTimeline(job.input.durationInSeconds, job.cuts ?? []);
+      const srtText = buildSrt(job.captions, timeline);
+      const srtPath = path.join(OUTPUTS_DIR, `${jobId}.srt`);
+      await fsp.writeFile(srtPath, srtText, "utf8");
+      console.log(`[job ${jobId}] .srt generado (destino "${job.destination}", sin subtítulos pegados): ${srtPath}`);
+
+      if (DRIVE_OUTPUT_FOLDER_ID) {
+        try {
+          console.log(`[job ${jobId}] subiendo el .srt a Drive...`);
+          const uploadedSrt = await uploadFile({
+            filePath: srtPath,
+            fileName: `${jobId}.srt`,
+            folderId: DRIVE_OUTPUT_FOLDER_ID,
+            mimeType: "application/x-subrip",
+          });
+          srtOutput = { fileId: uploadedSrt.id, webViewLink: uploadedSrt.webViewLink };
+          console.log(`[job ${jobId}] .srt subido a Drive: ${uploadedSrt.webViewLink}`);
+        } catch (err) {
+          console.log(`[job ${jobId}] no se pudo subir el .srt a Drive:`, err.message ?? err);
+        }
+      }
+    }
+  } catch (err) {
+    console.log(`[job ${jobId}] no se pudo generar el .srt:`, err.message ?? err);
+  }
+
   return writeStatus(jobId, {
     output: outputInfo ?? undefined,
     drive: driveOutput,
+    driveSrt: srtOutput,
   });
 };
 

@@ -1,5 +1,6 @@
 import { AbsoluteFill, Sequence, useVideoConfig } from "remotion";
 import type { Caption, ChannelProfile, EngineJob } from "../types";
+import { shouldBurnCaptions } from "../types";
 import { secondsToFrames } from "../lib/time";
 import { OverlayRenderer } from "./OverlayRenderer";
 import { ResourceRenderer } from "./ResourceRenderer";
@@ -124,7 +125,7 @@ export const VideoEngine: React.FC<VideoEngineProps> = ({
           );
         })}
 
-        {captionsInOutputTime.length > 0 ? (
+        {shouldBurnCaptions(job) && captionsInOutputTime.length > 0 ? (
           <Captions captions={captionsInOutputTime} />
         ) : null}
       </AbsoluteFill>
