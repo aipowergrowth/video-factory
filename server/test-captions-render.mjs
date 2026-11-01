@@ -14,10 +14,11 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import zlib from "node:zlib";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveCompositorFfmpeg, resolveCompositorFfprobe, binaryEnv } from "./compositor.mjs";
+import { resolveCompositorFfmpeg, binaryEnv } from "./compositor.mjs";
 
 const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -33,7 +34,6 @@ const check = (label, cond, detail = "") => {
 };
 
 const ffmpegPath = resolveCompositorFfmpeg();
-const ffprobePath = resolveCompositorFfprobe();
 const ffmpegEnv = binaryEnv(ffmpegPath);
 console.log(`usando FFmpeg real: ${ffmpegPath}`);
 
@@ -85,18 +85,87 @@ const renderStill = async (jobFileRelPath, outputPngPath) => {
   );
 };
 
-/** Lee un PNG y devuelve {width, height, pixels: Buffer en RGB24}. */
-const readPngAsRgb = async (pngPath) => {
-  const { stdout } = await execFileAsync(ffprobePath, [
-    "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", pngPath,
-  ], { env: ffmpegEnv });
-  const [width, height] = stdout.trim().split("x").map(Number);
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-  const rawPath = `${pngPath}.raw`;
-  await execFileAsync(ffmpegPath, ["-y", "-i", pngPath, "-f", "rawvideo", "-pix_fmt", "rgb24", rawPath], { env: ffmpegEnv });
-  const pixels = await fs.readFile(rawPath);
-  return { width, height, pixels };
+/** Deshace el filtro PNG de una fila usando la fila anterior ya reconstruida (spec PNG 9.2). */
+const unfilterRow = (filterType, row, previousRow, bpp) => {
+  const out = Buffer.alloc(row.length);
+  for (let i = 0; i < row.length; i++) {
+    const a = i >= bpp ? out[i - bpp] : 0; // izquierda
+    const b = previousRow ? previousRow[i] : 0; // arriba
+    const c = i >= bpp && previousRow ? previousRow[i - bpp] : 0; // arriba-izquierda
+    let value = row[i];
+    if (filterType === 1) value += a;
+    else if (filterType === 2) value += b;
+    else if (filterType === 3) value += Math.floor((a + b) / 2);
+    else if (filterType === 4) {
+      const p = a + b - c;
+      const pa = Math.abs(p - a);
+      const pb = Math.abs(p - b);
+      const pc = Math.abs(p - c);
+      value += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+    }
+    out[i] = value & 0xff;
+  }
+  return out;
 };
+
+/**
+ * Decodificador PNG mínimo (sin dependencias) -- soporta lo que produce
+ * Remotion/Chrome con `--image-format=png`: 8 bits por canal, RGB o
+ * RGBA, sin interlazado, sin paleta. No hace falta más: esta prueba
+ * solo necesita leer los píxeles del cuadro renderizado, no soportar
+ * cualquier PNG posible.
+ */
+const decodePng = (buffer) => {
+  if (!buffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    throw new Error("No es un PNG válido (falta la firma).");
+  }
+  let offset = 8;
+  let width, height, bitDepth, colorType;
+  const idatChunks = [];
+  while (offset + 8 <= buffer.length) {
+    const length = buffer.readUInt32BE(offset);
+    const type = buffer.toString("ascii", offset + 4, offset + 8);
+    const dataStart = offset + 8;
+    if (type === "IHDR") {
+      width = buffer.readUInt32BE(dataStart);
+      height = buffer.readUInt32BE(dataStart + 4);
+      bitDepth = buffer.readUInt8(dataStart + 8);
+      colorType = buffer.readUInt8(dataStart + 9);
+      const interlace = buffer.readUInt8(dataStart + 12);
+      if (bitDepth !== 8 || (colorType !== 2 && colorType !== 6) || interlace !== 0) {
+        throw new Error(`PNG no soportado por este decodificador mínimo (bitDepth=${bitDepth}, colorType=${colorType}, interlace=${interlace}).`);
+      }
+    } else if (type === "IDAT") {
+      idatChunks.push(buffer.subarray(dataStart, dataStart + length));
+    } else if (type === "IEND") {
+      break;
+    }
+    offset = dataStart + length + 4; // +4 = CRC
+  }
+
+  const channels = colorType === 6 ? 4 : 3;
+  const bpp = channels; // 8 bits por canal
+  const stride = 1 + width * bpp;
+  const raw = zlib.inflateSync(Buffer.concat(idatChunks));
+
+  const pixels = Buffer.alloc(width * height * channels);
+  let previousRow = null;
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * stride;
+    const filterType = raw[rowStart];
+    const filteredRow = raw.subarray(rowStart + 1, rowStart + stride);
+    const row = unfilterRow(filterType, filteredRow, previousRow, bpp);
+    row.copy(pixels, y * width * channels);
+    previousRow = row;
+  }
+
+  return { width, height, channels, pixels };
+};
+
+/** Lee un PNG (del render de Remotion) y devuelve {width, height, channels, pixels}. */
+const readPngAsRgb = async (pngPath) => decodePng(await fs.readFile(pngPath));
 
 /**
  * Cuenta píxeles "blanco-ish" (los tres canales por encima del umbral)
@@ -106,12 +175,12 @@ const readPngAsRgb = async (pngPath) => {
  * (`rgba(0,0,0,0.6)`, semitransparente sobre negro) son indistinguibles
  * por color; el TEXTO blanco (`captionTextColor`) sí lo es.
  */
-const countWhitePixelsInCaptionBand = ({ width, height, pixels }, threshold = 200) => {
+const countWhitePixelsInCaptionBand = ({ width, height, channels, pixels }, threshold = 200) => {
   const bandTop = Math.floor(height * 0.75);
   let count = 0;
   for (let y = bandTop; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      const offset = (y * width + x) * 3;
+      const offset = (y * width + x) * channels;
       if (pixels[offset] >= threshold && pixels[offset + 1] >= threshold && pixels[offset + 2] >= threshold) {
         count += 1;
       }
