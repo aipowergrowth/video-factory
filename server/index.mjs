@@ -976,6 +976,11 @@ app.post("/jobs/:id/replan", async (req, res) => {
     let acousticCuts = snappedCuts;
     let acousticCutIssues = [];
     let qualityGate = null;
+    // Medido con un cronómetro en el proceso (dictamen 31-oct-2026, "tiempo
+    // adicional real del mecanismo") -- cubre mapa de pausas reales +
+    // refineCutsWithRealSilence + puerta de calidad, sin incluir la
+    // llamada al modelo (medida aparte en plan.metrics.elapsedMs).
+    const audioMechanismStartedAt = Date.now();
     if (typeof job.input.baseVideo === "string") {
       const videoPath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
       const ffmpegPathForAudio = resolveFfmpeg();
@@ -1004,6 +1009,8 @@ app.post("/jobs/:id/replan", async (req, res) => {
       acousticCuts = gateResult.cuts;
       qualityGate = { ok: gateResult.ok, rounds: gateResult.rounds, incidents: gateResult.incidents, stoppedReason: gateResult.stoppedReason ?? null };
     }
+    const audioMechanismElapsedMs = Date.now() - audioMechanismStartedAt;
+    console.log(`[replan ${jobId}] mecanismo de audio (mapa de pausas + puerta de calidad): ${(audioMechanismElapsedMs / 1000).toFixed(1)}s.`);
     for (const issue of acousticCutIssues) {
       console.log(`[replan ${jobId}]   ${issue}`);
     }
@@ -1036,6 +1043,7 @@ app.post("/jobs/:id/replan", async (req, res) => {
       cuts: acousticCuts,
       cutIssues: [...plan.cutIssues, ...snapCutIssues, ...acousticCutIssues],
       qualityGate,
+      audioMechanismElapsedMs,
       resources,
       ctaIssues,
       pendingResources,
@@ -1101,6 +1109,12 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
   let finalCuts = adjustedCuts;
   let allDiscardReasons = [...cutIssues];
   let qualityGate = null;
+  // Mide el mismo mecanismo que /replan y planEditIfNeeded (mapa de
+  // pausas + puerta de calidad) SIN llamar al modelo y sin renderizar --
+  // este endpoint ya era gratis; ahora además reporta el tiempo exacto,
+  // útil para medirlo sin ningún gasto nuevo (dictamen 31-oct-2026).
+  const audioMechanismStartedAt = Date.now();
+  let audioMechanismElapsedMs = null;
   if (typeof job.input.baseVideo !== "string") {
     acousticNote = 'Este job no tiene "input.baseVideo" (sin video real en disco) -- se omite el análisis de audio real, solo se devuelve el diagnóstico por palabra.';
   } else {
@@ -1172,6 +1186,7 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
       };
     }
 
+    audioMechanismElapsedMs = Date.now() - audioMechanismStartedAt;
   }
 
   // Todo corte pedido que no sobrevivió en finalCuts queda identificado
@@ -1195,6 +1210,7 @@ app.post("/jobs/:id/snap-cuts", async (req, res) => {
     discardedCuts,
     acousticNote,
     qualityGate,
+    audioMechanismElapsedMs,
   });
 });
 
