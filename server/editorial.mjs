@@ -72,7 +72,14 @@ const readApiKey = () => {
   return process.env.ANTHROPIC_API_KEY;
 };
 
-const getClient = () => {
+/**
+ * Exportado para que otros módulos que también necesiten llamar a
+ * Claude (p.ej. resource-acquisition.mjs, validación de relevancia de
+ * Fase 3B) reutilicen el MISMO cliente/clave -- nunca una segunda
+ * lectura independiente del mismo secreto, mismo patrón que
+ * compositor.mjs para el binario de FFmpeg.
+ */
+export const getClient = () => {
   if (client) return client;
   const apiKey = readApiKey();
   if (!apiKey) {

@@ -53,6 +53,19 @@
       "essential": false
     },
     {
+      "id": "test-image-positivo-0",
+      "startSeconds": 250,
+      "endSeconds": 254,
+      "type": "image",
+      "description": "PRUEBA TÉCNICA (no editorial), caso POSITIVO pedido por Alex (01-nov-2026): consulta genérica y muy bien documentada en Pixabay, sin riesgo real de 'palabras correctas, sujeto equivocado' (a diferencia de 'persona corriendo', que puede coincidir con un animal) -- para confirmar que el sistema SÍ acepta un recurso cuando de verdad corresponde, no solo que rechaza los malos.",
+      "visualQuery": "laptop sobre un escritorio de oficina moderno",
+      "editorialGoal": "context",
+      "segment": "development",
+      "intensity": "subtle",
+      "veracityRequirement": "illustrative-ok",
+      "essential": false
+    },
+    {
       "id": "test-graphic-0",
       "startSeconds": 200,
       "endSeconds": 204,

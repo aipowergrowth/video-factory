@@ -1,10 +1,11 @@
 // Fase 3B (31-oct-2026, dictamen "integración mínima de imágenes y
-// B-roll"): resuelve recursos `broll`/`image` que el planificador ya
-// decidió (tipo, intervalo, `visualQuery`) contra Pixabay -- la IA
-// editorial sigue decidiendo QUÉ/CUÁNDO/CUÁNTO DURA; este módulo solo
-// responde DÓNDE conseguir el archivo, legalmente, con su licencia
-// registrada. Nunca decide relevancia editorial por su cuenta más allá
-// de un filtro de palabras clave (sin IA, pedido explícito del dictamen).
+// B-roll"; corregido 01-nov-2026 tras un falso positivo real -- ver
+// "Capa A"/"Capa B" abajo): resuelve recursos `broll`/`image` que el
+// planificador ya decidió (tipo, intervalo, `visualQuery`) contra
+// Pixabay -- la IA editorial sigue decidiendo QUÉ/CUÁNDO/CUÁNTO DURA;
+// este módulo solo responde DÓNDE conseguir el archivo, legalmente, con
+// su licencia registrada, Y si de verdad corresponde al sujeto de la
+// consulta.
 //
 // Cumplimiento de los términos de Pixabay (https://pixabay.com/api/docs/),
 // verificados en la investigación previa (31-oct-2026):
@@ -15,10 +16,35 @@
 //   recurso, nunca tumba el job completo.
 // - Solo se descarga el archivo elegido, nunca todos los candidatos de
 //   una búsqueda ("sin descargas masivas").
+//
+// RELEVANCIA, en dos capas (corrección del 01-nov-2026, tras un
+// incidente real: "persona corriendo en un parque" eligió un cachorro
+// porque "parque" coincidía; una consulta sin sentido eligió un
+// candidato porque "sin" coincidía con la etiqueta "sin fondo"):
+//
+// - Capa A (palabras clave, sin IA, abajo): exige que el candidato
+//   cubra una fracción mínima de las palabras SIGNIFICATIVAS de la
+//   consulta (no solo una), y un mínimo absoluto de coincidencias.
+//   Gratis, determinista, pero no entiende significado -- un candidato
+//   puede cubrir el 100% de las palabras y aun así ser el sujeto
+//   equivocado (un perro con las etiquetas "persona, corriendo,
+//   amanecer, parque" puestas por quien subió la foto, por ejemplo).
+// - Capa B (validación con IA, Claude Haiku, SOLO texto -- id, tipo,
+//   etiquetas, NUNCA la imagen): sobre los finalistas que sobrevivan la
+//   Capa A, un modelo barato juzga si el SUJETO real corresponde a la
+//   consulta, no solo si las palabras coinciden. Esto SÍ puede
+//   reconocer que "cachorro"/"perro" contradice "persona" aunque las
+//   etiquetas comiencen compartiendo varias palabras -- pero sigue
+//   siendo un juicio sobre lo que el banco escribió en las etiquetas,
+//   NUNCA una verificación visual de la imagen real. Si las etiquetas
+//   de Pixabay fueran insuficientes o engañosas, la Capa B puede
+//   fallar igual -- eso se reporta como tal, nunca como "verificado
+//   visualmente".
 
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { getClient } from "./editorial.mjs";
 
 /**
  * Misma convención que la clave de Anthropic (editorial.mjs#readApiKey) y
@@ -37,14 +63,28 @@ export const readPixabayApiKey = () => {
 
 const PIXABAY_LICENSE_URL = "https://pixabay.com/service/license-summary/";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h, exigido por los términos de Pixabay
-const MIN_KEYWORD_OVERLAP = 1; // sin IA -- el criterio de relevancia es puramente léxico
 
-// Palabras demasiado comunes para decir algo sobre relevancia visual --
-// ni exhaustivo ni delicado, solo evita que "de"/"the"/"con" cuenten
-// como una coincidencia real entre la consulta y las etiquetas de Pixabay.
+// --- Capa A: palabras clave --------------------------------------------
+
+// Umbrales elegidos para que los tres falsos positivos reales del
+// 01-nov-2026 (score=1 sobre 4-6 palabras significativas, 17-25% de
+// cobertura) queden rechazados con cualquiera de los dos criterios por
+// separado, no solo combinados.
+const MIN_ABSOLUTE_OVERLAP = 2;
+const MIN_COVERAGE_RATIO = 0.5;
+// Cuántos finalistas como mucho se le mandan a la Capa B -- acotado
+// para que el costo y el tamaño del prompt no crezcan con la cantidad
+// de candidatos que devuelva Pixabay.
+const MAX_FINALISTS = 3;
+
+// Palabras demasiado comunes para decir algo sobre relevancia visual.
+// "sin" se agregó el 01-nov-2026 tras el incidente real: coincidía con
+// la etiqueta "sin fondo" (sin relación con el contenido visual) y
+// bastaba para que una consulta sin sentido pasara el filtro.
 const STOPWORDS = new Set([
   "de", "la", "el", "los", "las", "un", "una", "unos", "unas", "y", "o", "en", "con", "para", "por", "del", "al",
-  "a", "que", "su", "sus", "the", "a", "an", "of", "in", "on", "with", "for", "and", "or", "to",
+  "a", "que", "su", "sus", "sin", "sobre", "entre", "desde", "hasta", "muy", "mas", "esta", "este", "estos", "estas",
+  "the", "an", "of", "in", "on", "with", "for", "and", "or", "to",
 ]);
 
 const normalizeToken = (token) =>
@@ -62,48 +102,52 @@ export const tokenize = (text) =>
       .filter((t) => t.length > 2 && !STOPWORDS.has(t)),
   );
 
-/**
- * Comprobación de relevancia por PALABRAS CLAVE, sin llamar a ningún
- * modelo (pedido explícito del dictamen) -- cuenta cuántos tokens de la
- * consulta aparecen en las etiquetas que Pixabay ya le puso al
- * archivo. Es menos preciso que una verificación semántica; es
- * intencional (ver informe de entrega: evidencia + alternativa con IA
- * y su costo, antes de implementarla).
- */
-export const scoreKeywordOverlap = (query, tagsString) => {
+/** Qué tokens de la consulta aparecen realmente en las etiquetas -- para el log, no solo el número. */
+export const matchedTokens = (query, tagsString) => {
   const queryTokens = tokenize(query);
   const tagTokens = tokenize((tagsString ?? "").replace(/,/g, " "));
-  let overlap = 0;
-  for (const t of queryTokens) {
-    if (tagTokens.has(t)) overlap += 1;
-  }
-  return overlap;
-};
-
-/** De una lista de resultados de Pixabay, el de mejor coincidencia léxica -- null si ninguno llega al mínimo. */
-export const pickBestHit = (hits, query, minOverlap = MIN_KEYWORD_OVERLAP) => {
-  let best = null;
-  let bestScore = 0;
-  for (const hit of hits ?? []) {
-    const score = scoreKeywordOverlap(query, hit.tags);
-    if (score > bestScore) {
-      bestScore = score;
-      best = hit;
-    }
-  }
-  return bestScore >= minOverlap ? { hit: best, score: bestScore } : null;
+  return [...queryTokens].filter((t) => tagTokens.has(t));
 };
 
 /**
- * Describe cada candidato de una búsqueda (id + puntaje de coincidencia
- * léxica contra la consulta) para el log -- pedido explícito de Alex
- * (01-nov-2026): el log debe mostrar "los candidatos", no solo cuántos
- * hubo. Nunca incluye nada de la clave de la API.
+ * Comprobación de relevancia por PALABRAS CLAVE, sin llamar a ningún
+ * modelo -- cuenta cuántos tokens de la consulta aparecen en las
+ * etiquetas que Pixabay ya le puso al archivo. Es menos preciso que
+ * una verificación semántica (ver Capa B); es intencional: cualquier
+ * candidato que no llegue ni a este piso léxico ni vale la pena
+ * mandarlo a la Capa B (ahorra esa llamada).
  */
-const describeHitsForLog = (hits, query) =>
-  (hits ?? [])
-    .map((hit) => `#${hit.id}(score=${scoreKeywordOverlap(query, hit.tags)})`)
-    .join(", ") || "ninguno";
+export const scoreKeywordOverlap = (query, tagsString) => matchedTokens(query, tagsString).length;
+
+/**
+ * Ordena TODOS los candidatos por coincidencia léxica, con su
+ * cobertura (score / cantidad de palabras significativas de la
+ * consulta) -- la cobertura es la que de verdad decide si pasa la
+ * Capa A, no el score absoluto solo.
+ */
+export const rankCandidates = (hits, query) => {
+  const queryTokenCount = tokenize(query).size;
+  return (hits ?? [])
+    .map((hit) => {
+      const score = scoreKeywordOverlap(query, hit.tags);
+      return { hit, score, coverage: queryTokenCount > 0 ? score / queryTokenCount : 0 };
+    })
+    .sort((a, b) => b.score - a.score);
+};
+
+/**
+ * Capa A: de los candidatos ya ordenados, los que de verdad valen la
+ * pena mandar a la Capa B -- deben cumplir el mínimo absoluto DE
+ * COINCIDENCIAS y el mínimo de COBERTURA relativa a la consulta, los
+ * dos a la vez (ver comentario grande arriba del archivo con los
+ * números reales de los tres falsos positivos que esto corrige).
+ */
+export const filterFinalists = (ranked, { minAbsolute = MIN_ABSOLUTE_OVERLAP, minCoverage = MIN_COVERAGE_RATIO, maxFinalists = MAX_FINALISTS } = {}) =>
+  ranked.filter((r) => r.score >= minAbsolute && r.coverage >= minCoverage).slice(0, maxFinalists);
+
+/** Candidatos (id + score + cobertura) para el log -- nunca la clave de la API. */
+const describeRankedForLog = (ranked) =>
+  ranked.map((r) => `#${r.hit.id}(score=${r.score}, cobertura=${(r.coverage * 100).toFixed(0)}%)`).join(", ") || "ninguno";
 
 const slugifyForCacheKey = (text) => [...tokenize(text)].sort().join("-");
 
@@ -175,7 +219,7 @@ export const __setDownloadToFileForTesting = (fn) => {
 export const searchPixabay = async ({ apiKey, query, mediaType, lang = "es", cacheDir, log = () => {} }) => {
   const cached = await readCache(cacheDir, mediaType, query);
   if (cached) {
-    log(`Pixabay (${mediaType}): "${query}" -- resultado en caché (sin llamar a la API) -- candidatos: ${describeHitsForLog(cached, query)}.`);
+    log(`Pixabay (${mediaType}): "${query}" -- resultado en caché (sin llamar a la API) -- candidatos: ${describeRankedForLog(rankCandidates(cached, query))}.`);
     return cached;
   }
 
@@ -202,7 +246,7 @@ export const searchPixabay = async ({ apiKey, query, mediaType, lang = "es", cac
 
   const hits = Array.isArray(payload.hits) ? payload.hits : [];
   await writeCache(cacheDir, mediaType, query, hits);
-  log(`Pixabay (${mediaType}): "${query}" -- ${hits.length} candidato(s), cacheados por 24h -- candidatos: ${describeHitsForLog(hits, query)}.`);
+  log(`Pixabay (${mediaType}): "${query}" -- ${hits.length} candidato(s), cacheados por 24h -- candidatos: ${describeRankedForLog(rankCandidates(hits, query))}.`);
   return hits;
 };
 
@@ -214,13 +258,88 @@ const extensionFor = (url, fallback) => {
   return match ? match[1] : fallback;
 };
 
+// --- Capa B: validación semántica con IA (solo texto) -------------------
+
+// Confirmado en claude.com/pricing el 01-nov-2026 (no se asumió Haiku
+// 4.5, que es el que estaba vigente antes de esta corrección): Haiku
+// 5.5, para prompts de hasta 100K tokens, $0.10/MTok de entrada y
+// $0.50/MTok de salida -- 90% más barato que Haiku 4.5.
+export const RELEVANCE_MODEL = "claude-haiku-5-5";
+export const RELEVANCE_MODEL_INPUT_PRICE_PER_TOKEN = 0.10 / 1_000_000;
+export const RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN = 0.50 / 1_000_000;
+
+/** Costo real de una llamada, a partir del uso que devuelve la API (nunca estimado). */
+export const computeRelevanceCallCostUsd = (usage) =>
+  (usage?.input_tokens ?? 0) * RELEVANCE_MODEL_INPUT_PRICE_PER_TOKEN + (usage?.output_tokens ?? 0) * RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN;
+
+const buildRelevancePrompt = (query, finalists) =>
+  `Eres un validador de relevancia visual, nada más -- no decides si usar el recurso, solo si el SUJETO de cada candidato corresponde de verdad a la consulta.
+
+Nunca viste ninguna imagen ni video real: solo tenés el id, el tipo y las etiquetas que el propio banco (Pixabay) le puso a cada candidato. Tu juicio es sobre esas etiquetas, no sobre contenido visual.
+
+Consulta: "${query}"
+
+Candidatos (cada uno ya comparte AL MENOS algunas palabras con la consulta -- tu trabajo es decidir si el SUJETO real coincide, no solo si hay palabras en común):
+${finalists.map((f, i) => `${i + 1}. id=${f.hit.id} tipo=${f.hit.type ?? "?"} etiquetas="${f.hit.tags ?? ""}"`).join("\n")}
+
+Elegí el ÚNICO candidato cuyo sujeto real corresponde a la consulta. Si ninguno corresponde (por ejemplo: la consulta pide una persona y el candidato es un animal; o la consulta no tiene relación real con ningún candidato aunque compartan alguna palabra suelta), elegí ninguno -- es preferible no elegir nada que elegir el equivocado. No inventes nada que no esté en las etiquetas.
+
+Responde ÚNICAMENTE con un objeto JSON, sin texto antes ni después, sin bloque de código:
+{"chosenId": <id de un candidato de la lista> | null, "reason": "una frase breve, en español"}`;
+
+const parseRelevanceResponse = (rawText, validIds) => {
+  const cleaned = rawText
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "")
+    .trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new Error(`el validador de relevancia no devolvió JSON válido (${err.message}): "${cleaned.slice(0, 200)}"`);
+  }
+  if (parsed.chosenId !== null && !validIds.includes(parsed.chosenId)) {
+    throw new Error(`el validador de relevancia eligió el id ${parsed.chosenId}, que no estaba entre los finalistas (${validIds.join(", ")}).`);
+  }
+  if (typeof parsed.reason !== "string" || parsed.reason.trim().length === 0) {
+    throw new Error("el validador de relevancia no dio un motivo.");
+  }
+  return { chosenId: parsed.chosenId, reason: parsed.reason.trim() };
+};
+
+/**
+ * Llama a Claude Haiku para juzgar, SOLO con id/tipo/etiquetas (nunca
+ * una imagen), cuál finalista (si alguno) corresponde de verdad al
+ * sujeto de la consulta. Devuelve `{chosenId, reason, usage}` --
+ * `usage` es el consumo REAL de tokens que devuelve la API, para poder
+ * loguear el costo real (nunca estimado) de cada llamada.
+ */
+const realValidateRelevanceWithAI = async ({ query, finalists }) => {
+  const client = getClient();
+  const response = await client.messages.create({
+    model: RELEVANCE_MODEL,
+    max_tokens: 200,
+    messages: [{ role: "user", content: buildRelevancePrompt(query, finalists) }],
+  });
+  const text = response.content?.find((block) => block.type === "text")?.text ?? "";
+  const validIds = finalists.map((f) => f.hit.id);
+  const { chosenId, reason } = parseRelevanceResponse(text, validIds);
+  return { chosenId, reason, usage: response.usage ?? { input_tokens: 0, output_tokens: 0 } };
+};
+let validateRelevanceWithAI = realValidateRelevanceWithAI;
+/** Solo para pruebas: nunca llama a la API real de Anthropic. */
+export const __setRelevanceValidatorForTesting = (fn) => {
+  validateRelevanceWithAI = fn ?? realValidateRelevanceWithAI;
+};
+
 /**
  * Resuelve UN recurso `broll`/`image` contra Pixabay: busca (con
- * caché), elige el mejor candidato por palabras clave, descarga SOLO
- * ese archivo y arma el registro de licencia. Si ya tenía
- * `resolvedAsset` o `acquisitionFailureReason` de una corrida anterior,
- * no vuelve a tocar nada (idempotente -- evita re-consultar en cada
- * replan de un job que no cambió).
+ * caché), filtra finalistas por palabras clave (Capa A), valida el
+ * sujeto real con IA sobre esos finalistas (Capa B, solo texto),
+ * descarga SOLO el archivo que la IA eligió, y arma el registro de
+ * licencia. Si ya tenía `resolvedAsset` o `acquisitionFailureReason` de
+ * una corrida anterior, no vuelve a tocar nada (idempotente).
  */
 export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir, jobId, lang = "es", log = () => {} }) => {
   if (resource.resolvedAsset || resource.acquisitionFailureReason) {
@@ -235,20 +354,53 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
     };
   }
 
+  const query = resource.visualQuery;
   const mediaType = resource.type === "broll" ? "video" : "image";
-  const hits = await searchPixabay({ apiKey, query: resource.visualQuery, mediaType, lang, cacheDir, log });
-  const best = pickBestHit(hits, resource.visualQuery);
+  const hits = await searchPixabay({ apiKey, query, mediaType, lang, cacheDir, log });
+  const ranked = rankCandidates(hits, query);
+  const finalists = filterFinalists(ranked);
 
-  if (!best) {
-    const reason = `no se encontró en Pixabay un resultado con buena coincidencia de palabras clave para "${resource.visualQuery}" (${hits.length} candidato(s) evaluado(s): ${describeHitsForLog(hits, resource.visualQuery)}).`;
-    log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
+  if (finalists.length === 0) {
+    const reason =
+      `ningún candidato de Pixabay alcanzó el umbral de relevancia por palabras clave para "${query}" ` +
+      `(mínimo ${MIN_ABSOLUTE_OVERLAP} coincidencias y ${Math.round(MIN_COVERAGE_RATIO * 100)}% de cobertura; ` +
+      `${hits.length} candidato(s) evaluado(s): ${describeRankedForLog(ranked)}).`;
+    log(`Pixabay: RECHAZADO (capa A) recurso "${resource.id}" -- ${reason}`);
     return { ...resource, acquisitionFailureReason: reason };
   }
 
-  const { hit, score } = best;
+  log(
+    `Pixabay: finalistas de "${resource.id}" para la Capa B (${finalists.length} de ${hits.length}): ` +
+      finalists.map((f) => `#${f.hit.id} etiquetas="${f.hit.tags ?? ""}" (coincidieron: ${matchedTokens(query, f.hit.tags).join(", ") || "ninguna"})`).join(" | ") +
+      ".",
+  );
+
+  let verdict;
+  try {
+    verdict = await validateRelevanceWithAI({ query, finalists });
+  } catch (err) {
+    const reason = `la validación de relevancia con IA falló (${err.message ?? err}) -- se conserva el presentador en pantalla en vez de insertar un recurso sin validar.`;
+    log(`Pixabay: RECHAZADO (capa B, error) recurso "${resource.id}" -- ${reason}`);
+    return { ...resource, acquisitionFailureReason: reason };
+  }
+
+  const costUsd = computeRelevanceCallCostUsd(verdict.usage);
+  log(
+    `Pixabay: Capa B (${RELEVANCE_MODEL}) para "${resource.id}" -- veredicto: ${verdict.chosenId === null ? "NINGUNO sirve" : `candidato #${verdict.chosenId}`} ` +
+      `-- motivo del modelo: "${verdict.reason}" -- tokens: ${verdict.usage.input_tokens ?? 0} entrada / ${verdict.usage.output_tokens ?? 0} salida -- costo real: $${costUsd.toFixed(6)}.`,
+  );
+
+  if (verdict.chosenId === null) {
+    const reason = `la Capa B (validación con IA sobre etiquetas, sin imágenes) determinó que ningún finalista corresponde al sujeto de "${query}": ${verdict.reason}`;
+    log(`Pixabay: RECHAZADO (capa B) recurso "${resource.id}" -- ${reason}`);
+    return { ...resource, acquisitionFailureReason: reason };
+  }
+
+  const chosen = finalists.find((f) => f.hit.id === verdict.chosenId);
+  const { hit, score, coverage } = chosen;
   const sourceUrl = mediaType === "video" ? pickVideoUrl(hit) : pickImageUrl(hit);
   if (!sourceUrl) {
-    const reason = `Pixabay devolvió el candidato #${hit.id} para "${resource.visualQuery}" sin una URL de descarga utilizable.`;
+    const reason = `la Capa B eligió el candidato #${hit.id} para "${query}" pero Pixabay no le dio una URL de descarga utilizable.`;
     log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
     return { ...resource, acquisitionFailureReason: reason };
   }
@@ -267,7 +419,7 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
     try {
       await downloadToFile(sourceUrl, destPath);
     } catch (err) {
-      const reason = `se eligió el candidato #${hit.id} (score=${score}) para "${resource.visualQuery}" pero falló la descarga (${err.message ?? err}).`;
+      const reason = `la Capa B eligió el candidato #${hit.id} (score=${score}) para "${query}" pero falló la descarga (${err.message ?? err}).`;
       log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
       return { ...resource, acquisitionFailureReason: reason };
     }
@@ -277,8 +429,8 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
   const licenseName = "Pixabay Content License";
   const attributionRequired = false;
   log(
-    `Pixabay: ELEGIDO recurso "${resource.id}" -> candidato #${hit.id} (score=${score} de ${hits.length} evaluado(s): ${describeHitsForLog(hits, resource.visualQuery)}) ` +
-      `-- autor "${hit.user}", tipo ${mediaTypeFinal}, licencia "${licenseName}" (${PIXABAY_LICENSE_URL}, atribución ${attributionRequired ? "obligatoria" : "no obligatoria"}), ` +
+    `Pixabay: ELEGIDO recurso "${resource.id}" -> candidato #${hit.id} (capa A: score=${score}, cobertura=${(coverage * 100).toFixed(0)}%; capa B: "${verdict.reason}") ` +
+      `-- etiquetas="${hit.tags ?? ""}", autor "${hit.user}", tipo ${mediaTypeFinal}, licencia "${licenseName}" (${PIXABAY_LICENSE_URL}, atribución ${attributionRequired ? "obligatoria" : "no obligatoria"}), ` +
       `página ${hit.pageURL}, ${alreadyOnDisk ? "ya estaba en disco" : "descargado ahora"} -> ${relativePath}.`,
   );
 
