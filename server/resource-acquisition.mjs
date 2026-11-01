@@ -272,6 +272,45 @@ export const RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN = 0.50 / 1_000_000;
 export const computeRelevanceCallCostUsd = (usage) =>
   (usage?.input_tokens ?? 0) * RELEVANCE_MODEL_INPUT_PRICE_PER_TOKEN + (usage?.output_tokens ?? 0) * RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN;
 
+// Incidente real (01-nov-2026): con 2 finalistas y etiquetas muy
+// repetidas ("iphone" x4, "oficina" x5 en los datos crudos de
+// Pixabay), la llamada devolvió texto VACÍO y el recurso (un caso
+// positivo real) quedó rechazado por el fail-safe en vez de aceptado.
+// 200 tokens de salida era insuficiente margen; se sube a 1024 --
+// el costo real no sube con esto, porque se cobra por lo que el
+// modelo efectivamente genera, no por el tope. No se pide "thinking"
+// (razonamiento extendido) en ningún parámetro -- está apagado por
+// default en la API de Mensajes; si alguna vez apareciera un bloque de
+// ese tipo, los diagnósticos de abajo lo mostrarían en vez de fallar
+// en silencio.
+const RELEVANCE_MAX_OUTPUT_TOKENS = 1024;
+// 1 reintento automático ante un fallo TÉCNICO (respuesta vacía, JSON
+// no parseable, error de red/timeout) -- nunca ante un veredicto real
+// ("ninguno sirve" no es un error, es una respuesta válida y se
+// respeta sin reintentar).
+const RELEVANCE_MAX_ATTEMPTS = 2;
+
+/**
+ * Quita etiquetas duplicadas (ignorando mayúsculas/espacios) antes de
+ * mandarlas al modelo o al log -- un candidato con "iphone" repetido 4
+ * veces en los datos crudos de Pixabay no debe inflar ni el costo del
+ * prompt ni la lectura del log. No afecta el puntaje de la Capa A
+ * (que ya usa un Set internamente), solo lo que se muestra/envía.
+ */
+export const dedupeTagsString = (tagsString) => {
+  const seen = new Set();
+  const kept = [];
+  for (const raw of (tagsString ?? "").split(",")) {
+    const trimmed = raw.trim();
+    const key = trimmed.toLowerCase();
+    if (trimmed && !seen.has(key)) {
+      seen.add(key);
+      kept.push(trimmed);
+    }
+  }
+  return kept.join(", ");
+};
+
 const buildRelevancePrompt = (query, finalists) =>
   `Eres un validador de relevancia visual, nada más -- no decides si usar el recurso, solo si el SUJETO de cada candidato corresponde de verdad a la consulta.
 
@@ -280,24 +319,44 @@ Nunca viste ninguna imagen ni video real: solo tenés el id, el tipo y las etiqu
 Consulta: "${query}"
 
 Candidatos (cada uno ya comparte AL MENOS algunas palabras con la consulta -- tu trabajo es decidir si el SUJETO real coincide, no solo si hay palabras en común):
-${finalists.map((f, i) => `${i + 1}. id=${f.hit.id} tipo=${f.hit.type ?? "?"} etiquetas="${f.hit.tags ?? ""}"`).join("\n")}
+${finalists.map((f, i) => `${i + 1}. id=${f.hit.id} tipo=${f.hit.type ?? "?"} etiquetas="${dedupeTagsString(f.hit.tags)}"`).join("\n")}
 
 Elegí el ÚNICO candidato cuyo sujeto real corresponde a la consulta. Si ninguno corresponde (por ejemplo: la consulta pide una persona y el candidato es un animal; o la consulta no tiene relación real con ningún candidato aunque compartan alguna palabra suelta), elegí ninguno -- es preferible no elegir nada que elegir el equivocado. No inventes nada que no esté en las etiquetas.
 
-Responde ÚNICAMENTE con un objeto JSON, sin texto antes ni después, sin bloque de código:
+Responde ÚNICAMENTE con un objeto JSON, sin texto antes ni después, sin bloque de código, sin explicación aparte del campo "reason":
 {"chosenId": <id de un candidato de la lista> | null, "reason": "una frase breve, en español"}`;
 
 const parseRelevanceResponse = (rawText, validIds) => {
-  const cleaned = rawText
+  const cleaned = (rawText ?? "")
     .trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/```\s*$/, "")
     .trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (err) {
-    throw new Error(`el validador de relevancia no devolvió JSON válido (${err.message}): "${cleaned.slice(0, 200)}"`);
+
+  const tryParse = (candidate) => {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return undefined;
+    }
+  };
+
+  // Parseo tolerante: si el texto viene limpio, se parsea directo. Si
+  // el modelo agregó algo de prosa alrededor del JSON, se busca el
+  // primer objeto "{...}" dentro del texto antes de darse por vencido
+  // -- pero si no hay NADA de texto (el incidente real del 01-nov-2026),
+  // no hay nada que buscar y el error lo dice explícitamente.
+  let parsed = tryParse(cleaned);
+  if (!parsed) {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) parsed = tryParse(match[0]);
+  }
+  if (!parsed) {
+    throw new Error(
+      cleaned.length === 0
+        ? "el validador de relevancia devolvió una respuesta de texto VACÍA (sin ningún bloque de texto utilizable)."
+        : `el validador de relevancia no devolvió JSON válido: "${cleaned.slice(0, 200)}"`,
+    );
   }
   if (parsed.chosenId !== null && !validIds.includes(parsed.chosenId)) {
     throw new Error(`el validador de relevancia eligió el id ${parsed.chosenId}, que no estaba entre los finalistas (${validIds.join(", ")}).`);
@@ -314,23 +373,71 @@ const parseRelevanceResponse = (rawText, validIds) => {
  * sujeto de la consulta. Devuelve `{chosenId, reason, usage}` --
  * `usage` es el consumo REAL de tokens que devuelve la API, para poder
  * loguear el costo real (nunca estimado) de cada llamada.
+ *
+ * Si la respuesta no se puede parsear (el incidente real: texto
+ * vacío), el error que se lanza lleva adjunto `.usage` (para poder
+ * contar el costo de ESE intento fallido también) y un mensaje con
+ * diagnóstico -- stop_reason, qué tipos de bloque devolvió el
+ * contenido, y los tokens -- nunca ninguna clave.
  */
 const realValidateRelevanceWithAI = async ({ query, finalists }) => {
   const client = getClient();
   const response = await client.messages.create({
     model: RELEVANCE_MODEL,
-    max_tokens: 200,
+    max_tokens: RELEVANCE_MAX_OUTPUT_TOKENS,
     messages: [{ role: "user", content: buildRelevancePrompt(query, finalists) }],
   });
-  const text = response.content?.find((block) => block.type === "text")?.text ?? "";
+  const usage = response.usage ?? { input_tokens: 0, output_tokens: 0 };
+  const contentBlocks = response.content ?? [];
+  const text = contentBlocks
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("");
   const validIds = finalists.map((f) => f.hit.id);
-  const { chosenId, reason } = parseRelevanceResponse(text, validIds);
-  return { chosenId, reason, usage: response.usage ?? { input_tokens: 0, output_tokens: 0 } };
+  try {
+    const { chosenId, reason } = parseRelevanceResponse(text, validIds);
+    return { chosenId, reason, usage };
+  } catch (err) {
+    const blockTypes = contentBlocks.map((b) => b.type).join(", ") || "ninguno";
+    const diagnosed = new Error(
+      `${err.message} -- diagnóstico: stop_reason="${response.stop_reason ?? "desconocido"}", bloques de contenido=[${blockTypes}], tokens=${usage.input_tokens ?? 0} entrada / ${usage.output_tokens ?? 0} salida.`,
+    );
+    diagnosed.usage = usage;
+    throw diagnosed;
+  }
 };
 let validateRelevanceWithAI = realValidateRelevanceWithAI;
 /** Solo para pruebas: nunca llama a la API real de Anthropic. */
 export const __setRelevanceValidatorForTesting = (fn) => {
   validateRelevanceWithAI = fn ?? realValidateRelevanceWithAI;
+};
+
+/**
+ * Envoltorio con UN reintento automático ante un fallo TÉCNICO de la
+ * Capa B (nunca ante un veredicto válido, incluido "ninguno sirve").
+ * Registra el costo de CADA intento, exitoso o no -- si los dos
+ * intentos fallan, el error final lleva adjunto el costo total
+ * gastado en los intentos fallidos (`.spentOnFailedAttemptsUsd`) para
+ * que quede en el log de rechazo también.
+ */
+const validateRelevanceWithRetry = async ({ query, finalists, resourceId, log }) => {
+  let lastErr;
+  let spentOnFailedAttemptsUsd = 0;
+  for (let attempt = 1; attempt <= RELEVANCE_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await validateRelevanceWithAI({ query, finalists });
+    } catch (err) {
+      lastErr = err;
+      const attemptCostUsd = computeRelevanceCallCostUsd(err.usage);
+      spentOnFailedAttemptsUsd += attemptCostUsd;
+      log(
+        `Pixabay: Capa B -- intento ${attempt}/${RELEVANCE_MAX_ATTEMPTS} para "${resourceId}" falló (${err.message}) -- costo de ese intento: $${attemptCostUsd.toFixed(6)}.` +
+          (attempt < RELEVANCE_MAX_ATTEMPTS ? " Reintentando una vez." : ""),
+      );
+    }
+  }
+  lastErr.spentOnFailedAttemptsUsd = spentOnFailedAttemptsUsd;
+  throw lastErr;
 };
 
 /**
@@ -371,15 +478,18 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
 
   log(
     `Pixabay: finalistas de "${resource.id}" para la Capa B (${finalists.length} de ${hits.length}): ` +
-      finalists.map((f) => `#${f.hit.id} etiquetas="${f.hit.tags ?? ""}" (coincidieron: ${matchedTokens(query, f.hit.tags).join(", ") || "ninguna"})`).join(" | ") +
+      finalists.map((f) => `#${f.hit.id} etiquetas="${dedupeTagsString(f.hit.tags)}" (coincidieron: ${matchedTokens(query, f.hit.tags).join(", ") || "ninguna"})`).join(" | ") +
       ".",
   );
 
   let verdict;
   try {
-    verdict = await validateRelevanceWithAI({ query, finalists });
+    verdict = await validateRelevanceWithRetry({ query, finalists, resourceId: resource.id, log });
   } catch (err) {
-    const reason = `la validación de relevancia con IA falló (${err.message ?? err}) -- se conserva el presentador en pantalla en vez de insertar un recurso sin validar.`;
+    const spentUsd = err.spentOnFailedAttemptsUsd ?? 0;
+    const reason =
+      `la validación de relevancia con IA falló tras ${RELEVANCE_MAX_ATTEMPTS} intento(s) (${err.message ?? err}) -- ` +
+      `costo gastado en los intentos fallidos: $${spentUsd.toFixed(6)} -- se conserva el presentador en pantalla en vez de insertar un recurso sin validar.`;
     log(`Pixabay: RECHAZADO (capa B, error) recurso "${resource.id}" -- ${reason}`);
     return { ...resource, acquisitionFailureReason: reason };
   }
@@ -430,7 +540,7 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
   const attributionRequired = false;
   log(
     `Pixabay: ELEGIDO recurso "${resource.id}" -> candidato #${hit.id} (capa A: score=${score}, cobertura=${(coverage * 100).toFixed(0)}%; capa B: "${verdict.reason}") ` +
-      `-- etiquetas="${hit.tags ?? ""}", autor "${hit.user}", tipo ${mediaTypeFinal}, licencia "${licenseName}" (${PIXABAY_LICENSE_URL}, atribución ${attributionRequired ? "obligatoria" : "no obligatoria"}), ` +
+      `-- etiquetas="${dedupeTagsString(hit.tags)}", autor "${hit.user}", tipo ${mediaTypeFinal}, licencia "${licenseName}" (${PIXABAY_LICENSE_URL}, atribución ${attributionRequired ? "obligatoria" : "no obligatoria"}), ` +
       `página ${hit.pageURL}, ${alreadyOnDisk ? "ya estaba en disco" : "descargado ahora"} -> ${relativePath}.`,
   );
 

@@ -6,8 +6,17 @@
 // scoreKeywordOverlap, rankCandidates, filterFinalists) y el CONTROL DE
 // FLUJO de las dos capas de relevancia (Capa A por palabras clave, Capa
 // B por IA sobre los finalistas) de server/resource-acquisition.mjs --
-// incluidos los tres casos reales que Alex reportó el 01-nov-2026 y el
-// caso límite del cachorro con etiquetas coincidentes.
+// incluidos los tres casos reales que Alex reportó el 01-nov-2026, el
+// caso límite del cachorro con etiquetas coincidentes, y el incidente
+// real del caso positivo (respuesta vacía de la Capa B) del mismo día.
+//
+// Para reproducir el incidente de la respuesta vacía SIN mockear el
+// SDK de Anthropic a mano, se usa __setAnthropicClientForTesting --
+// el mismo gancho que ya existe en editorial.mjs -- para inyectar un
+// cliente falso cuyo `messages.create` devuelve exactamente la forma
+// de respuesta problemática. getClient() (compartido, ver
+// resource-acquisition.mjs) devuelve ese cliente falso sin tocar la
+// red ni leer ninguna clave real.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,6 +26,7 @@ import {
   scoreKeywordOverlap,
   rankCandidates,
   filterFinalists,
+  dedupeTagsString,
   computeRelevanceCallCostUsd,
   RELEVANCE_MODEL_INPUT_PRICE_PER_TOKEN,
   RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN,
@@ -27,6 +37,7 @@ import {
   __setDownloadToFileForTesting,
   __setRelevanceValidatorForTesting,
 } from "./resource-acquisition.mjs";
+import { __setAnthropicClientForTesting } from "./editorial.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -57,6 +68,12 @@ check("tokenize: conserva las palabras significativas de una consulta sin sentid
 check("scoreKeywordOverlap: sin ninguna coincidencia da 0", scoreKeywordOverlap("gato jugando", "car, engine, factory") === 0);
 check("scoreKeywordOverlap: con coincidencia da >0", scoreKeywordOverlap("laboratorio de neurociencia", "laboratorio, ciencia, microscopio") > 0);
 check("matchedTokens: devuelve las palabras que de verdad coincidieron, no solo el número", matchedTokens("persona corriendo al amanecer en un parque", "cachorro, animal, parque").join(",") === "parque");
+
+// --- dedupeTagsString (corrección 01-nov-2026: etiquetas repetidas no deben inflar el prompt/log) ---
+
+check("dedupeTagsString: quita duplicados exactos sin importar mayúsculas/espacios", dedupeTagsString("iPhone, iphone , OFICINA, oficina, escritorio") === "iPhone, OFICINA, escritorio");
+check("dedupeTagsString: conserva el orden de la primera aparición", dedupeTagsString("b, a, b, a, c") === "b, a, c");
+check("dedupeTagsString: vacío o undefined da cadena vacía", dedupeTagsString(undefined) === "" && dedupeTagsString("") === "");
 
 // --- rankCandidates / filterFinalists (Capa A) ---
 
@@ -354,23 +371,136 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
 }
 
 {
-  // La llamada a la Capa B falla (error/timeout): el recurso queda
-  // pendiente con ESE motivo -- nunca se inserta sin validar (pedido
-  // explícito: "es preferible conservar al presentador en pantalla").
+  // La llamada a la Capa B falla (error/timeout) en AMBOS intentos: el
+  // recurso queda pendiente con ESE motivo -- nunca se inserta sin
+  // validar (pedido explícito: "es preferible conservar al
+  // presentador en pantalla"). El reintento automático (corrección
+  // 01-nov-2026) debe intentarlo exactamente 2 veces, no más ni menos.
+  let validatorCalls = 0;
   __setFetchJsonForTesting(async () => ({
     hits: [{ id: 12, tags: "oficina, trabajo, escritorio, computadora", pageURL: "https://pixabay.com/x/12", largeImageURL: "https://cdn.example/12.jpg", user: "x" }],
   }));
   __setRelevanceValidatorForTesting(async () => {
-    throw new Error("timeout esperando a Claude (simulado)");
+    validatorCalls++;
+    const err = new Error("timeout esperando a Claude (simulado)");
+    err.usage = { input_tokens: 50, output_tokens: 0 };
+    throw err;
   });
   const resource = { id: "ai-resource-ai-fails", type: "image", description: "x", visualQuery: "oficina trabajo escritorio computadora" };
   const logLines = [];
   const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
   check("resolveOneResource: si la Capa B falla, NUNCA se inserta sin validar", resolved.resolvedAsset === undefined);
+  check("resolveOneResource: se reintentó exactamente 1 vez (2 intentos en total, no más)", validatorCalls === 2);
   check("resolveOneResource: el motivo del fallo queda registrado", resolved.acquisitionFailureReason?.includes("timeout esperando a Claude"));
+  check("resolveOneResource: el motivo incluye el costo gastado en los intentos fallidos", resolved.acquisitionFailureReason?.includes("costo gastado en los intentos fallidos"));
   check("resolveOneResource: el log explica el principio de conservar al presentador", logLines.some((l) => l.includes("presentador en pantalla")));
+  check("log: el primer intento fallido queda registrado con 'Reintentando una vez'", logLines.some((l) => l.includes("intento 1/2") && l.includes("Reintentando una vez")));
   __setFetchJsonForTesting(null);
   __setRelevanceValidatorForTesting(null);
+}
+
+{
+  // INCIDENTE REAL (reporte de Alex, 01-nov-2026): con 2 finalistas y
+  // etiquetas muy repetidas, la Capa B devolvió texto VACÍO -- el caso
+  // positivo quedó rechazado por el fail-safe en vez de aceptado. Se
+  // reproduce aquí SIN mockear el validador de alto nivel, sino
+  // inyectando un cliente de Anthropic falso (mismo gancho que usa
+  // editorial.mjs) para ejercitar el parseo/diagnóstico/reintento
+  // REALES de realValidateRelevanceWithAI. El primer intento devuelve
+  // exactamente la forma de respuesta problemática (content: [],
+  // texto vacío); el reintento automático sí trae un JSON válido -- el
+  // recurso debe terminar ACEPTADO.
+  let createCalls = 0;
+  let firstPromptText = null;
+  const incidenteCacheDir = path.join(tmpDir, "cache-incidente-vacio");
+  __setFetchJsonForTesting(async () => ({
+    hits: [
+      {
+        id: 1868496,
+        tags: "iphone, iphone, iphone, iphone, oficina, oficina, oficina, oficina, oficina, escritorio, laptop",
+        pageURL: "https://pixabay.com/x/1868496",
+        largeImageURL: "https://cdn.example/1868496.jpg",
+        user: "autor-a",
+      },
+      {
+        id: 2846221,
+        tags: "laptop, escritorio, oficina, moderno, trabajo",
+        pageURL: "https://pixabay.com/x/2846221",
+        largeImageURL: "https://cdn.example/2846221.jpg",
+        user: "autor-b",
+      },
+    ],
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        createCalls++;
+        if (createCalls === 1) {
+          firstPromptText = params.messages?.[0]?.content ?? "";
+          // La forma EXACTA del incidente real: ningún bloque de texto.
+          return { content: [], stop_reason: "end_turn", usage: { input_tokens: 540, output_tokens: 0 } };
+        }
+        return {
+          content: [{ type: "text", text: '{"chosenId": 1868496, "reason": "escritorio con laptop, coincide con la consulta"}' }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 540, output_tokens: 24 },
+        };
+      },
+    },
+  });
+  const resource = { id: "test-image-positivo-0", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: incidenteCacheDir, assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("incidente reproducido: primer intento con texto vacío, segundo intento (real) ÉXITO -- se acepta", resolved.resolvedAsset?.assetId === 1868496);
+  check("incidente reproducido: hubo exactamente 2 llamadas reales a messages.create (1 fallo + 1 reintento)", createCalls === 2);
+  const diagLine = logLines.find((l) => l.includes("intento 1/2"));
+  check("log: el intento fallido queda diagnosticado con stop_reason y tipos de bloque -- sin claves", diagLine?.includes('stop_reason="end_turn"') && diagLine?.includes("bloques de contenido=[ninguno]") && diagLine.includes("VACÍA") && !diagLine.includes("fake"));
+  check("log: el intento fallido registra su costo real de ese intento (no $0, el fallo igual consumió tokens de entrada)", /costo de ese intento: \$0\.000054/.test(diagLine ?? ""));
+  // "iphone" solo aparece en las etiquetas del candidato #1868496
+  // (repetido 4 veces en los datos crudos) -- deduplicado, debe quedar
+  // en el prompt exactamente 1 vez. "oficina" aparece en AMBOS
+  // candidatos (una vez cada uno tras deduplicar sus propias
+  // etiquetas) -- lo que no debe pasar es que aparezca 5 veces seguidas
+  // (el dato crudo del candidato #1868496 antes de deduplicar).
+  check("prompt real enviado a la IA: 'iphone' (repetido 4 veces en el candidato #1868496) queda deduplicado a 1 sola vez", (firstPromptText.match(/iphone/gi) ?? []).length === 1);
+  check("prompt real enviado a la IA: 'oficina' no aparece repetida dentro de un mismo candidato (nunca 'oficina, oficina')", !/oficina,\s*oficina/i.test(firstPromptText));
+  const finalistasLine = logLines.find((l) => l.includes("finalistas de"));
+  check("log: la línea de finalistas tampoco repite 'oficina' dentro de un mismo candidato", !/oficina,\s*oficina/i.test(finalistasLine ?? ""));
+  const elegidoLine = logLines.find((l) => l.includes("ELEGIDO"));
+  check("log: la línea ELEGIDO tampoco repite etiquetas duplicadas", (elegidoLine.match(/oficina/gi) ?? []).length === 1 && (elegidoLine.match(/iphone/gi) ?? []).length === 1);
+  __setAnthropicClientForTesting(null);
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+}
+
+{
+  // Variante del incidente real: la Capa B falla con texto vacío en
+  // LOS DOS intentos (el reintento no siempre salva el caso) -- debe
+  // quedar rechazado y pendiente, nunca insertar algo sin validar.
+  let createCalls = 0;
+  const incidenteDosVecesCacheDir = path.join(tmpDir, "cache-incidente-vacio-dos-veces");
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 55, tags: "laptop, escritorio, oficina, moderno", pageURL: "https://pixabay.com/x/55", largeImageURL: "https://cdn.example/55.jpg", user: "x" }],
+  }));
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async () => {
+        createCalls++;
+        return { content: [], stop_reason: "max_tokens", usage: { input_tokens: 300, output_tokens: 0 } };
+      },
+    },
+  });
+  const resource = { id: "siempre-vacio", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: incidenteDosVecesCacheDir, assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("ambos intentos reales fallan: NUNCA se inserta sin validar", resolved.resolvedAsset === undefined);
+  check("ambos intentos reales fallan: se llamó exactamente 2 veces (no más)", createCalls === 2);
+  const rechazadoLine = logLines.find((l) => l.includes("RECHAZADO (capa B, error)"));
+  check("log: el rechazo final menciona el costo total gastado en los intentos fallidos", rechazadoLine?.includes("costo gastado en los intentos fallidos"));
+  check("log: el diagnóstico distingue 'VACÍA' de un JSON simplemente mal formado", logLines.some((l) => l.includes("VACÍA")));
+  __setAnthropicClientForTesting(null);
+  __setFetchJsonForTesting(null);
 }
 
 {
