@@ -35,6 +35,10 @@ services:
       # refresh_token (ver DEPLOY.md para cómo se genera, una sola vez,
       # sin terminal).
       DRIVE_OAUTH_CREDENTIALS_FILE: "/run/secrets/drive_oauth_credentials_json"
+      # Clave de API de Pixabay (Fase 3B, adquisición de broll/image).
+      # Mismo patrón que las credenciales de arriba: nunca en texto
+      # plano, siempre desde un secreto de Swarm.
+      PIXABAY_API_KEY_FILE: "/run/secrets/pixabay_api_key"
     volumes:
       - fabrica_videos_inputs:/app/public/uploads
       - fabrica_videos_outputs:/data/outputs
@@ -46,6 +50,8 @@ services:
         target: anthropic_api_key
       - source: drive_oauth_v2
         target: drive_oauth_credentials_json
+      - source: vfpixabay_api_key
+        target: pixabay_api_key
     deploy:
       replicas: 1
       resources:
@@ -88,4 +94,11 @@ secrets:
   # igual en /run/secrets/drive_oauth_credentials_json, que es lo que
   # espera DRIVE_OAUTH_CREDENTIALS_FILE.
   drive_oauth_v2:
+    external: true
+  # Contenido: solo la clave de Pixabay, sin comillas ni nombre de
+  # variable delante -- mismo formato que vfanthropic_api_key. El
+  # secreto en Portainer se llama "vfpixabay_api_key" -- el
+  # "source"/"target" de arriba lo monta en /run/secrets/pixabay_api_key,
+  # que es lo que espera PIXABAY_API_KEY_FILE.
+  vfpixabay_api_key:
     external: true

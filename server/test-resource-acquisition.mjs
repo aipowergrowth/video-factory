@@ -106,11 +106,20 @@ check("pickBestHit: lista vacía devuelve null", pickBestHit([], "cualquier cosa
     downloadCalls++;
   });
   const resource = { id: "ai-resource-0", type: "image", description: "prosa editorial", visualQuery: "ilustración de una molécula de dopamina" };
-  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test" });
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
   check("resolveOneResource: resuelve con el candidato más relevante (id 7, no 8)", resolved.resolvedAsset?.assetId === 7);
   check("resolveOneResource: se descarga exactamente 1 archivo (nunca los dos candidatos)", downloadCalls === 1);
   check("resolveOneResource: solo 1 búsqueda", searchCalls === 1);
   check("resolveOneResource: registra proveedor/licencia/autor/fecha", resolved.resolvedAsset?.provider === "pixabay" && resolved.resolvedAsset?.licenseName && resolved.resolvedAsset?.author === "autor-x" && resolved.resolvedAsset?.downloadedAt);
+  // Pedido explícito de Alex (01-nov-2026): el log debe mostrar, por
+  // recurso, la consulta, los candidatos evaluados, el elegido y su
+  // licencia/procedencia -- no solo que se descargó algo.
+  const elegidoLine = logLines.find((l) => l.includes("ELEGIDO"));
+  check("log: hay una línea 'ELEGIDO' con el recurso y el candidato elegido", elegidoLine?.includes("ai-resource-0") && elegidoLine?.includes("#7"));
+  check("log: la línea ELEGIDO lista los candidatos evaluados (ambos ids)", elegidoLine?.includes("#7") && elegidoLine?.includes("#8"));
+  check("log: la línea ELEGIDO incluye la licencia y el autor", elegidoLine?.includes("Pixabay Content License") && elegidoLine?.includes("autor-x"));
+  check("log: ninguna línea de log contiene la clave de la API", !logLines.some((l) => l.includes("fake")));
   check("resolveOneResource: mediaType illustration se conserva (no se fuerza a 'photo')", resolved.resolvedAsset?.mediaType === "illustration");
   check("resolveOneResource: localPath queda dentro de uploads/resources/<jobId>/", resolved.resolvedAsset?.localPath.startsWith("uploads/resources/job-test/"));
   __setFetchJsonForTesting(null);
@@ -135,9 +144,12 @@ check("pickBestHit: lista vacía devuelve null", pickBestHit([], "cualquier cosa
   // Ningún candidato relevante: no inserta nada genérico -- queda con motivo.
   __setFetchJsonForTesting(async () => ({ hits: [{ id: 9, tags: "coche, carretera", largeImageURL: "https://cdn.example/9.jpg", user: "x" }] }));
   const resource = { id: "ai-resource-2", type: "image", description: "x", visualQuery: "laboratorio de neurociencia" };
-  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test" });
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
   check("resolveOneResource: sin candidato relevante, NO queda resolvedAsset", resolved.resolvedAsset === undefined);
   check("resolveOneResource: motivo menciona la consulta original", resolved.acquisitionFailureReason?.includes("laboratorio de neurociencia"));
+  const rechazadoLine = logLines.find((l) => l.includes("RECHAZADO"));
+  check("log: hay una línea 'RECHAZADO' con el recurso y los candidatos evaluados", rechazadoLine?.includes("ai-resource-2") && rechazadoLine?.includes("#9"));
   __setFetchJsonForTesting(null);
 }
 

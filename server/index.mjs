@@ -710,7 +710,6 @@ const acquireResourcesIfNeeded = async (jobId, job) => {
 
   const apiKey = readPixabayApiKey();
   let updatedResources = job.resources;
-  let issues = [];
   if (!apiKey) {
     console.log(`[job ${jobId}] sin clave de Pixabay configurada (PIXABAY_API_KEY_FILE) -- los recursos broll/image quedan pendientes.`);
     updatedResources = (job.resources ?? []).map((r) =>
@@ -719,7 +718,12 @@ const acquireResourcesIfNeeded = async (jobId, job) => {
         : r,
     );
   } else {
-    ({ resources: updatedResources, issues } = await acquireResourcesForJob({
+    // resolveOneResource ya registra, para cada recurso, la consulta,
+    // los candidatos evaluados (con su puntaje), el elegido con su
+    // licencia/procedencia, o el motivo del rechazo -- no se repite ese
+    // detalle acá (quedaría tres veces en el log: acá, adentro, y en el
+    // resumen de pendingResources más abajo).
+    ({ resources: updatedResources } = await acquireResourcesForJob({
       resources: job.resources,
       apiKey,
       cacheDir: RESOURCE_CACHE_DIR,
@@ -727,9 +731,6 @@ const acquireResourcesIfNeeded = async (jobId, job) => {
       jobId,
       log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
     }));
-    for (const issue of issues) {
-      console.log(`[job ${jobId}]   ${issue}`);
-    }
   }
 
   job.resources = updatedResources;
@@ -1003,12 +1004,30 @@ app.get("/jobs", (req, res) => {
   res.json(all);
 });
 
-app.get("/jobs/:id", (req, res) => {
+/**
+ * Además del estado en memoria, incluye `resources`/`pendingResources`
+ * del job guardado en disco (01-nov-2026, pedido para poder revisar un
+ * job sin acceso al disco del VPS) -- de solo lectura, no llama a
+ * ningún modelo, no persiste ni modifica nada. Si el archivo del job no
+ * existe (ya limpiado, o el job nunca llegó a escribirse), simplemente
+ * se omiten esos dos campos -- nunca falla la respuesta por eso.
+ */
+app.get("/jobs/:id", async (req, res) => {
   const status = jobs.get(req.params.id);
   if (!status) {
     return res.status(404).json({ error: "jobId desconocido." });
   }
-  res.json({ jobId: req.params.id, ...status });
+  let resources;
+  let pendingResources;
+  try {
+    const job = JSON.parse(await fsp.readFile(jobFilePath(req.params.id), "utf8"));
+    resources = job.resources;
+    pendingResources = job.pendingResources;
+  } catch {
+    // Sin archivo de job en disco (todavía no se escribió, o ya se
+    // limpió) -- se responde igual, solo sin estos dos campos.
+  }
+  res.json({ jobId: req.params.id, ...status, resources, pendingResources });
 });
 
 /**

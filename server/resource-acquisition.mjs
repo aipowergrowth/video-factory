@@ -94,6 +94,17 @@ export const pickBestHit = (hits, query, minOverlap = MIN_KEYWORD_OVERLAP) => {
   return bestScore >= minOverlap ? { hit: best, score: bestScore } : null;
 };
 
+/**
+ * Describe cada candidato de una búsqueda (id + puntaje de coincidencia
+ * léxica contra la consulta) para el log -- pedido explícito de Alex
+ * (01-nov-2026): el log debe mostrar "los candidatos", no solo cuántos
+ * hubo. Nunca incluye nada de la clave de la API.
+ */
+const describeHitsForLog = (hits, query) =>
+  (hits ?? [])
+    .map((hit) => `#${hit.id}(score=${scoreKeywordOverlap(query, hit.tags)})`)
+    .join(", ") || "ninguno";
+
 const slugifyForCacheKey = (text) => [...tokenize(text)].sort().join("-");
 
 const cacheFilePath = (cacheDir, mediaType, query) =>
@@ -164,7 +175,7 @@ export const __setDownloadToFileForTesting = (fn) => {
 export const searchPixabay = async ({ apiKey, query, mediaType, lang = "es", cacheDir, log = () => {} }) => {
   const cached = await readCache(cacheDir, mediaType, query);
   if (cached) {
-    log(`Pixabay (${mediaType}): "${query}" -- resultado en caché (sin llamar a la API).`);
+    log(`Pixabay (${mediaType}): "${query}" -- resultado en caché (sin llamar a la API) -- candidatos: ${describeHitsForLog(cached, query)}.`);
     return cached;
   }
 
@@ -191,7 +202,7 @@ export const searchPixabay = async ({ apiKey, query, mediaType, lang = "es", cac
 
   const hits = Array.isArray(payload.hits) ? payload.hits : [];
   await writeCache(cacheDir, mediaType, query, hits);
-  log(`Pixabay (${mediaType}): "${query}" -- ${hits.length} candidato(s), cacheados por 24h.`);
+  log(`Pixabay (${mediaType}): "${query}" -- ${hits.length} candidato(s), cacheados por 24h -- candidatos: ${describeHitsForLog(hits, query)}.`);
   return hits;
 };
 
@@ -213,9 +224,11 @@ const extensionFor = (url, fallback) => {
  */
 export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir, jobId, lang = "es", log = () => {} }) => {
   if (resource.resolvedAsset || resource.acquisitionFailureReason) {
+    log(`Pixabay: recurso "${resource.id}" ya estaba resuelto de una corrida anterior (${resource.resolvedAsset ? `asset #${resource.resolvedAsset.assetId}` : "descartado"}) -- no se vuelve a consultar.`);
     return resource;
   }
   if (!resource.visualQuery || resource.visualQuery.trim().length === 0) {
+    log(`Pixabay: recurso "${resource.id}" (${resource.type}) sin "visualQuery" -- se descarta sin buscar.`);
     return {
       ...resource,
       acquisitionFailureReason: `recurso "${resource.type}" sin "visualQuery" -- el planificador no dio una consulta visual concreta para buscar.`,
@@ -227,19 +240,17 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
   const best = pickBestHit(hits, resource.visualQuery);
 
   if (!best) {
-    return {
-      ...resource,
-      acquisitionFailureReason: `no se encontró en Pixabay un resultado con buena coincidencia de palabras clave para "${resource.visualQuery}" (${hits.length} candidato(s) evaluado(s)).`,
-    };
+    const reason = `no se encontró en Pixabay un resultado con buena coincidencia de palabras clave para "${resource.visualQuery}" (${hits.length} candidato(s) evaluado(s): ${describeHitsForLog(hits, resource.visualQuery)}).`;
+    log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
+    return { ...resource, acquisitionFailureReason: reason };
   }
 
-  const { hit } = best;
+  const { hit, score } = best;
   const sourceUrl = mediaType === "video" ? pickVideoUrl(hit) : pickImageUrl(hit);
   if (!sourceUrl) {
-    return {
-      ...resource,
-      acquisitionFailureReason: `Pixabay devolvió un candidato para "${resource.visualQuery}" sin una URL de descarga utilizable.`,
-    };
+    const reason = `Pixabay devolvió el candidato #${hit.id} para "${resource.visualQuery}" sin una URL de descarga utilizable.`;
+    log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
+    return { ...resource, acquisitionFailureReason: reason };
   }
 
   const ext = extensionFor(sourceUrl, mediaType === "video" ? "mp4" : "jpg");
@@ -251,17 +262,25 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
   const relativePath = `uploads/resources/${jobId}/${resource.id}.${ext}`;
   const destPath = path.join(assetsDir, jobId, `${resource.id}.${ext}`);
 
-  if (!fs.existsSync(destPath)) {
+  const alreadyOnDisk = fs.existsSync(destPath);
+  if (!alreadyOnDisk) {
     try {
       await downloadToFile(sourceUrl, destPath);
-      log(`Pixabay: descargado "${resource.visualQuery}" -> ${relativePath} (id ${hit.id}).`);
     } catch (err) {
-      return {
-        ...resource,
-        acquisitionFailureReason: `se encontró un candidato para "${resource.visualQuery}" pero falló la descarga (${err.message ?? err}).`,
-      };
+      const reason = `se eligió el candidato #${hit.id} (score=${score}) para "${resource.visualQuery}" pero falló la descarga (${err.message ?? err}).`;
+      log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
+      return { ...resource, acquisitionFailureReason: reason };
     }
   }
+
+  const mediaTypeFinal = mediaType === "video" ? "video" : hit.type === "illustration" ? "illustration" : "photo";
+  const licenseName = "Pixabay Content License";
+  const attributionRequired = false;
+  log(
+    `Pixabay: ELEGIDO recurso "${resource.id}" -> candidato #${hit.id} (score=${score} de ${hits.length} evaluado(s): ${describeHitsForLog(hits, resource.visualQuery)}) ` +
+      `-- autor "${hit.user}", tipo ${mediaTypeFinal}, licencia "${licenseName}" (${PIXABAY_LICENSE_URL}, atribución ${attributionRequired ? "obligatoria" : "no obligatoria"}), ` +
+      `página ${hit.pageURL}, ${alreadyOnDisk ? "ya estaba en disco" : "descargado ahora"} -> ${relativePath}.`,
+  );
 
   return {
     ...resource,
@@ -270,11 +289,11 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
       assetId: hit.id,
       pageUrl: hit.pageURL,
       localPath: relativePath,
-      mediaType: mediaType === "video" ? "video" : hit.type === "illustration" ? "illustration" : "photo",
+      mediaType: mediaTypeFinal,
       author: hit.user,
-      licenseName: "Pixabay Content License",
+      licenseName,
       licenseUrl: PIXABAY_LICENSE_URL,
-      attributionRequired: false,
+      attributionRequired,
       downloadedAt: new Date().toISOString(),
     },
   };
