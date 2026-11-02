@@ -5,6 +5,7 @@
     "accentColor": "#E53935",
     "captionBackgroundColor": "rgba(0,0,0,0.6)",
     "captionTextColor": "#ffffff",
-    "defaultCtaText": "Dale like y suscríbete a 'A mí no me cuadra'"
+    "defaultCtaText": "Dale like y suscríbete a 'A mí no me cuadra'",
+    "visualStyle": "ilustración editorial plana (flat design), trazo limpio y geométrico, paleta roja (#E53935), blanco y gris oscuro, sin gradientes complejos ni textura fotorrealista -- aspecto de infografía, nunca de fotografía ni de recreación realista de una escena"
   }
 }

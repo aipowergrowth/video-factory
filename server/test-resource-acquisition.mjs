@@ -30,6 +30,7 @@
 // resource-acquisition.mjs) devuelve ese cliente falso sin tocar la
 // red ni leer ninguna clave real.
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -49,13 +50,16 @@ import {
   searchPixabay,
   resolveOneResource,
   acquireResourcesForJob,
+  createGenerationBudget,
   __setFetchJsonForTesting,
   __setDownloadToFileForTesting,
   __setRelevanceValidatorForTesting,
   __setVisualValidatorForTesting,
   __setDownloadBytesForTesting,
+  __setGeneratedImageValidatorForTesting,
 } from "./resource-acquisition.mjs";
 import { __setAnthropicClientForTesting } from "./editorial.mjs";
+import { __setImageGeneratorForTesting, GEMINI_IMAGE_MODEL } from "./image-generation.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -1108,6 +1112,247 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
   const resolved = await resolveOneResource({ resource: already, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test" });
   check("resolveOneResource: ya resuelto -- no vuelve a buscar", called === false && resolved.resolvedAsset.assetId === 1);
   __setFetchJsonForTesting(null);
+}
+
+// --- Generación con IA (último recurso, autorizado por Alex el
+// 02-nov-2026) -------------------------------------------------------
+
+/** Validador falso (Capa C sobre imagen generada) que siempre aprueba. */
+const acceptGeneratedImage = async () => ({ aprobado: true, motivo: "simulado: la ilustración corresponde a la consulta", usage: { input_tokens: 300, output_tokens: 16 } });
+
+{
+  // "must-be-real" NUNCA se genera, aunque Pixabay falle del todo --
+  // queda pendiente con el motivo de Pixabay, como siempre, y la
+  // generación NUNCA se llama.
+  let generatorCalls = 0;
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  __setImageGeneratorForTesting(async () => {
+    generatorCalls++;
+    return { buffer: Buffer.from("img"), mimeType: "image/png", costUsd: 0.0336, usage: null };
+  });
+  const resource = { id: "gen-must-be-real", type: "image", description: "x", visualQuery: "estudio de la UCSF sobre dopamina", veracityRequirement: "must-be-real" };
+  const resolved = await resolveOneResource({
+    resource,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-must-be-real"),
+    assetsDir,
+    jobId: "job-test",
+    imageGenerationApiKey: "fake-gemini-key",
+  });
+  check("must-be-real: nunca se genera, queda pendiente con el motivo de Pixabay", resolved.resolvedAsset === undefined && generatorCalls === 0);
+  __setFetchJsonForTesting(null);
+  __setImageGeneratorForTesting(null);
+}
+
+{
+  // "illustrative-ok" pero SIN clave de Gemini configurada: nunca
+  // intenta generar (no truena, no asume nada) -- queda pendiente con
+  // el motivo de Pixabay.
+  let generatorCalls = 0;
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  __setImageGeneratorForTesting(async () => {
+    generatorCalls++;
+    return { buffer: Buffer.from("img"), mimeType: "image/png", costUsd: 0.0336, usage: null };
+  });
+  const resource = { id: "gen-sin-clave", type: "image", description: "x", visualQuery: "ilustración de neuronas", veracityRequirement: "illustrative-ok" };
+  const logLines = [];
+  const resolved = await resolveOneResource({
+    resource,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-sin-clave"),
+    assetsDir,
+    jobId: "job-test",
+    log: (m) => logLines.push(m),
+    // imageGenerationApiKey: ausente a propósito
+  });
+  check("sin clave de Gemini: nunca se intenta generar", resolved.resolvedAsset === undefined && generatorCalls === 0);
+  check("log: explica que falta la clave de Gemini", logLines.some((l) => l.includes("no hay clave de Gemini configurada")));
+  __setFetchJsonForTesting(null);
+  __setImageGeneratorForTesting(null);
+}
+
+{
+  // Caso sano: Pixabay falla, "illustrative-ok", hay clave -- se
+  // genera, la validación visual (inyectada) aprueba, el recurso
+  // queda ACEPTADO con la procedencia completa.
+  let generatorCalls = 0;
+  let validatorCalls = 0;
+  let capturedPrompt = null;
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  __setImageGeneratorForTesting(async ({ prompt }) => {
+    generatorCalls++;
+    capturedPrompt = prompt;
+    return { buffer: Buffer.from("imagen-generada-falsa"), mimeType: "image/png", costUsd: 0.0336, usage: null };
+  });
+  __setGeneratedImageValidatorForTesting(async (args) => {
+    validatorCalls++;
+    return acceptGeneratedImage(args);
+  });
+  const resource = { id: "gen-caso-sano", type: "image", description: "x", visualQuery: "ilustración de neuronas transmitiendo señales", veracityRequirement: "illustrative-ok" };
+  const logLines = [];
+  const resolved = await resolveOneResource({
+    resource,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-caso-sano"),
+    assetsDir,
+    jobId: "job-test",
+    log: (m) => logLines.push(m),
+    imageGenerationApiKey: "fake-gemini-key",
+    visualStyle: "trazo grueso, paleta azul",
+  });
+  check("caso sano: se generó y se aceptó", resolved.resolvedAsset?.provider === "google-gemini");
+  check("caso sano: se llamó exactamente 1 vez al generador y 1 vez al validador", generatorCalls === 1 && validatorCalls === 1);
+  check("caso sano: el prompt incluye el estilo del canal", capturedPrompt?.includes("trazo grueso, paleta azul"));
+  check(
+    "caso sano: resolvedAsset trae toda la procedencia pedida (model, prompt, costUsd, generatedAt, synthetic, licenseName, attributionRequired)",
+    resolved.resolvedAsset?.model === GEMINI_IMAGE_MODEL &&
+      resolved.resolvedAsset?.prompt === capturedPrompt &&
+      resolved.resolvedAsset?.costUsd === 0.0336 &&
+      typeof resolved.resolvedAsset?.generatedAt === "string" &&
+      resolved.resolvedAsset?.synthetic === true &&
+      typeof resolved.resolvedAsset?.licenseName === "string" &&
+      resolved.resolvedAsset?.attributionRequired === false,
+  );
+  check("caso sano: mediaType es 'generated-illustration' (para que el render no lo trate como un video real)", resolved.resolvedAsset?.mediaType === "generated-illustration");
+  check("caso sano: el archivo se escribió en disco en la ruta registrada", fsSync.existsSync(path.join(assetsDir, "job-test", path.basename(resolved.resolvedAsset.localPath))));
+  const elegidoLine = logLines.find((l) => l.includes("Generación con IA: ELEGIDO"));
+  check("log: hay una línea ELEGIDO con el modelo, el costo y el prompt -- nunca una clave", elegidoLine?.includes(GEMINI_IMAGE_MODEL) && elegidoLine?.includes("0.0336") && !elegidoLine.includes("fake-gemini-key"));
+  __setFetchJsonForTesting(null);
+  __setImageGeneratorForTesting(null);
+  __setGeneratedImageValidatorForTesting(null);
+}
+
+{
+  // La imagen se genera (y se cobra) pero la validación visual la
+  // rechaza -- nunca se inserta, nunca se escribe a disco, el motivo
+  // queda registrado.
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  __setImageGeneratorForTesting(async () => ({ buffer: Buffer.from("img"), mimeType: "image/png", costUsd: 0.0336, usage: null }));
+  __setGeneratedImageValidatorForTesting(async () => ({ aprobado: false, motivo: "la ilustración muestra algo distinto a lo pedido", usage: { input_tokens: 300, output_tokens: 15 } }));
+  const resource = { id: "gen-rechazado-por-validacion", type: "broll", description: "x", visualQuery: "cazadores prehistóricos persiguiendo presa", veracityRequirement: "illustrative-ok" };
+  const resolved = await resolveOneResource({
+    resource,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-rechazado"),
+    assetsDir,
+    jobId: "job-test",
+    imageGenerationApiKey: "fake-gemini-key",
+  });
+  check("rechazado por validación: NUNCA se inserta", resolved.resolvedAsset === undefined);
+  check("rechazado por validación: el motivo incluye lo que dijo la validación", resolved.acquisitionFailureReason?.includes("algo distinto a lo pedido"));
+  __setFetchJsonForTesting(null);
+  __setImageGeneratorForTesting(null);
+  __setGeneratedImageValidatorForTesting(null);
+}
+
+{
+  // La generación falla técnicamente en los dos intentos -- nunca se
+  // inserta, y el presupuesto del video NO se gasta (nunca se produjo
+  // una imagen real que Google haya facturado).
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  __setImageGeneratorForTesting(async () => {
+    throw new Error("Gemini respondió HTTP 500 (simulado)");
+  });
+  const budget = createGenerationBudget();
+  const resource = { id: "gen-falla-tecnica", type: "image", description: "x", visualQuery: "ilustración de neuronas", veracityRequirement: "illustrative-ok" };
+  const resolved = await resolveOneResource({
+    resource,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-falla-tecnica"),
+    assetsDir,
+    jobId: "job-test",
+    imageGenerationApiKey: "fake-gemini-key",
+    generationBudget: budget,
+  });
+  check("falla técnica de generación: NUNCA se inserta", resolved.resolvedAsset === undefined);
+  check("falla técnica: el presupuesto del video no se gastó (ninguna imagen real llegó a cobrarse)", budget.count === 0 && budget.costUsd === 0);
+  __setFetchJsonForTesting(null);
+  __setImageGeneratorForTesting(null);
+}
+
+{
+  // Tope de costo/cantidad del VIDEO (compartido entre recursos, no
+  // por recurso): con el tope ya alcanzado, el siguiente recurso NI
+  // SIQUIERA intenta generar.
+  let generatorCalls = 0;
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  __setImageGeneratorForTesting(async () => {
+    generatorCalls++;
+    return { buffer: Buffer.from("img"), mimeType: "image/png", costUsd: 0.0336, usage: null };
+  });
+  const budgetAgotadoPorCantidad = { maxCount: 1, maxCostUsd: 10, count: 1, costUsd: 0.0336 }; // ya alcanzó el máximo de imágenes
+  const resource = { id: "gen-tope-cantidad", type: "image", description: "x", visualQuery: "ilustración de neuronas", veracityRequirement: "illustrative-ok" };
+  const logLines = [];
+  const resolved = await resolveOneResource({
+    resource,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-tope-cantidad"),
+    assetsDir,
+    jobId: "job-test",
+    log: (m) => logLines.push(m),
+    imageGenerationApiKey: "fake-gemini-key",
+    generationBudget: budgetAgotadoPorCantidad,
+  });
+  check("tope de cantidad alcanzado: no se llama al generador", generatorCalls === 0 && resolved.resolvedAsset === undefined);
+  check("log: el motivo menciona el tope del video", logLines.some((l) => l.includes("tope de costo/cantidad")));
+  check("motivo final: menciona cuántas imágenes/cuánto costo se llevan", resolved.acquisitionFailureReason?.includes("1/1 imágenes"));
+  __setFetchJsonForTesting(null);
+  __setImageGeneratorForTesting(null);
+}
+
+{
+  // Lo mismo, pero el tope alcanzado es por COSTO, no por cantidad.
+  const budgetAgotadoPorCosto = { maxCount: 8, maxCostUsd: 0.03, count: 1, costUsd: 0.0336 }; // ya superó el máximo de dólares
+  const resource = { id: "gen-tope-costo", type: "image", description: "x", visualQuery: "ilustración de neuronas", veracityRequirement: "illustrative-ok" };
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  const resolved = await resolveOneResource({
+    resource,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-tope-costo"),
+    assetsDir,
+    jobId: "job-test",
+    imageGenerationApiKey: "fake-gemini-key",
+    generationBudget: budgetAgotadoPorCosto,
+  });
+  check("tope de costo alcanzado: queda pendiente con ese motivo", resolved.resolvedAsset === undefined && resolved.acquisitionFailureReason?.includes("tope de generación"));
+  __setFetchJsonForTesting(null);
+}
+
+{
+  // acquireResourcesForJob comparte UN SOLO presupuesto entre varios
+  // recursos del mismo job -- con maxCount=1 (vía variable de
+  // entorno), el segundo recurso illustrative-ok NUNCA debe generar
+  // aunque el primero sí haya podido.
+  const prevMax = process.env.IMAGE_GENERATION_MAX_COUNT;
+  process.env.IMAGE_GENERATION_MAX_COUNT = "1";
+  let generatorCalls = 0;
+  __setFetchJsonForTesting(async () => ({ hits: [] }));
+  __setImageGeneratorForTesting(async () => {
+    generatorCalls++;
+    return { buffer: Buffer.from("img"), mimeType: "image/png", costUsd: 0.0336, usage: null };
+  });
+  __setGeneratedImageValidatorForTesting(acceptGeneratedImage);
+  const resources = [
+    { id: "gen-job-r0", type: "image", description: "x", visualQuery: "ilustración de neuronas", veracityRequirement: "illustrative-ok" },
+    { id: "gen-job-r1", type: "image", description: "x", visualQuery: "cazadores en una cueva", veracityRequirement: "illustrative-ok" },
+  ];
+  const { resources: updated, generationBudget } = await acquireResourcesForJob({
+    resources,
+    apiKey: "fake",
+    cacheDir: path.join(tmpDir, "cache-gen-job-compartido"),
+    assetsDir,
+    jobId: "job-test-gen",
+    imageGenerationApiKey: "fake-gemini-key",
+  });
+  check("presupuesto compartido: el primer recurso SÍ se generó", updated.find((r) => r.id === "gen-job-r0").resolvedAsset?.provider === "google-gemini");
+  check("presupuesto compartido: el segundo recurso NO se generó (tope ya alcanzado por el primero)", updated.find((r) => r.id === "gen-job-r1").resolvedAsset === undefined);
+  check("presupuesto compartido: el generador se llamó exactamente 1 vez en todo el job, no 2", generatorCalls === 1);
+  check("presupuesto compartido: el contador final del job refleja 1 imagen", generationBudget.count === 1);
+  if (prevMax === undefined) delete process.env.IMAGE_GENERATION_MAX_COUNT;
+  else process.env.IMAGE_GENERATION_MAX_COUNT = prevMax;
+  __setFetchJsonForTesting(null);
+  __setImageGeneratorForTesting(null);
+  __setGeneratedImageValidatorForTesting(null);
 }
 
 // --- acquireResourcesForJob ---

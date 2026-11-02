@@ -21,6 +21,7 @@ import { runQualityGateWithRemediation } from "./quality-gate.mjs";
 import { resolveCompositorFfprobe, resolveCompositorFfmpeg, binaryEnv } from "./compositor.mjs";
 import { shouldBurnCaptions, buildSrt } from "./subtitles.mjs";
 import { acquireResourcesForJob, readPixabayApiKey } from "./resource-acquisition.mjs";
+import { readGeminiApiKey } from "./image-generation.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -443,6 +444,26 @@ const transcribeJobIfNeeded = async (jobId, job) => {
 // levantar este servidor Express) -- compartidas entre el flujo normal
 // (planEditIfNeeded) y POST /jobs/:id/replan.
 
+/**
+ * Modelo combinado (02-nov-2026): `visualStyle` opcional del perfil
+ * del canal (`public/channels/<canal>/profile.json`, el archivo del
+ * TEMA que ya carga el motor de render para los colores -- no el
+ * `editorial-profile.json` de arriba, que es otro archivo) para que
+ * las imágenes generadas con IA de un mismo canal se vean coherentes.
+ * Sin el archivo o sin el campo, devuelve `undefined` -- nunca lanza;
+ * `buildImageGenerationPrompt` ya tiene su propio estilo genérico de
+ * respaldo (ver image-generation.mjs).
+ */
+const readChannelVisualStyle = async (channel) => {
+  try {
+    const raw = await fsp.readFile(path.join(PROJECT_ROOT, "public/channels", channel, "profile.json"), "utf8");
+    const profile = JSON.parse(raw);
+    return typeof profile?.theme?.visualStyle === "string" ? profile.theme.visualStyle : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const loadChannelEditorialContext = async (channel, layout) => {
   const channelDir = path.join(PROJECT_ROOT, "public/channels", channel);
   const guidelines =
@@ -723,12 +744,23 @@ const acquireResourcesIfNeeded = async (jobId, job) => {
     // licencia/procedencia, o el motivo del rechazo -- no se repite ese
     // detalle acá (quedaría tres veces en el log: acá, adentro, y en el
     // resumen de pendingResources más abajo).
+    //
+    // Modelo combinado (02-nov-2026): si Pixabay no encuentra nada, el
+    // mismo `resolveOneResource` intenta generación con IA -- solo
+    // para "illustrative-ok", solo si hay clave de Gemini configurada
+    // (su ausencia NUNCA detiene el job, simplemente esos recursos
+    // quedan pendientes con el motivo de Pixabay, igual que hoy sin
+    // la clave de Gemini creada todavía).
+    const imageGenerationApiKey = readGeminiApiKey();
+    const visualStyle = await readChannelVisualStyle(job.channel);
     ({ resources: updatedResources } = await acquireResourcesForJob({
       resources: job.resources,
       apiKey,
       cacheDir: RESOURCE_CACHE_DIR,
       assetsDir: RESOURCE_ASSETS_DIR,
       jobId,
+      imageGenerationApiKey,
+      visualStyle,
       log: (msg) => console.log(`[job ${jobId}]   ${msg}`),
     }));
   }

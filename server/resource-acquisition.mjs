@@ -53,6 +53,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { getClient } from "./editorial.mjs";
+import { buildImageGenerationPrompt, generateImageWithRetry, GEMINI_IMAGE_MODEL } from "./image-generation.mjs";
 
 /**
  * Misma convención que la clave de Anthropic (editorial.mjs#readApiKey) y
@@ -844,6 +845,108 @@ const runVisualValidation = async ({ query, finalists, chosenIdFromCapaB, mediaT
   return { approved: null, approvedMotivo: null, attempts };
 };
 
+// --- Generación con IA (último recurso, autorizado por Alex el
+// 02-nov-2026, tras la propuesta del modelo combinado): cuando
+// Pixabay (Capa A+B+C arriba) no encuentra NADA pertinente Y el
+// planificador marcó el recurso como `veracityRequirement:
+// "illustrative-ok"` -- un recurso "must-be-real" NUNCA llega acá, se
+// queda pendiente exactamente como hoy (Fase 3C). Decisiones cerradas
+// de Alex: un solo proveedor (Gemini API, nivel de pago, ver
+// image-generation.mjs), estilo siempre ilustrativo/esquemático,
+// nunca fotorrealista, y un `broll` sin cobertura se resuelve con una
+// imagen FIJA (nunca un video real) -- el componente de render decide
+// por el tipo del asset resuelto, no solo por `resource.type` (ver
+// ResourceRenderer.tsx). -------------------------------------------
+
+// Tope por VIDEO (no por recurso), decisión explícita de Alex: 8
+// imágenes o US$0.30, lo que ocurra primero -- configurable sin tocar
+// código. Al llegar al tope, los recursos restantes quedan pendientes
+// con ese motivo; nunca se sigue generando sin límite.
+const GENERATION_MAX_COUNT_DEFAULT = 8;
+const GENERATION_MAX_COST_USD_DEFAULT = 0.3;
+
+/** Un contador por JOB (no por recurso) -- `acquireResourcesForJob` crea uno y lo comparte entre todos sus recursos. */
+export const createGenerationBudget = () => ({
+  maxCount: Number(process.env.IMAGE_GENERATION_MAX_COUNT) || GENERATION_MAX_COUNT_DEFAULT,
+  maxCostUsd: Number(process.env.IMAGE_GENERATION_MAX_COST_USD) || GENERATION_MAX_COST_USD_DEFAULT,
+  count: 0,
+  costUsd: 0,
+});
+
+/**
+ * Igual que la Capa C de Pixabay en el fondo -- mismo modelo, mismo
+ * formato de prompt/respuesta (reutiliza `buildVisualPrompt()` y
+ * `parseVisualResponse()`, funciones puras sin nada específico de
+ * Pixabay) -- pero para una imagen YA EN MEMORIA (generada con IA,
+ * nunca descargada de una URL). A propósito es una función APARTE: no
+ * se tocó ni se reescribió `realEvaluateCandidateVisually` ni su
+ * cascada -- límite explícito de esta tarea (no tocar la Capa C real
+ * de Pixabay, ya validada con datos reales).
+ */
+const realEvaluateGeneratedImageVisually = async ({ query, imageBytes, mimeType }) => {
+  if (!mimeType || !SUPPORTED_IMAGE_CONTENT_TYPES.has(mimeType)) {
+    throw new Error(mimeType ? `la imagen generada vino con un tipo no soportado ("${mimeType}").` : "la imagen generada no tiene un tipo reconocible.");
+  }
+  const client = getClient();
+  const response = await client.messages.create({
+    model: RELEVANCE_MODEL,
+    max_tokens: VISUAL_MAX_OUTPUT_TOKENS,
+    thinking: { type: "disabled" },
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mimeType, data: imageBytes.toString("base64") } },
+          { type: "text", text: buildVisualPrompt(query) },
+        ],
+      },
+    ],
+  });
+  const usage = response.usage ?? { input_tokens: 0, output_tokens: 0 };
+  const contentBlocks = response.content ?? [];
+  const text = contentBlocks
+    .filter((b) => b.type === "text")
+    .map((b) => b.text ?? "")
+    .join("");
+  try {
+    const { aprobado, motivo } = parseVisualResponse(text);
+    return { aprobado, motivo, usage };
+  } catch (err) {
+    const blockTypes = contentBlocks.map((b) => b.type).join(", ") || "ninguno";
+    const diagnosed = new Error(
+      `${err.message} -- diagnóstico: stop_reason="${response.stop_reason ?? "desconocido"}", bloques de contenido=[${blockTypes}], tokens=${usage.input_tokens ?? 0} entrada / ${usage.output_tokens ?? 0} salida.`,
+    );
+    diagnosed.usage = usage;
+    throw diagnosed;
+  }
+};
+let evaluateGeneratedImageVisually = realEvaluateGeneratedImageVisually;
+/** Solo para pruebas: nunca llama a la API real de Anthropic. */
+export const __setGeneratedImageValidatorForTesting = (fn) => {
+  evaluateGeneratedImageVisually = fn ?? realEvaluateGeneratedImageVisually;
+};
+
+/** Mismo criterio de reintento que la Capa C de Pixabay. */
+const evaluateGeneratedImageVisuallyWithRetry = async ({ query, imageBytes, mimeType, resourceId, log }) => {
+  let lastErr;
+  let spentOnFailedAttemptsUsd = 0;
+  for (let attempt = 1; attempt <= VISUAL_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await evaluateGeneratedImageVisually({ query, imageBytes, mimeType });
+    } catch (err) {
+      lastErr = err;
+      const attemptCostUsd = computeRelevanceCallCostUsd(err.usage);
+      spentOnFailedAttemptsUsd += attemptCostUsd;
+      log(
+        `Generación con IA: Capa C -- intento ${attempt}/${VISUAL_MAX_ATTEMPTS} para "${resourceId}" falló (${err.message}) -- costo de ese intento: $${attemptCostUsd.toFixed(6)}.` +
+          (attempt < VISUAL_MAX_ATTEMPTS ? " Reintentando una vez." : ""),
+      );
+    }
+  }
+  lastErr.spentOnFailedAttemptsUsd = spentOnFailedAttemptsUsd;
+  throw lastErr;
+};
+
 /**
  * Resuelve UN recurso `broll`/`image` contra Pixabay: busca (con
  * caché), filtra finalistas por palabras clave (Capa A), valida el
@@ -851,15 +954,11 @@ const runVisualValidation = async ({ query, finalists, chosenIdFromCapaB, mediaT
  * confirma con la miniatura REAL (Capa C, visual, sobre el elegido de
  * la Capa B y -- si lo rechaza -- los demás finalistas en orden de
  * puntaje), descarga SOLO el archivo finalmente aprobado, y arma el
- * registro de licencia. Si ya tenía `resolvedAsset` o
- * `acquisitionFailureReason` de una corrida anterior, no vuelve a
- * tocar nada (idempotente).
+ * registro de licencia. Es el cuerpo EXACTO de la función que existía
+ * antes de la generación con IA -- renombrada tal cual, sin tocar su
+ * lógica (límite explícito: no reescribir la Capa A/B/C de Pixabay).
  */
-export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir, jobId, lang = "es", log = () => {} }) => {
-  if (resource.resolvedAsset || resource.acquisitionFailureReason) {
-    log(`Pixabay: recurso "${resource.id}" ya estaba resuelto de una corrida anterior (${resource.resolvedAsset ? `asset #${resource.resolvedAsset.assetId}` : "descartado"}) -- no se vuelve a consultar.`);
-    return resource;
-  }
+const tryResolveFromPixabay = async ({ resource, apiKey, cacheDir, assetsDir, jobId, lang = "es", log = () => {} }) => {
   if (!resource.visualQuery || resource.visualQuery.trim().length === 0) {
     log(`Pixabay: recurso "${resource.id}" (${resource.type}) sin "visualQuery" -- se descarta sin buscar.`);
     return {
@@ -1000,12 +1099,154 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
 };
 
 /**
- * Resuelve TODOS los recursos `broll`/`image` de un job contra Pixabay
- * -- el resto de los recursos (graphic/CTA/text-highlight/etc.) pasan
- * sin tocar. Nunca lanza por un fallo individual: cada recurso que no
- * se pudo resolver queda con `acquisitionFailureReason`, el resto sigue.
+ * Resuelve UN recurso `broll`/`image`: primero Pixabay (Capa A+B+C,
+ * `tryResolveFromPixabay`, sin cambios). Si Pixabay no encuentra nada
+ * Y el planificador marcó el recurso como `veracityRequirement:
+ * "illustrative-ok"`, intenta generación con IA (último recurso,
+ * autorizado por Alex el 02-nov-2026) -- un recurso "must-be-real"
+ * NUNCA llega a generarse, queda pendiente con el motivo de Pixabay,
+ * exactamente como antes. Idempotente: si ya tenía `resolvedAsset` o
+ * `acquisitionFailureReason` de una corrida anterior, no vuelve a
+ * tocar nada (ni Pixabay ni generación).
  */
-export const acquireResourcesForJob = async ({ resources, apiKey, cacheDir, assetsDir, jobId, lang = "es", log = () => {} }) => {
+export const resolveOneResource = async ({
+  resource,
+  apiKey,
+  cacheDir,
+  assetsDir,
+  jobId,
+  lang = "es",
+  log = () => {},
+  imageGenerationApiKey,
+  visualStyle,
+  generationBudget,
+}) => {
+  if (resource.resolvedAsset || resource.acquisitionFailureReason) {
+    log(`Pixabay: recurso "${resource.id}" ya estaba resuelto de una corrida anterior (${resource.resolvedAsset ? `asset #${resource.resolvedAsset.assetId}` : "descartado"}) -- no se vuelve a consultar.`);
+    return resource;
+  }
+
+  const pixabayResult = await tryResolveFromPixabay({ resource, apiKey, cacheDir, assetsDir, jobId, lang, log });
+  if (pixabayResult.resolvedAsset) {
+    return pixabayResult;
+  }
+
+  // Pixabay (Capa A+B+C) no encontró nada -- único paso extra:
+  // generación con IA, solo para "illustrative-ok". "must-be-real" (o
+  // sin el campo) nunca se genera -- queda pendiente con el motivo de
+  // Pixabay, Fase 3C sigue sin tocarse.
+  if (resource.veracityRequirement !== "illustrative-ok") {
+    return pixabayResult;
+  }
+  if (!imageGenerationApiKey) {
+    log(`Generación con IA: recurso "${resource.id}" es "illustrative-ok" pero no hay clave de Gemini configurada -- queda pendiente con el motivo de Pixabay.`);
+    return pixabayResult;
+  }
+
+  const budget = generationBudget ?? createGenerationBudget();
+  if (budget.count >= budget.maxCount || budget.costUsd >= budget.maxCostUsd) {
+    const reason =
+      `${pixabayResult.acquisitionFailureReason} -- además, se alcanzó el tope de generación con IA para este video ` +
+      `(${budget.count}/${budget.maxCount} imágenes, $${budget.costUsd.toFixed(4)}/$${budget.maxCostUsd.toFixed(2)}) -- los recursos restantes quedan pendientes.`;
+    log(`Generación con IA: RECHAZADO recurso "${resource.id}" -- tope de costo/cantidad del video alcanzado.`);
+    return { ...pixabayResult, acquisitionFailureReason: reason };
+  }
+
+  const prompt = buildImageGenerationPrompt(resource.visualQuery, visualStyle);
+  let generated;
+  try {
+    generated = await generateImageWithRetry({ apiKey: imageGenerationApiKey, prompt, resourceId: resource.id, log });
+  } catch (err) {
+    const spentUsd = err.spentOnFailedAttemptsUsd ?? 0;
+    const reason =
+      `${pixabayResult.acquisitionFailureReason} -- además, la generación con IA falló tras 2 intento(s) (${err.message ?? err}) -- ` +
+      `costo gastado en los intentos: $${spentUsd.toFixed(6)} -- se conserva el presentador en pantalla en vez de insertar una imagen sin generar.`;
+    log(`Generación con IA: RECHAZADO recurso "${resource.id}" -- ${reason}`);
+    return { ...pixabayResult, acquisitionFailureReason: reason };
+  }
+
+  // Se generó una imagen real -- cuenta para el tope del video sin
+  // importar lo que decida la validación a continuación (Google ya la
+  // facturó; un fallo/rechazo de Claude no la hace gratis).
+  budget.count += 1;
+  budget.costUsd += generated.costUsd;
+  log(
+    `Generación con IA: imagen generada para "${resource.id}" -- modelo ${GEMINI_IMAGE_MODEL}, costo real: $${generated.costUsd.toFixed(6)} -- ` +
+      `acumulado del video: ${budget.count}/${budget.maxCount} imágenes, $${budget.costUsd.toFixed(4)}/$${budget.maxCostUsd.toFixed(2)}.`,
+  );
+
+  let verdictVisual;
+  try {
+    verdictVisual = await evaluateGeneratedImageVisuallyWithRetry({
+      query: resource.visualQuery,
+      imageBytes: generated.buffer,
+      mimeType: generated.mimeType,
+      resourceId: resource.id,
+      log,
+    });
+  } catch (err) {
+    const spentUsd = err.spentOnFailedAttemptsUsd ?? 0;
+    const reason =
+      `${pixabayResult.acquisitionFailureReason} -- se generó una imagen pero la validación visual falló tras 2 intento(s) (${err.message ?? err}) -- ` +
+      `costo gastado en la validación: $${spentUsd.toFixed(6)} -- se conserva el presentador en pantalla.`;
+    log(`Generación con IA: RECHAZADO recurso "${resource.id}" -- ${reason}`);
+    return { ...pixabayResult, acquisitionFailureReason: reason };
+  }
+
+  const validationCostUsd = computeRelevanceCallCostUsd(verdictVisual.usage);
+  log(
+    `Generación con IA: validación visual para "${resource.id}" -- veredicto: ${verdictVisual.aprobado ? "APROBADO" : "rechazado"} -- motivo: "${verdictVisual.motivo}" -- ` +
+      `tokens: ${verdictVisual.usage.input_tokens ?? 0} entrada / ${verdictVisual.usage.output_tokens ?? 0} salida -- costo real: $${validationCostUsd.toFixed(6)}.`,
+  );
+
+  if (!verdictVisual.aprobado) {
+    const reason =
+      `${pixabayResult.acquisitionFailureReason} -- se generó una imagen con IA pero la validación visual la rechazó: ${verdictVisual.motivo} -- ` +
+      `se conserva el presentador en pantalla en vez de insertar una imagen generada equivocada.`;
+    log(`Generación con IA: RECHAZADO recurso "${resource.id}" -- ${reason}`);
+    return { ...pixabayResult, acquisitionFailureReason: reason };
+  }
+
+  const ext = generated.mimeType === "image/png" ? "png" : generated.mimeType === "image/webp" ? "webp" : "jpg";
+  const relativePath = `uploads/resources/${jobId}/${resource.id}-generado.${ext}`;
+  const destPath = path.join(assetsDir, jobId, `${resource.id}-generado.${ext}`);
+  await fsp.mkdir(path.dirname(destPath), { recursive: true });
+  await fsp.writeFile(destPath, generated.buffer);
+
+  log(
+    `Generación con IA: ELEGIDO recurso "${resource.id}" -> imagen generada (modelo ${GEMINI_IMAGE_MODEL}, costo generación $${generated.costUsd.toFixed(6)} + validación $${validationCostUsd.toFixed(6)}) ` +
+      `-- motivo de la validación: "${verdictVisual.motivo}" -- prompt: "${prompt}" -- guardado en ${relativePath}.`,
+  );
+
+  return {
+    ...resource,
+    resolvedAsset: {
+      provider: "google-gemini",
+      model: GEMINI_IMAGE_MODEL,
+      prompt,
+      localPath: relativePath,
+      mediaType: "generated-illustration",
+      licenseName: "Generado con Gemini API -- Google no reclama propiedad sobre el contenido generado; uso comercial permitido en el nivel de pago (ver ai.google.dev/gemini-api/terms, confirmado 02-nov-2026).",
+      attributionRequired: false,
+      costUsd: generated.costUsd,
+      generatedAt: new Date().toISOString(),
+      synthetic: true,
+    },
+  };
+};
+
+/**
+ * Resuelve TODOS los recursos `broll`/`image` de un job: primero
+ * Pixabay, y -- si hace falta y corresponde -- generación con IA (ver
+ * `resolveOneResource`) -- el resto de los recursos
+ * (graphic/CTA/text-highlight/etc.) pasan sin tocar. Nunca lanza por
+ * un fallo individual: cada recurso que no se pudo resolver queda con
+ * `acquisitionFailureReason`, el resto sigue. El tope de generación
+ * (`createGenerationBudget`) es UN SOLO contador compartido por TODOS
+ * los recursos de este job -- no por recurso.
+ */
+export const acquireResourcesForJob = async ({ resources, apiKey, cacheDir, assetsDir, jobId, lang = "es", log = () => {}, imageGenerationApiKey, visualStyle }) => {
+  const generationBudget = createGenerationBudget();
   const updated = [];
   const issues = [];
   for (const resource of resources ?? []) {
@@ -1013,11 +1254,11 @@ export const acquireResourcesForJob = async ({ resources, apiKey, cacheDir, asse
       updated.push(resource);
       continue;
     }
-    const resolved = await resolveOneResource({ resource, apiKey, cacheDir, assetsDir, jobId, lang, log });
+    const resolved = await resolveOneResource({ resource, apiKey, cacheDir, assetsDir, jobId, lang, log, imageGenerationApiKey, visualStyle, generationBudget });
     updated.push(resolved);
     if (resolved.acquisitionFailureReason) {
       issues.push(`recurso "${resolved.id}" (${resolved.type}): ${resolved.acquisitionFailureReason}`);
     }
   }
-  return { resources: updated, issues };
+  return { resources: updated, issues, generationBudget };
 };

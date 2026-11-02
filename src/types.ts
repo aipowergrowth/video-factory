@@ -197,6 +197,16 @@ export type ChannelProfile = {
      * enlaces, usuarios ni nombres de perfil inventados.
      */
     defaultCtaText: string;
+    /**
+     * Opcional (02-nov-2026, modelo combinado): guía de estilo visual
+     * que se inyecta en el prompt de generación con IA cuando Pixabay
+     * no encuentra nada pertinente -- para que las ilustraciones
+     * generadas de un mismo canal se vean coherentes entre sí. Sin
+     * esto, `buildImageGenerationPrompt` usa un estilo genérico
+     * razonable (ver server/image-generation.mjs) -- nunca deja el
+     * prompt sin ninguna guía.
+     */
+    visualStyle?: string;
   };
 };
 
@@ -296,19 +306,45 @@ export type Resource = {
    * recurso (nunca se usa un recurso sin esto). `localPath` es una ruta
    * dentro de `public/`, consumible por `staticFile()` (mismo patrón que
    * `input.baseVideo`).
+   *
+   * Modelo combinado (02-nov-2026, autorizado por Alex): si Pixabay no
+   * encontró nada pertinente Y el recurso es `veracityRequirement:
+   * "illustrative-ok"`, puede resolverse con una imagen GENERADA con
+   * IA en su lugar (`provider: "google-gemini"`) -- nunca para
+   * `"must-be-real"`. `mediaType: "generated-illustration"` es la señal
+   * para que el motor de render la trate como una imagen fija (con
+   * movimiento de cámara simulado si el recurso era `broll`), nunca
+   * como un video real -- ver `ResourceRenderer.tsx`.
    */
-  resolvedAsset?: {
-    provider: "pixabay";
-    assetId: number;
-    pageUrl: string;
-    localPath: string;
-    mediaType: "photo" | "illustration" | "video";
-    author: string;
-    licenseName: string;
-    licenseUrl: string;
-    attributionRequired: boolean;
-    downloadedAt: string;
-  };
+  resolvedAsset?:
+    | {
+        provider: "pixabay";
+        assetId: number;
+        pageUrl: string;
+        localPath: string;
+        mediaType: "photo" | "illustration" | "video";
+        author: string;
+        licenseName: string;
+        licenseUrl: string;
+        attributionRequired: boolean;
+        downloadedAt: string;
+      }
+    | {
+        provider: "google-gemini";
+        /** Id exacto del modelo de Gemini usado (ver server/image-generation.mjs). */
+        model: string;
+        /** El prompt EXACTO enviado -- nunca la clave de la API. */
+        prompt: string;
+        localPath: string;
+        mediaType: "generated-illustration";
+        licenseName: string;
+        attributionRequired: false;
+        /** Costo real de la generación (tarifa verificada, no estimada). */
+        costUsd: number;
+        generatedAt: string;
+        /** Siempre `true` -- nunca se presenta como un documento o registro auténtico (Fase 3C es lo opuesto a esto). */
+        synthetic: true;
+      };
 
   /**
    * Fase 3B: si la adquisición automática no encontró un resultado

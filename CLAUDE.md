@@ -204,6 +204,7 @@ node server/test-drive-simulated.mjs
 node server/test-editorial-simulated.mjs
 node server/test-quality-gate.mjs
 node server/test-resource-acquisition.mjs
+node server/test-image-generation.mjs
 node server/test-subtitles.mjs
 node server/test-timeline.mjs
 ```

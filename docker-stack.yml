@@ -39,6 +39,19 @@ services:
       # Mismo patrón que las credenciales de arriba: nunca en texto
       # plano, siempre desde un secreto de Swarm.
       PIXABAY_API_KEY_FILE: "/run/secrets/pixabay_api_key"
+      # Clave de API de Gemini (modelo combinado, 02-nov-2026:
+      # generación de imágenes con IA como último recurso, solo cuando
+      # Pixabay no encuentra nada pertinente). Mismo patrón que las
+      # credenciales de arriba: nunca en texto plano. NO se usa hasta
+      # que Alex confirme que este secreto existe en Portainer -- sin
+      # él, esos recursos simplemente quedan pendientes, igual que hoy.
+      GEMINI_API_KEY_FILE: "/run/secrets/gemini_api_key"
+      # Tope de generación con IA POR VIDEO (no por recurso) -- decisión
+      # explícita de Alex: 8 imágenes o $0.30, lo que ocurra primero.
+      # No son secretos, solo límites de costo -- ajustables acá sin
+      # tocar código ni reconstruir la imagen.
+      IMAGE_GENERATION_MAX_COUNT: "8"
+      IMAGE_GENERATION_MAX_COST_USD: "0.30"
     volumes:
       - fabrica_videos_inputs:/app/public/uploads
       - fabrica_videos_outputs:/data/outputs
@@ -52,6 +65,8 @@ services:
         target: drive_oauth_credentials_json
       - source: vfpixabay_api_key
         target: pixabay_api_key
+      - source: vfgemini_api_key
+        target: gemini_api_key
     deploy:
       replicas: 1
       resources:
@@ -101,4 +116,13 @@ secrets:
   # "source"/"target" de arriba lo monta en /run/secrets/pixabay_api_key,
   # que es lo que espera PIXABAY_API_KEY_FILE.
   vfpixabay_api_key:
+    external: true
+  # Contenido: solo la clave de Gemini (nivel de pago, decisión
+  # cerrada de Alex), sin comillas ni nombre de variable delante --
+  # mismo formato que las demás. El secreto en Portainer debe llamarse
+  # "vfgemini_api_key" -- el "source"/"target" de arriba lo monta en
+  # /run/secrets/gemini_api_key, que es lo que espera
+  # GEMINI_API_KEY_FILE. Sin crear este secreto, los recursos que
+  # necesitarían generación quedan pendientes -- no detiene nada.
+  vfgemini_api_key:
     external: true
