@@ -44,6 +44,8 @@ import {
   RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN,
   pickThumbnailUrl,
   detectImageContentTypeFromBytes,
+  pluralVariants,
+  buildPixabaySearchTerms,
   searchPixabay,
   resolveOneResource,
   acquireResourcesForJob,
@@ -92,6 +94,38 @@ check("tokenize: conserva las palabras significativas de una consulta sin sentid
 check("scoreKeywordOverlap: sin ninguna coincidencia da 0", scoreKeywordOverlap("gato jugando", "car, engine, factory") === 0);
 check("scoreKeywordOverlap: con coincidencia da >0", scoreKeywordOverlap("laboratorio de neurociencia", "laboratorio, ciencia, microscopio") > 0);
 check("matchedTokens: devuelve las palabras que de verdad coincidieron, no solo el número", matchedTokens("persona corriendo al amanecer en un parque", "cachorro, animal, parque").join(",") === "parque");
+
+// --- pluralVariants / matchedTokens con normalización de plural
+// (defecto real, job e707ade8, 01-nov-2026: "neuronas" no coincidía
+// con la etiqueta "neurona", "cazadores" no coincidía con "cazador") ---
+
+check("pluralVariants: 'neuronas' agrega 'neurona' (termina en 's', no 'es')", [...pluralVariants("neuronas")].sort().join(",") === "neurona,neuronas");
+check("pluralVariants: 'cazadores' agrega 'cazador' (termina en 'es')", [...pluralVariants("cazadores")].sort().join(",") === "cazador,cazadores");
+check("pluralVariants: 'senales' agrega 'senal'", [...pluralVariants("senales")].sort().join(",") === "senal,senales");
+check("pluralVariants: palabra corta terminada en 's' no se toca (evita falsos positivos)", [...pluralVariants("bus")].join(",") === "bus");
+check("pluralVariants: palabra sin 's' al final queda igual", [...pluralVariants("cerebro")].join(",") === "cerebro");
+check(
+  "matchedTokens: 'neuronas' (consulta) coincide con la etiqueta 'neurona' (singular)",
+  matchedTokens("ilustración de neuronas", "neurona, cerebro, ciencia").includes("neuronas"),
+);
+check(
+  "matchedTokens: 'cazador' (etiqueta singular) coincide con 'cazadores' en la consulta",
+  matchedTokens("cazadores en la selva", "cazador, selva, naturaleza").includes("cazadores"),
+);
+check(
+  "matchedTokens: NUNCA normaliza formas verbales (límite documentado a propósito) -- 'persiguiendo' no coincide con 'perseguir'",
+  !matchedTokens("persiguiendo a la presa", "perseguir, presa, caza").includes("persiguiendo"),
+);
+
+// --- buildPixabaySearchTerms (hipótesis 1: consultas largas devuelven
+// peores resultados en Pixabay que pocas palabras clave) ---
+
+check(
+  "buildPixabaySearchTerms: una consulta con más de 5 palabras significativas se acota a las primeras 5, en orden",
+  buildPixabaySearchTerms("ilustración científica de neuronas transmitiendo señales con neurotransmisores") === "ilustracion cientifica neuronas transmitiendo senales",
+);
+check("buildPixabaySearchTerms: una consulta corta queda igual (solo tokenizada)", buildPixabaySearchTerms("persona corriendo al amanecer en un parque") === "persona corriendo amanecer parque");
+check("buildPixabaySearchTerms: si no hay ninguna palabra significativa, cae de vuelta a la consulta original (nunca manda una búsqueda vacía)", buildPixabaySearchTerms("a la de en con por") === "a la de en con por");
 
 // --- dedupeTagsString (corrección 01-nov-2026: etiquetas repetidas no deben inflar el prompt/log) ---
 
@@ -343,6 +377,12 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
   check("test-image-0: el motivo queda registrado para pendingResources", typeof resolved.acquisitionFailureReason === "string" && resolved.acquisitionFailureReason.length > 0);
   const rechazadoLine = logLines.find((l) => l.includes("RECHAZADO (capa A)"));
   check("log: RECHAZADO (capa A) menciona el recurso", rechazadoLine?.includes("test-image-0"));
+  // Defecto real (job e707ade8, 01-nov-2026): el log no mostraba las
+  // etiquetas de lo rechazado -- ahora sí, para poder juzgar si el
+  // rechazo fue correcto sin tener que adivinar.
+  const diagnosticoLine = logLines.find((l) => l.includes("diagnóstico de los candidatos mejor puntuados"));
+  check("log: el diagnóstico de la Capa A incluye las etiquetas del candidato rechazado", diagnosticoLine?.includes("#8637542") && diagnosticoLine?.includes("cachorro, animal, mascota, parque"));
+  check("log: el diagnóstico muestra qué palabra coincidió (parque)", diagnosticoLine?.includes("coincidieron: parque"));
   __setFetchJsonForTesting(null);
   __setRelevanceValidatorForTesting(null);
 }
@@ -364,6 +404,82 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
   check("test-image-sin-resultado: la Capa B nunca se llamó", validatorCalls === 0);
   __setFetchJsonForTesting(null);
   __setRelevanceValidatorForTesting(null);
+}
+
+{
+  // Hipótesis 1 (defecto real del job e707ade8): la consulta que de
+  // verdad se le manda a Pixabay debe ser más corta que la descripción
+  // completa del planificador -- se verifica contra la URL REAL
+  // armada por searchPixabay (vía el "q=" que recibe fetchJson), no
+  // solo contra la función pura.
+  let requestedUrl = null;
+  __setFetchJsonForTesting(async (url) => {
+    requestedUrl = url;
+    return { hits: [] };
+  });
+  const resource = {
+    id: "test-consulta-larga",
+    type: "image",
+    description: "x",
+    visualQuery: "ilustración científica de neuronas transmitiendo señales con neurotransmisores",
+  };
+  const logLines = [];
+  await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-consulta-larga"), assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  const sentQParam = new URL(requestedUrl).searchParams.get("q");
+  check("hipótesis 1: a Pixabay se le manda la consulta ACOTADA (5 palabras), no las 6 completas", sentQParam === "ilustracion cientifica neuronas transmitiendo senales");
+  check(
+    "log: se registra tanto la descripción completa del planificador como lo que de verdad se buscó",
+    logLines.some((l) => l.includes("ilustración científica de neuronas transmitiendo señales con neurotransmisores") && l.includes('buscado como "ilustracion cientifica neuronas transmitiendo senales"')),
+  );
+  __setFetchJsonForTesting(null);
+}
+
+{
+  // La normalización de plural puede ser la diferencia entre rechazar
+  // y pasar la Capa A. Consulta de 4 palabras significativas, todas en
+  // plural: "cazadores", "cuevas", "señales", "antiguas". Candidato
+  // con las mismas 3 primeras en SINGULAR más una que no tiene
+  // relación ("piedra"): sin normalizar, ninguna coincide literalmente
+  // (score=0, 0% -- rechazado en la Capa A); con normalización,
+  // "cazadores"<->"cazador", "cuevas"<->"cueva", "señales"<->"señal"
+  // sí coinciden (score=3, 75% -- pasa, y la Capa B/C (inyectadas)
+  // terminan aceptándolo).
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 901, tags: "cazador, cueva, señal, piedra", pageURL: "https://pixabay.com/x/901", webformatURL: "https://cdn.example/901-web.jpg", user: "x" }],
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setRelevanceValidatorForTesting(acceptBestFinalist);
+  __setVisualValidatorForTesting(acceptVisually);
+  const resource = { id: "test-normalizacion-plural", type: "image", description: "x", visualQuery: "cazadores en cuevas con señales antiguas" };
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-normalizacion-plural"), assetsDir, jobId: "job-test" });
+  check(
+    "normalización de plural: sin ella el score sería 0 (0%, rechazado) -- con ella es 3 (75%), pasa y se acepta",
+    resolved.resolvedAsset?.assetId === 901,
+  );
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
+}
+
+{
+  // Caso realista de la HIPÓTESIS (query 1 del job e707ade8): incluso
+  // con normalización de plural y consulta acotada, una consulta de 6
+  // palabras cuyos candidatos no comparten NINGUNA palabra (ni en
+  // singular ni en plural) sigue rechazándose -- la corrección no
+  // inventa relevancia donde no la hay.
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 902, tags: "ciencia, abstracto, fondo, azul", pageURL: "https://pixabay.com/x/902", webformatURL: "https://cdn.example/902-web.jpg", user: "x" }],
+  }));
+  const resource = {
+    id: "test-sin-coincidencia-real",
+    type: "image",
+    description: "x",
+    visualQuery: "ilustración científica de neuronas transmitiendo señales con neurotransmisores",
+  };
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-sin-coincidencia"), assetsDir, jobId: "job-test" });
+  check("sin coincidencia real: sigue rechazado -- la corrección no acepta por una coincidencia superficial", resolved.resolvedAsset === undefined);
+  __setFetchJsonForTesting(null);
 }
 
 {

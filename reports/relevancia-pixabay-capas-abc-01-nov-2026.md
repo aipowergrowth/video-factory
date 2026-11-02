@@ -52,3 +52,36 @@ Un JSON truncado que "alcanza a decir" `aprobado:false` (defecto 1) sigue tratá
 ## Pendiente de validar (nivel 3 — corrida real)
 
 Alex debe repetir `public/jobs/dopamina-fase3b-prueba-pixabay.json` una vez más tras el commit `9c03f18` para confirmar, con datos reales: que #2846221 recibe ahora un veredicto **completo** (sin truncarse) de la Capa C, que #1868496 se procesa sin el error 400, y que el resultado final (aceptado o pendiente) tiene un motivo honesto. Costo esperado: menos de un centavo.
+
+---
+
+## Capítulo 2 — plan real de dopamina: 0 de 3 recursos resueltos (job `e707ade8`)
+
+Alex ejecutó el plan real `planOnly` del video de dopamina (imagen `9c03f18`). Confirmó por fin, con datos reales, el campo de miniatura de video (`videos.<tamaño>.thumbnail` presente con `url/width/height/size/thumbnail`) — queda cerrado ese riesgo. Pero de los 3 recursos que fueron a Pixabay (1 imagen, 2 broll), los 3 se **rechazaron en la Capa A** — las capas B y C nunca llegaron a evaluarse:
+
+| Consulta real | Mejor score | Cobertura | Umbral exigido |
+|---|---|---|---|
+| "ilustración científica de neuronas transmitiendo señales con neurotransmisores" (imagen) | 0/6 | 0% | ≥2 y ≥50% |
+| "cazadores prehistóricos persiguiendo presa en la naturaleza" (broll) | 2/5 | 40% | ≥2 y ≥50% |
+| "persona comprando carne en supermercado moderno" (broll) | 1/5 | 20% | ≥2 y ≥50% |
+
+El log no mostraba las etiquetas de los candidatos rechazados — sin esa evidencia no se podía saber si los 3 rechazos eran correctos o si la Capa A descartó algo útil. Hipótesis del operador (no verificadas en ese momento, sin datos de etiquetas): consultas demasiado largas para la búsqueda de Pixabay, falta de normalización de singular/plural y formas verbales, y un umbral de cobertura quizás demasiado estricto como filtro previo a capas B/C ya robustas.
+
+### Diagnóstico y corrección (commit pendiente de hash final de esta entrega)
+
+**No se pudo obtener la evidencia real de etiquetas sin un nuevo arreglo primero** — se agregó el log que faltaba (`Pixabay: diagnóstico de los candidatos mejor puntuados (capa A)...`, siempre activo, sin costo de IA, imprime etiquetas + score + cobertura + qué palabras coincidieron de los 3 mejores candidatos cuando la Capa A rechaza todo). Esto es lo que debe confirmar la próxima corrida real.
+
+Mientras tanto, dos correcciones justificadas independientemente de los datos de etiquetas (no se tocó ningún umbral):
+
+1. **`buildPixabaySearchTerms()`**: la consulta que de verdad se le manda a Pixabay (parámetro `q`) se acota a las primeras 5 palabras significativas de la descripción del planificador — nunca la consulta usada para puntuar en la Capa A, ni la que validan la Capa B/Capa C, que siguen viendo la descripción completa. Justificación: es una propiedad conocida de los motores de búsqueda por palabras clave (frases largas en lenguaje natural devuelven peores resultados que pocas palabras concretas), no depende de ver las etiquetas reales para ser una mejora razonable. Si 5 resulta ser mucho o poco, es una sola constante para ajustar.
+2. **Normalización de singular/plural** (`pluralVariants()`): `matchedTokens`/`scoreKeywordOverlap` ahora consideran "neuronas"≡"neurona", "cazadores"≡"cazador", etc. (dos reglas: quitar "es" final o quitar "s" final, con un piso de longitud para no tocar palabras cortas). **Deliberadamente NO cubre formas verbales** (gerundios como "persiguiendo"/"comprando" hacia su infinitivo) — no hay una regla simple y confiable en español para eso (raíces irregulares, conjugaciones -ar/-er/-ir); se prefirió dejarlo sin cubrir en la Capa A antes que inventar una regla sin verificar. La Capa B/C, con el significado completo, puede igual reconocer un candidato que llegue a ser finalista por otras palabras.
+
+**Umbrales de la Capa A sin cambios** (`MIN_ABSOLUTE_OVERLAP=2`, `MIN_COVERAGE_RATIO=0.5`). Límite honesto detectado durante el diseño de esta corrección: para una consulta de 6 palabras significativas (como la de neuronas), incluso con normalización perfecta, alcanzar 50% de cobertura exige que al menos 3 de esas 6 palabras específicas aparezcan en las etiquetas del candidato — eso puede seguir siendo difícil para frases narrativas/científicas compuestas, independientemente de singular/plural. Si la corrida real muestra que la normalización + la consulta acotada no alcanzan para esos casos, la siguiente escalación (ajustar el umbral o el rol de la Capa A) es una decisión de Alex, no algo que se cambie en esta entrega.
+
+### Probado (nivel 2 — datos simulados)
+
+Pruebas nuevas en `test-resource-acquisition.mjs`: `pluralVariants`/`buildPixabaySearchTerms` como funciones puras; que la consulta acotada es lo que de verdad llega a la URL de Pixabay (capturada en la llamada real, no solo en la función); un caso ilustrativo donde la normalización es la diferencia exacta entre 0% (rechazado) y 75% (aceptado); confirmación de que un candidato sin ninguna coincidencia real sigue rechazado (la corrección no inventa relevancia); y que el nuevo log de diagnóstico muestra etiquetas reales en un rechazo de Capa A. Toda la batería anterior (los 3 casos reales originales, el caso límite del cachorro, las dos capas de reintento/diagnóstico de B y C, los defectos 1 y 2) se volvió a correr completa sin que se repitiera manualmente caso por caso — sigue en verde.
+
+### Pendiente de validar (nivel 3 — corrida real)
+
+La prueba real con las 3 consultas de este job (vía `skipEditorialAI`, sin repetir la llamada editorial) es el único nivel que puede confirmar o descartar las hipótesis. Qué esperar en el log: por cada uno de los 3 recursos, una línea de diagnóstico con las etiquetas reales de los 2-3 mejores candidatos (nueva); la consulta acotada que de verdad se buscó junto a la descripción completa; si alguno ahora pasa la Capa A, las líneas de Capa B/Capa C con su veredicto y costo real. Costo real esperado de B+C por video: basado en lo medido en la corrida real anterior (`b7c0c8ac`, ≈US$0.0005 en total para varios recursos) y en que como máximo 3 recursos de este job pueden llegar a Pixabay, el techo realista sigue estando muy por debajo de un centavo por video, incluso si ahora más recursos alcanzan la Capa B/C que antes.

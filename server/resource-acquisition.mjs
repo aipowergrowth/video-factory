@@ -110,11 +110,51 @@ export const tokenize = (text) =>
       .filter((t) => t.length > 2 && !STOPWORDS.has(t)),
   );
 
-/** Qué tokens de la consulta aparecen realmente en las etiquetas -- para el log, no solo el número. */
+/**
+ * Variantes razonables de un token para comparar significado, no solo
+ * texto literal. Defecto real (01-nov-2026, job e707ade8): con
+ * consultas reales del planificador, "neuronas" no coincidía con la
+ * etiqueta "neurona", "cazadores" no coincidía con "cazador" -- la
+ * comparación literal penalizaba candidatos que sí podrían ser
+ * correctos solo por singular/plural. Reglas de reversión de plural en
+ * español, las dos más comunes y seguras (con un piso de longitud para
+ * no tocar palabras cortas donde "quitar una letra" cambia el
+ * significado):
+ * - termina en "es" (cazadores->cazador, señales->señal): se agrega la
+ *   forma sin "es".
+ * - termina en "s" sin ser "es" (neuronas->neurona, perros->perro): se
+ *   agrega la forma sin "s".
+ * LÍMITE DOCUMENTADO, a propósito no cubierto: formas verbales
+ * (gerundios como "persiguiendo"/"comprando" hacia su infinitivo) --
+ * no hay una regla de dos líneas que lo haga de forma confiable en
+ * español (raíces irregulares, -ar/-er/-ir), y una mala lo haría
+ * fallar en silencio. Se prefiere dejar ese caso sin cubrir en la Capa
+ * A (la Capa B/C, con el significado completo, puede igual reconocer
+ * el candidato si llega a ser finalista por otras palabras) antes que
+ * inventar una regla sin verificar.
+ */
+export const pluralVariants = (token) => {
+  const variants = new Set([token]);
+  if (token.endsWith("es") && token.length > 5) variants.add(token.slice(0, -2));
+  else if (token.endsWith("s") && token.length > 4) variants.add(token.slice(0, -1));
+  return variants;
+};
+
+const expandWithPluralVariants = (tokens) => {
+  const expanded = new Set();
+  for (const t of tokens) for (const v of pluralVariants(t)) expanded.add(v);
+  return expanded;
+};
+
+/**
+ * Qué tokens de la consulta aparecen realmente en las etiquetas --
+ * para el log, no solo el número. Compara variantes de singular/plural
+ * en los dos sentidos (ver `pluralVariants`), nunca formas verbales.
+ */
 export const matchedTokens = (query, tagsString) => {
   const queryTokens = tokenize(query);
-  const tagTokens = tokenize((tagsString ?? "").replace(/,/g, " "));
-  return [...queryTokens].filter((t) => tagTokens.has(t));
+  const tagTokens = expandWithPluralVariants(tokenize((tagsString ?? "").replace(/,/g, " ")));
+  return [...queryTokens].filter((t) => [...pluralVariants(t)].some((v) => tagTokens.has(v)));
 };
 
 /**
@@ -156,6 +196,38 @@ export const filterFinalists = (ranked, { minAbsolute = MIN_ABSOLUTE_OVERLAP, mi
 /** Candidatos (id + score + cobertura) para el log -- nunca la clave de la API. */
 const describeRankedForLog = (ranked) =>
   ranked.map((r) => `#${r.hit.id}(score=${r.score}, cobertura=${(r.coverage * 100).toFixed(0)}%)`).join(", ") || "ninguno";
+
+/** Candidatos con sus etiquetas, para diagnosticar un rechazo de la Capa A -- nunca la clave de la API. */
+const describeRankedWithTagsForLog = (ranked, query) =>
+  ranked
+    .map(
+      (r) =>
+        `#${r.hit.id} etiquetas="${dedupeTagsString(r.hit.tags)}" (score=${r.score}, cobertura=${(r.coverage * 100).toFixed(0)}%, coincidieron: ${matchedTokens(query, r.hit.tags).join(", ") || "ninguna"})`,
+    )
+    .join(" | ") || "ninguno";
+
+// HIPÓTESIS 1 (01-nov-2026, defecto real del job e707ade8, sin
+// verificar todavía con datos reales): Pixabay devuelve mejores
+// resultados con pocas palabras clave concretas que con una frase
+// larga en lenguaje natural -- las tres consultas reales del
+// planificador (5-6 palabras significativas cada una) sacaron
+// scores de 0-2 sobre un máximo de 5-6 contra sus propios candidatos.
+// Se acota la consulta ENVIADA A PIXABAY a este máximo de palabras
+// significativas (en el orden en que aparecen) -- NUNCA la consulta
+// usada para puntuar en la Capa A ni la que ven la Capa B/C, que
+// siguen validando contra la descripción completa (ver REGLA ESENCIAL
+// en resolveOneResource). Si la corrida real muestra que este número
+// no alcanza o es demasiado agresivo, es un solo valor para ajustar,
+// no una reescritura.
+const PIXABAY_SEARCH_MAX_TERMS = 5;
+
+/**
+ * La consulta real que se le manda a Pixabay -- más corta que la
+ * descripción visual completa del planificador (ver hipótesis arriba).
+ * Nunca se usa para puntuar relevancia ni para validar con IA, solo
+ * para pedirle a Pixabay mejores candidatos.
+ */
+export const buildPixabaySearchTerms = (visualQuery) => [...tokenize(visualQuery)].slice(0, PIXABAY_SEARCH_MAX_TERMS).join(" ") || visualQuery;
 
 const slugifyForCacheKey = (text) => [...tokenize(text)].sort().join("-");
 
@@ -224,17 +296,23 @@ export const __setDownloadToFileForTesting = (fn) => {
  * la API. `per_page` chico a propósito: solo se piden candidatos para
  * elegir el mejor, nunca para descargarlos todos.
  */
-export const searchPixabay = async ({ apiKey, query, mediaType, lang = "es", cacheDir, log = () => {} }) => {
-  const cached = await readCache(cacheDir, mediaType, query);
+export const searchPixabay = async ({ apiKey, query, searchTerms, mediaType, lang = "es", cacheDir, log = () => {} }) => {
+  // `searchTerms` es lo que de verdad se le manda a Pixabay (más corto
+  // que `query`, ver buildPixabaySearchTerms) -- si no se pasa, se
+  // mantiene el comportamiento anterior (usar la consulta completa),
+  // para no romper llamadas existentes. La caché se guarda por lo que
+  // REALMENTE se buscó, nunca por la descripción completa.
+  const effectiveSearchTerms = searchTerms ?? query;
+  const cached = await readCache(cacheDir, mediaType, effectiveSearchTerms);
   if (cached) {
-    log(`Pixabay (${mediaType}): "${query}" -- resultado en caché (sin llamar a la API) -- candidatos: ${describeRankedForLog(rankCandidates(cached, query))}.`);
+    log(`Pixabay (${mediaType}): "${query}" (buscado como "${effectiveSearchTerms}") -- resultado en caché (sin llamar a la API) -- candidatos: ${describeRankedForLog(rankCandidates(cached, query))}.`);
     return cached;
   }
 
   const endpoint = mediaType === "video" ? "https://pixabay.com/api/videos/" : "https://pixabay.com/api/";
   const params = new URLSearchParams({
     key: apiKey,
-    q: query,
+    q: effectiveSearchTerms,
     lang,
     per_page: "5",
     safesearch: "true",
@@ -248,13 +326,13 @@ export const searchPixabay = async ({ apiKey, query, mediaType, lang = "es", cac
     // Un fallo de red/API (incluido un 429 por exceder el límite de
     // solicitudes) nunca tumba el job -- se trata como "sin resultados"
     // para ESTE recurso, se registra, y se sigue con los demás.
-    log(`Pixabay (${mediaType}): "${query}" -- falló la búsqueda (${err.message ?? err}).`);
+    log(`Pixabay (${mediaType}): "${query}" (buscado como "${effectiveSearchTerms}") -- falló la búsqueda (${err.message ?? err}).`);
     return [];
   }
 
   const hits = Array.isArray(payload.hits) ? payload.hits : [];
-  await writeCache(cacheDir, mediaType, query, hits);
-  log(`Pixabay (${mediaType}): "${query}" -- ${hits.length} candidato(s), cacheados por 24h -- candidatos: ${describeRankedForLog(rankCandidates(hits, query))}.`);
+  await writeCache(cacheDir, mediaType, effectiveSearchTerms, hits);
+  log(`Pixabay (${mediaType}): "${query}" (buscado como "${effectiveSearchTerms}") -- ${hits.length} candidato(s), cacheados por 24h -- candidatos: ${describeRankedForLog(rankCandidates(hits, query))}.`);
   if (mediaType === "video" && hits.length > 0) {
     // Diagnóstico de UNA sola vez, sin costo de IA (pedido explícito de
     // Alex, 01-nov-2026, antes de confiar en qué campo trae el
@@ -792,11 +870,21 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
 
   const query = resource.visualQuery;
   const mediaType = resource.type === "broll" ? "video" : "image";
-  const hits = await searchPixabay({ apiKey, query, mediaType, lang, cacheDir, log });
+  // Lo que se le manda a Pixabay (más corto, ver buildPixabaySearchTerms)
+  // es distinto de `query` -- `query` (la descripción completa del
+  // planificador) sigue siendo la única usada para puntuar/validar, en
+  // la Capa A y también en la B/C (ver REGLA ESENCIAL más abajo).
+  const searchTerms = buildPixabaySearchTerms(query);
+  const hits = await searchPixabay({ apiKey, query, searchTerms, mediaType, lang, cacheDir, log });
   const ranked = rankCandidates(hits, query);
   const finalists = filterFinalists(ranked);
 
   if (finalists.length === 0) {
+    // Diagnóstico explícito (defecto real, job e707ade8, 01-nov-2026:
+    // el log no mostraba las etiquetas de lo rechazado, solo el score)
+    // -- siempre se registra, sin costo de IA, para poder juzgar si el
+    // rechazo fue correcto o si la Capa A descartó algo útil.
+    log(`Pixabay: diagnóstico de los candidatos mejor puntuados (capa A) para "${resource.id}" -- ${describeRankedWithTagsForLog(ranked.slice(0, 3), query)}.`);
     const reason =
       `ningún candidato de Pixabay alcanzó el umbral de relevancia por palabras clave para "${query}" ` +
       `(mínimo ${MIN_ABSOLUTE_OVERLAP} coincidencias y ${Math.round(MIN_COVERAGE_RATIO * 100)}% de cobertura; ` +
