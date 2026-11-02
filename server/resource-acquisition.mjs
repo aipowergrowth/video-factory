@@ -17,10 +17,13 @@
 // - Solo se descarga el archivo elegido, nunca todos los candidatos de
 //   una búsqueda ("sin descargas masivas").
 //
-// RELEVANCIA, en dos capas (corrección del 01-nov-2026, tras un
-// incidente real: "persona corriendo en un parque" eligió un cachorro
-// porque "parque" coincidía; una consulta sin sentido eligió un
-// candidato porque "sin" coincidía con la etiqueta "sin fondo"):
+// RELEVANCIA, en tres capas (Capa C añadida el 01-nov-2026, autorizada
+// por Alex, tras un segundo incidente real: la Capa B aprobó un
+// candidato por sus etiquetas -- "macbook", "escritorio", "oficina en
+// casa" -- para "laptop sobre un escritorio de oficina moderno", pero
+// la foto real era un CELULAR sobre un cuaderno. Las etiquetas de un
+// banco pueden describir mal el contenido real; solo ver la imagen lo
+// detecta):
 //
 // - Capa A (palabras clave, sin IA, abajo): exige que el candidato
 //   cubra una fracción mínima de las palabras SIGNIFICATIVAS de la
@@ -36,10 +39,15 @@
 //   reconocer que "cachorro"/"perro" contradice "persona" aunque las
 //   etiquetas comiencen compartiendo varias palabras -- pero sigue
 //   siendo un juicio sobre lo que el banco escribió en las etiquetas,
-//   NUNCA una verificación visual de la imagen real. Si las etiquetas
-//   de Pixabay fueran insuficientes o engañosas, la Capa B puede
-//   fallar igual -- eso se reporta como tal, nunca como "verificado
-//   visualmente".
+//   NUNCA una verificación visual de la imagen real.
+// - Capa C (validación VISUAL con IA, mismo modelo, sobre la miniatura
+//   REAL -- nunca las etiquetas): confirma, viendo de verdad la
+//   miniatura del candidato que la Capa B aprobó, que el sujeto
+//   corresponde. Si lo rechaza, prueba -- en el mismo orden de puntaje
+//   de la Capa A -- los demás finalistas, hasta un máximo acotado.
+//   Esto SÍ ve la imagen real, pero sigue siendo una miniatura chica,
+//   de un solo fotograma en el caso de video -- no es una garantía
+//   absoluta, es la mejor evidencia visual barata disponible.
 
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -247,6 +255,18 @@ export const searchPixabay = async ({ apiKey, query, mediaType, lang = "es", cac
   const hits = Array.isArray(payload.hits) ? payload.hits : [];
   await writeCache(cacheDir, mediaType, query, hits);
   log(`Pixabay (${mediaType}): "${query}" -- ${hits.length} candidato(s), cacheados por 24h -- candidatos: ${describeRankedForLog(rankCandidates(hits, query))}.`);
+  if (mediaType === "video" && hits.length > 0) {
+    // Diagnóstico de UNA sola vez, sin costo de IA (pedido explícito de
+    // Alex, 01-nov-2026, antes de confiar en qué campo trae el
+    // fotograma de cada video): la documentación oficial de Pixabay
+    // muestra `videos.<tamaño>.thumbnail`, pero eso nunca se confirmó
+    // contra una respuesta real. Esto imprime las claves reales, nada
+    // más -- ni descarga ni analiza nada.
+    const firstHit = hits[0];
+    const sizeKeys = Object.keys(firstHit.videos ?? {});
+    const perSizeKeys = sizeKeys.map((size) => `${size}=[${Object.keys(firstHit.videos[size] ?? {}).join(",")}]`).join(" ");
+    log(`Pixabay (video): diagnóstico de campos reales -- primer candidato #${firstHit.id} -- claves de nivel superior=[${Object.keys(firstHit).join(",")}] -- claves por tamaño: ${perSizeKeys}.`);
+  }
   return hits;
 };
 
@@ -440,13 +460,257 @@ const validateRelevanceWithRetry = async ({ query, finalists, resourceId, log })
   throw lastErr;
 };
 
+// --- Capa C: validación VISUAL sobre la miniatura real (autorizado por
+// Alex, 01-nov-2026, tras un defecto real: la Capa B aprobó #2846221
+// ("laptop sobre un escritorio de oficina moderno") por sus etiquetas
+// ("macbook", "escritorio", "oficina en casa"), pero la foto real
+// mostraba un CELULAR sobre un cuaderno -- las etiquetas describían
+// mal el contenido real. Esta capa no reemplaza ni reescribe la Capa A
+// ni la Capa B: corre DESPUÉS, sobre el candidato que la Capa B
+// aprobó, y si esa evaluación visual lo rechaza, sigue -- en el mismo
+// orden de puntaje de la Capa A -- con los demás finalistas, hasta un
+// máximo de VISUAL_MAX_EVALUATIONS evaluaciones por recurso. El
+// recurso queda pendiente solo si TODAS las evaluaciones intentadas
+// rechazan (o fallan técnicamente). -------------------------------
+
+// Autorización explícita de Alex: Capa B + hasta 2 finalistas más (3
+// evaluaciones visuales en total por recurso), nunca más.
+const VISUAL_MAX_EVALUATIONS = 3;
+// Mismo criterio que la Capa B: 1 reintento automático ante un fallo
+// TÉCNICO (nunca ante un "no corresponde" -- eso es un veredicto
+// válido, no un error).
+const VISUAL_MAX_ATTEMPTS = 2;
+const VISUAL_MAX_OUTPUT_TOKENS = 300;
+
+// DECISIÓN (pedida explícitamente por Alex antes de codificar esto):
+// la miniatura NUNCA se manda como `source: {type: "url", url: ...}`
+// apuntando directo al CDN de Pixabay. La documentación oficial de la
+// API de Pixabay (https://pixabay.com/api/docs/) dice literalmente:
+// "permanent hotlinking of images (using Pixabay URLs in your app) is
+// not allowed. If you intend to use the images, please download them
+// to your server first." Aunque nuestro caso es una llamada
+// servidor-a-modelo y no un sitio público, la instrucción es clara y
+// la miniatura pesa unos pocos KB (webformatURL, <=640px) -- se
+// descarga una sola vez a memoria (nunca a disco, nunca se guarda) y
+// se manda en base64. Esto también evita depender de que Anthropic
+// pueda alcanzar el CDN de Pixabay desde sus propios servidores (no
+// confirmado, y ahora irrelevante porque no se usa esa vía).
+const SUPPORTED_IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+/**
+ * La miniatura a evaluar visualmente -- NUNCA la imagen/video completo.
+ * Para imagen: `webformatURL` (<=640px), nunca `previewURL` (<=150px):
+ * la documentación de Claude advierte que la precisión cae en
+ * imágenes de menos de 200px, y 150px queda por debajo de ese umbral.
+ * Para video: el campo `thumbnail` dentro del tamaño más chico
+ * disponible de `videos` (confirmado en la documentación oficial de
+ * Pixabay con un ejemplo de respuesta literal el 01-nov-2026; el log
+ * de diagnóstico de `searchPixabay` de arriba confirma esto contra una
+ * respuesta real la primera vez que corra un job con un broll).
+ */
+export const pickThumbnailUrl = (hit, mediaType) => {
+  if (mediaType === "video") {
+    return (
+      hit.videos?.tiny?.thumbnail ??
+      hit.videos?.small?.thumbnail ??
+      hit.videos?.medium?.thumbnail ??
+      hit.videos?.large?.thumbnail ??
+      null
+    );
+  }
+  return hit.webformatURL ?? null;
+};
+
+const realDownloadBytes = async (url) => {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} al descargar la miniatura`);
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const contentType = res.headers.get("content-type")?.split(";")[0]?.trim() ?? "image/jpeg";
+  return { buffer, contentType };
+};
+let downloadBytes = realDownloadBytes;
+/** Solo para pruebas: nunca descarga nada real. */
+export const __setDownloadBytesForTesting = (fn) => {
+  downloadBytes = fn ?? realDownloadBytes;
+};
+
+const buildVisualPrompt = (query) =>
+  `Consulta: "${query}"
+
+¿Esta imagen muestra realmente lo que pide la consulta? Si tenés cualquier duda, respondé que no -- es preferible rechazar a aprobar algo dudoso. No evalúes calidad fotográfica ni composición, solo si el sujeto real corresponde a la consulta.
+
+Responde ÚNICAMENTE con un objeto JSON, sin texto antes ni después, sin bloque de código:
+{"aprobado": true|false, "motivo": "una frase breve, en español"}`;
+
+const parseVisualResponse = (rawText) => {
+  const cleaned = (rawText ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "")
+    .trim();
+
+  const tryParse = (candidate) => {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return undefined;
+    }
+  };
+
+  let parsed = tryParse(cleaned);
+  if (!parsed) {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) parsed = tryParse(match[0]);
+  }
+  if (!parsed) {
+    throw new Error(
+      cleaned.length === 0
+        ? "el validador visual devolvió una respuesta de texto VACÍA (sin ningún bloque de texto utilizable)."
+        : `el validador visual no devolvió JSON válido: "${cleaned.slice(0, 200)}"`,
+    );
+  }
+  if (typeof parsed.aprobado !== "boolean") {
+    throw new Error("el validador visual no dio un valor booleano en 'aprobado'.");
+  }
+  if (typeof parsed.motivo !== "string" || parsed.motivo.trim().length === 0) {
+    throw new Error("el validador visual no dio un motivo.");
+  }
+  return { aprobado: parsed.aprobado, motivo: parsed.motivo.trim() };
+};
+
+/**
+ * Evalúa UN candidato visualmente: descarga su miniatura real (nunca
+ * la imagen/video completo) y le pregunta a Claude (con la miniatura
+ * en base64, nunca por URL -- ver decisión arriba) si corresponde de
+ * verdad a la consulta. Nunca envía las etiquetas -- el objetivo es
+ * que el modelo juzgue los píxeles, no que repita el razonamiento de
+ * la Capa B. Igual que la Capa B, cualquier fallo de parseo lleva
+ * `.usage` adjunto (para contar el costo del intento fallido) y un
+ * diagnóstico (stop_reason, tipos de bloque, tokens) -- nunca claves.
+ */
+const realEvaluateCandidateVisually = async ({ query, hit, mediaType }) => {
+  const thumbnailUrl = pickThumbnailUrl(hit, mediaType);
+  if (!thumbnailUrl) {
+    throw new Error(`no hay miniatura utilizable para el candidato #${hit.id} (el campo esperado no vino en la respuesta de Pixabay).`);
+  }
+  let image;
+  try {
+    image = await downloadBytes(thumbnailUrl);
+  } catch (err) {
+    throw new Error(`no se pudo descargar la miniatura del candidato #${hit.id} (${thumbnailUrl}): ${err.message ?? err}`);
+  }
+  if (!SUPPORTED_IMAGE_CONTENT_TYPES.has(image.contentType)) {
+    throw new Error(`la miniatura del candidato #${hit.id} vino con un tipo no soportado ("${image.contentType}").`);
+  }
+
+  const client = getClient();
+  const response = await client.messages.create({
+    model: RELEVANCE_MODEL,
+    max_tokens: VISUAL_MAX_OUTPUT_TOKENS,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: image.contentType, data: image.buffer.toString("base64") } },
+          { type: "text", text: buildVisualPrompt(query) },
+        ],
+      },
+    ],
+  });
+  const usage = response.usage ?? { input_tokens: 0, output_tokens: 0 };
+  const contentBlocks = response.content ?? [];
+  const text = contentBlocks
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("");
+  try {
+    const { aprobado, motivo } = parseVisualResponse(text);
+    return { aprobado, motivo, usage, thumbnailUrl };
+  } catch (err) {
+    const blockTypes = contentBlocks.map((b) => b.type).join(", ") || "ninguno";
+    const diagnosed = new Error(
+      `${err.message} -- diagnóstico: stop_reason="${response.stop_reason ?? "desconocido"}", bloques de contenido=[${blockTypes}], tokens=${usage.input_tokens ?? 0} entrada / ${usage.output_tokens ?? 0} salida.`,
+    );
+    diagnosed.usage = usage;
+    throw diagnosed;
+  }
+};
+let evaluateCandidateVisually = realEvaluateCandidateVisually;
+/** Solo para pruebas: nunca llama a la API real de Anthropic ni descarga nada. */
+export const __setVisualValidatorForTesting = (fn) => {
+  evaluateCandidateVisually = fn ?? realEvaluateCandidateVisually;
+};
+
+/** Mismo criterio de reintento que la Capa B, para la Capa C. */
+const evaluateCandidateVisuallyWithRetry = async ({ query, hit, mediaType, resourceId, log }) => {
+  let lastErr;
+  let spentOnFailedAttemptsUsd = 0;
+  for (let attempt = 1; attempt <= VISUAL_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await evaluateCandidateVisually({ query, hit, mediaType });
+    } catch (err) {
+      lastErr = err;
+      const attemptCostUsd = computeRelevanceCallCostUsd(err.usage);
+      spentOnFailedAttemptsUsd += attemptCostUsd;
+      log(
+        `Pixabay: Capa C -- intento ${attempt}/${VISUAL_MAX_ATTEMPTS} para "${resourceId}" candidato #${hit.id} falló (${err.message}) -- costo de ese intento: $${attemptCostUsd.toFixed(6)}.` +
+          (attempt < VISUAL_MAX_ATTEMPTS ? " Reintentando una vez." : ""),
+      );
+    }
+  }
+  lastErr.spentOnFailedAttemptsUsd = spentOnFailedAttemptsUsd;
+  throw lastErr;
+};
+
+/**
+ * Capa C completa para un recurso: evalúa visualmente, en orden de
+ * puntaje de la Capa A, empezando por el candidato que la Capa B
+ * aprobó -- hasta VISUAL_MAX_EVALUATIONS candidatos en total. Se
+ * detiene en el primero que la IA apruebe visualmente. Devuelve
+ * `{approved, attempts}` -- `approved` es el finalista aprobado (o
+ * `null` si ninguno lo fue), `attempts` es la lista de intentos (para
+ * el log y el motivo de rechazo final).
+ */
+const runVisualValidation = async ({ query, finalists, chosenIdFromCapaB, mediaType, resourceId, log }) => {
+  const chosenFinalist = finalists.find((f) => f.hit.id === chosenIdFromCapaB);
+  const ordered = [chosenFinalist, ...finalists.filter((f) => f.hit.id !== chosenIdFromCapaB)].slice(0, VISUAL_MAX_EVALUATIONS);
+
+  const attempts = [];
+  for (const candidate of ordered) {
+    let result;
+    try {
+      result = await evaluateCandidateVisuallyWithRetry({ query, hit: candidate.hit, mediaType, resourceId, log });
+    } catch (err) {
+      const spentUsd = err.spentOnFailedAttemptsUsd ?? 0;
+      log(`Pixabay: Capa C -- candidato #${candidate.hit.id} para "${resourceId}" quedó sin validar tras un fallo técnico (${err.message}) -- costo gastado en los intentos: $${spentUsd.toFixed(6)}.`);
+      attempts.push({ hit: candidate.hit, aprobado: false, motivo: `fallo técnico: ${err.message ?? err}`, isCapaBChoice: candidate.hit.id === chosenIdFromCapaB });
+      continue;
+    }
+    const costUsd = computeRelevanceCallCostUsd(result.usage);
+    log(
+      `Pixabay: Capa C (${RELEVANCE_MODEL}) para "${resourceId}" -- candidato #${candidate.hit.id} -- miniatura: ${result.thumbnailUrl} -- página: ${candidate.hit.pageURL} -- ` +
+        `veredicto: ${result.aprobado ? "APROBADO" : "rechazado"} -- motivo: "${result.motivo}" -- tokens: ${result.usage.input_tokens ?? 0} entrada / ${result.usage.output_tokens ?? 0} salida -- costo real: $${costUsd.toFixed(6)}.`,
+    );
+    attempts.push({ hit: candidate.hit, aprobado: result.aprobado, motivo: result.motivo, isCapaBChoice: candidate.hit.id === chosenIdFromCapaB });
+    if (result.aprobado) {
+      return { approved: candidate, approvedMotivo: result.motivo, attempts };
+    }
+  }
+  return { approved: null, approvedMotivo: null, attempts };
+};
+
 /**
  * Resuelve UN recurso `broll`/`image` contra Pixabay: busca (con
  * caché), filtra finalistas por palabras clave (Capa A), valida el
  * sujeto real con IA sobre esos finalistas (Capa B, solo texto),
- * descarga SOLO el archivo que la IA eligió, y arma el registro de
- * licencia. Si ya tenía `resolvedAsset` o `acquisitionFailureReason` de
- * una corrida anterior, no vuelve a tocar nada (idempotente).
+ * confirma con la miniatura REAL (Capa C, visual, sobre el elegido de
+ * la Capa B y -- si lo rechaza -- los demás finalistas en orden de
+ * puntaje), descarga SOLO el archivo finalmente aprobado, y arma el
+ * registro de licencia. Si ya tenía `resolvedAsset` o
+ * `acquisitionFailureReason` de una corrida anterior, no vuelve a
+ * tocar nada (idempotente).
  */
 export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir, jobId, lang = "es", log = () => {} }) => {
   if (resource.resolvedAsset || resource.acquisitionFailureReason) {
@@ -506,11 +770,28 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
     return { ...resource, acquisitionFailureReason: reason };
   }
 
-  const chosen = finalists.find((f) => f.hit.id === verdict.chosenId);
-  const { hit, score, coverage } = chosen;
+  const { approved, approvedMotivo, attempts } = await runVisualValidation({
+    query,
+    finalists,
+    chosenIdFromCapaB: verdict.chosenId,
+    mediaType,
+    resourceId: resource.id,
+    log,
+  });
+
+  if (!approved) {
+    const motivos = attempts.map((a) => `#${a.hit.id}: ${a.motivo}`).join(" | ");
+    const reason =
+      `la Capa C (validación visual sobre la miniatura real, nunca solo etiquetas) rechazó ${attempts.length} candidato(s) para "${query}" -- ${motivos} ` +
+      `-- se conserva el presentador en pantalla en vez de insertar un B-roll/imagen equivocado.`;
+    log(`Pixabay: RECHAZADO (capa C) recurso "${resource.id}" -- ${reason}`);
+    return { ...resource, acquisitionFailureReason: reason };
+  }
+
+  const { hit, score, coverage } = approved;
   const sourceUrl = mediaType === "video" ? pickVideoUrl(hit) : pickImageUrl(hit);
   if (!sourceUrl) {
-    const reason = `la Capa B eligió el candidato #${hit.id} para "${query}" pero Pixabay no le dio una URL de descarga utilizable.`;
+    const reason = `la Capa C aprobó visualmente el candidato #${hit.id} para "${query}" pero Pixabay no le dio una URL de descarga utilizable.`;
     log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
     return { ...resource, acquisitionFailureReason: reason };
   }
@@ -529,7 +810,7 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
     try {
       await downloadToFile(sourceUrl, destPath);
     } catch (err) {
-      const reason = `la Capa B eligió el candidato #${hit.id} (score=${score}) para "${query}" pero falló la descarga (${err.message ?? err}).`;
+      const reason = `la Capa C aprobó visualmente el candidato #${hit.id} (score=${score}) para "${query}" pero falló la descarga (${err.message ?? err}).`;
       log(`Pixabay: RECHAZADO recurso "${resource.id}" -- ${reason}`);
       return { ...resource, acquisitionFailureReason: reason };
     }
@@ -538,8 +819,12 @@ export const resolveOneResource = async ({ resource, apiKey, cacheDir, assetsDir
   const mediaTypeFinal = mediaType === "video" ? "video" : hit.type === "illustration" ? "illustration" : "photo";
   const licenseName = "Pixabay Content License";
   const attributionRequired = false;
+  const capaBDescripcion =
+    hit.id === verdict.chosenId
+      ? `capa B: "${verdict.reason}"`
+      : `capa B había aprobado otro candidato (#${verdict.chosenId}) que la Capa C rechazó -- este no pasó por la Capa B`;
   log(
-    `Pixabay: ELEGIDO recurso "${resource.id}" -> candidato #${hit.id} (capa A: score=${score}, cobertura=${(coverage * 100).toFixed(0)}%; capa B: "${verdict.reason}") ` +
+    `Pixabay: ELEGIDO recurso "${resource.id}" -> candidato #${hit.id} (capa A: score=${score}, cobertura=${(coverage * 100).toFixed(0)}%; ${capaBDescripcion}; capa C: "${approvedMotivo}") ` +
       `-- etiquetas="${dedupeTagsString(hit.tags)}", autor "${hit.user}", tipo ${mediaTypeFinal}, licencia "${licenseName}" (${PIXABAY_LICENSE_URL}, atribución ${attributionRequired ? "obligatoria" : "no obligatoria"}), ` +
       `página ${hit.pageURL}, ${alreadyOnDisk ? "ya estaba en disco" : "descargado ahora"} -> ${relativePath}.`,
   );

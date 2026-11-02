@@ -1,14 +1,26 @@
 // PRUEBA SIMULADA -- nunca llama a la red real de Pixabay NI a la API
 // real de Anthropic (misma disciplina que el resto de las pruebas de
 // este proyecto: inyecta __setFetchJsonForTesting/
-// __setDownloadToFileForTesting/__setRelevanceValidatorForTesting en
-// vez de golpear una API real). Prueba la lógica PURA (tokenize,
-// scoreKeywordOverlap, rankCandidates, filterFinalists) y el CONTROL DE
-// FLUJO de las dos capas de relevancia (Capa A por palabras clave, Capa
-// B por IA sobre los finalistas) de server/resource-acquisition.mjs --
-// incluidos los tres casos reales que Alex reportó el 01-nov-2026, el
-// caso límite del cachorro con etiquetas coincidentes, y el incidente
-// real del caso positivo (respuesta vacía de la Capa B) del mismo día.
+// __setDownloadToFileForTesting/__setRelevanceValidatorForTesting/
+// __setVisualValidatorForTesting/__setDownloadBytesForTesting en vez de
+// golpear una API real). Prueba la lógica PURA (tokenize,
+// scoreKeywordOverlap, rankCandidates, filterFinalists,
+// pickThumbnailUrl) y el CONTROL DE FLUJO de las tres capas de
+// relevancia (Capa A por palabras clave, Capa B por IA sobre texto/
+// etiquetas, Capa C por IA sobre la miniatura REAL) de
+// server/resource-acquisition.mjs -- incluidos los tres casos reales
+// que Alex reportó el 01-nov-2026, el caso límite del cachorro con
+// etiquetas coincidentes, el incidente real del caso positivo
+// (respuesta vacía de la Capa B), y el defecto real que motivó la Capa
+// C (la Capa B aprobó por etiquetas un candidato cuya foto real era
+// otra cosa).
+//
+// IMPORTANTE (criterio explícito de Alex, 01-nov-2026): estas pruebas
+// con cliente/validador simulado verifican el CABLEADO -- que se
+// llama a quien corresponde, con los datos correctos, en el orden
+// correcto, y que los fallos se manejan bien -- pero NO son el
+// criterio de aceptación de la Capa C. Eso es una corrida real contra
+// Pixabay y Anthropic reales (ver el informe de entrega).
 //
 // Para reproducir el incidente de la respuesta vacía SIN mockear el
 // SDK de Anthropic a mano, se usa __setAnthropicClientForTesting --
@@ -30,12 +42,15 @@ import {
   computeRelevanceCallCostUsd,
   RELEVANCE_MODEL_INPUT_PRICE_PER_TOKEN,
   RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN,
+  pickThumbnailUrl,
   searchPixabay,
   resolveOneResource,
   acquireResourcesForJob,
   __setFetchJsonForTesting,
   __setDownloadToFileForTesting,
   __setRelevanceValidatorForTesting,
+  __setVisualValidatorForTesting,
+  __setDownloadBytesForTesting,
 } from "./resource-acquisition.mjs";
 import { __setAnthropicClientForTesting } from "./editorial.mjs";
 
@@ -53,11 +68,19 @@ const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "vf-resource-acquisition-
 const cacheDir = path.join(tmpDir, "cache");
 const assetsDir = path.join(tmpDir, "assets");
 
-/** Validador falso que siempre elige el mejor finalista (el primero, ya vienen ordenados). */
+/** Validador falso (Capa B) que siempre elige el mejor finalista (el primero, ya vienen ordenados). */
 const acceptBestFinalist = async ({ finalists }) => ({
   chosenId: finalists[0]?.hit.id ?? null,
   reason: "simulado: coincide con el sujeto de la consulta",
   usage: { input_tokens: 120, output_tokens: 18 },
+});
+
+/** Validador falso (Capa C) que aprueba visualmente cualquier candidato que le llegue. */
+const acceptVisually = async ({ hit }) => ({
+  aprobado: true,
+  motivo: "simulado: la miniatura muestra el sujeto correcto",
+  usage: { input_tokens: 350, output_tokens: 20 },
+  thumbnailUrl: `https://cdn.example/miniatura-${hit.id}.jpg`,
 });
 
 // --- tokenize / scoreKeywordOverlap / matchedTokens ---
@@ -151,6 +174,20 @@ check("filterFinalists: lista vacía no da finalistas", filterFinalists(rankCand
   check("Capa A (caso límite): con etiquetas que cubren TODA la consulta, SÍ llega a finalista (score=4, cobertura=100%)", finalists.length === 1 && finalists[0].score === 4 && finalists[0].coverage === 1);
 }
 
+// --- pickThumbnailUrl (Capa C: qué miniatura se evalúa) ---
+
+check(
+  "pickThumbnailUrl (imagen): usa webformatURL, nunca previewURL (Claude pierde precisión bajo 200px, previewURL es <=150px)",
+  pickThumbnailUrl({ webformatURL: "https://cdn.example/web.jpg", previewURL: "https://cdn.example/preview.jpg" }, "image") === "https://cdn.example/web.jpg",
+);
+check("pickThumbnailUrl (imagen): sin webformatURL, null (nunca cae a previewURL como respaldo)", pickThumbnailUrl({ previewURL: "https://cdn.example/preview.jpg" }, "image") === null);
+check(
+  "pickThumbnailUrl (video): prefiere el thumbnail del tamaño más chico disponible (tiny)",
+  pickThumbnailUrl({ videos: { large: { thumbnail: "L" }, tiny: { thumbnail: "T" } } }, "video") === "T",
+);
+check("pickThumbnailUrl (video): si falta 'tiny', sube a 'small', luego 'medium', luego 'large'", pickThumbnailUrl({ videos: { large: { thumbnail: "L" } } }, "video") === "L");
+check("pickThumbnailUrl (video): sin ningún thumbnail en ningún tamaño, null", pickThumbnailUrl({ videos: { medium: { url: "solo-url-sin-thumbnail" } } }, "video") === null);
+
 // --- computeRelevanceCallCostUsd ---
 
 check(
@@ -190,17 +227,27 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
 
 {
   // Caso sano (POSITIVO): Capa A deja un único finalista claro, la
-  // Capa B (inyectada) lo aprueba -- se descarga SOLO ese archivo, y
-  // el log trae etiquetas, veredicto, tokens y costo real.
+  // Capa B (inyectada) lo aprueba, la Capa C (inyectada) lo confirma
+  // visualmente -- se descarga SOLO ese archivo, y el log trae
+  // etiquetas, veredictos de ambas capas de IA, tokens y costo real.
   let searchCalls = 0;
   let downloadCalls = 0;
   let validatorCalls = 0;
+  let visualCalls = 0;
   __setFetchJsonForTesting(async () => {
     searchCalls++;
     return {
       hits: [
-        { id: 7, tags: "molecula, dopamina, ciencia, ilustracion", pageURL: "https://pixabay.com/x/7", largeImageURL: "https://cdn.example/7-large.jpg", user: "autor-x", type: "illustration" },
-        { id: 8, tags: "coche, carretera", pageURL: "https://pixabay.com/x/8", largeImageURL: "https://cdn.example/8-large.jpg", user: "autor-y" },
+        {
+          id: 7,
+          tags: "molecula, dopamina, ciencia, ilustracion",
+          pageURL: "https://pixabay.com/x/7",
+          largeImageURL: "https://cdn.example/7-large.jpg",
+          webformatURL: "https://cdn.example/7-web.jpg",
+          user: "autor-x",
+          type: "illustration",
+        },
+        { id: 8, tags: "coche, carretera", pageURL: "https://pixabay.com/x/8", largeImageURL: "https://cdn.example/8-large.jpg", webformatURL: "https://cdn.example/8-web.jpg", user: "autor-y" },
       ],
     };
   });
@@ -211,29 +258,39 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
     validatorCalls++;
     return acceptBestFinalist(args);
   });
+  __setVisualValidatorForTesting(async (args) => {
+    visualCalls++;
+    return acceptVisually(args);
+  });
   const resource = { id: "ai-resource-0", type: "image", description: "prosa editorial", visualQuery: "ilustración de una molécula de dopamina" };
   const logLines = [];
   const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
-  check("resolveOneResource: resuelve con el candidato que la Capa B aprobó (id 7, no 8)", resolved.resolvedAsset?.assetId === 7);
+  check("resolveOneResource: resuelve con el candidato que la Capa B aprobó y la Capa C confirmó (id 7, no 8)", resolved.resolvedAsset?.assetId === 7);
   check("resolveOneResource: se descarga exactamente 1 archivo (nunca los dos candidatos)", downloadCalls === 1);
   check("resolveOneResource: solo 1 búsqueda", searchCalls === 1);
   check("resolveOneResource: la Capa B se llamó exactamente 1 vez", validatorCalls === 1);
+  check("resolveOneResource: la Capa C se llamó exactamente 1 vez (el primer candidato ya fue aprobado, no cascadea)", visualCalls === 1);
   check("resolveOneResource: registra proveedor/licencia/autor/fecha", resolved.resolvedAsset?.provider === "pixabay" && resolved.resolvedAsset?.licenseName && resolved.resolvedAsset?.author === "autor-x" && resolved.resolvedAsset?.downloadedAt);
   const elegidoLine = logLines.find((l) => l.includes("ELEGIDO"));
   check("log: hay una línea 'ELEGIDO' con el recurso y el candidato elegido", elegidoLine?.includes("ai-resource-0") && elegidoLine?.includes("#7"));
   check("log: la línea ELEGIDO incluye las etiquetas del candidato elegido", elegidoLine?.includes("molecula, dopamina, ciencia, ilustracion"));
   check("log: la línea ELEGIDO incluye el motivo de la Capa B", elegidoLine?.includes("coincide con el sujeto"));
+  check("log: la línea ELEGIDO incluye el motivo de la Capa C", elegidoLine?.includes("miniatura muestra el sujeto correcto"));
   const finalistasLine = logLines.find((l) => l.includes("finalistas de"));
   check("log: hay una línea de finalistas con sus etiquetas (candidato #8 descartado antes de la IA)", finalistasLine?.includes("#7") && !finalistasLine?.includes("#8"));
-  const capaBLine = logLines.find((l) => l.includes("costo real"));
+  const capaBLine = logLines.find((l) => l.includes("Capa B (") && l.includes("costo real"));
   check("log: la línea de Capa B registra tokens de entrada/salida reales", capaBLine?.includes("120") && capaBLine?.includes("18"));
   check("log: la línea de Capa B registra el costo real en dólares", /costo real: \$0\.000\d+/.test(capaBLine ?? ""));
+  const capaCLine = logLines.find((l) => l.includes("Capa C (") && l.includes("APROBADO"));
+  check("log: la línea de Capa C incluye la miniatura evaluada y la página de Pixabay", capaCLine?.includes("miniatura-7.jpg") && capaCLine?.includes("pixabay.com/x/7"));
+  check("log: la línea de Capa C registra tokens y costo reales", capaCLine?.includes("350") && capaCLine?.includes("20") && /costo real: \$0\.000\d+/.test(capaCLine ?? ""));
   check("log: ninguna línea de log contiene la clave de la API", !logLines.some((l) => l.includes("fake")));
   check("resolveOneResource: mediaType illustration se conserva (no se fuerza a 'photo')", resolved.resolvedAsset?.mediaType === "illustration");
   check("resolveOneResource: localPath queda dentro de uploads/resources/<jobId>/", resolved.resolvedAsset?.localPath.startsWith("uploads/resources/job-test/"));
   __setFetchJsonForTesting(null);
   __setDownloadToFileForTesting(null);
   __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
 }
 
 {
@@ -337,9 +394,17 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
   // "solo se inserta si su contenido es pertinente a dopamina/cerebro"
   // es una condición, no una prohibición total.
   let validatorCalls = 0;
+  let visualCalls = 0;
   __setFetchJsonForTesting(async () => ({
     hits: [
-      { id: 37422, tags: "cerebro, neurona, dopamina, ciencia, ilustracion, medicina", pageURL: "https://pixabay.com/videos/id-37422/", videos: { medium: { url: "https://cdn.example/37422.mp4" } }, user: "Animateon", type: "film" },
+      {
+        id: 37422,
+        tags: "cerebro, neurona, dopamina, ciencia, ilustracion, medicina",
+        pageURL: "https://pixabay.com/videos/id-37422/",
+        videos: { medium: { url: "https://cdn.example/37422.mp4", thumbnail: "https://cdn.example/37422-thumb.jpg" } },
+        user: "Animateon",
+        type: "film",
+      },
     ],
   }));
   __setDownloadToFileForTesting(async () => {});
@@ -347,13 +412,19 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
     validatorCalls++;
     return acceptBestFinalist(args);
   });
+  __setVisualValidatorForTesting(async (args) => {
+    visualCalls++;
+    return acceptVisually(args);
+  });
   const resource = { id: "test-broll-0", type: "broll", description: "x", visualQuery: "ilustración 3D de una molécula de dopamina en el cerebro" };
   const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test" });
   check("test-broll-0 (candidato realmente pertinente): SÍ se inserta", resolved.resolvedAsset?.assetId === 37422);
   check("test-broll-0: la Capa B se llamó (había finalista real)", validatorCalls === 1);
+  check("test-broll-0: la Capa C también se llamó (video pasa por las tres capas igual que imagen)", visualCalls === 1);
   __setFetchJsonForTesting(null);
   __setDownloadToFileForTesting(null);
   __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
 }
 
 {
@@ -420,6 +491,7 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
         tags: "iphone, iphone, iphone, iphone, oficina, oficina, oficina, oficina, oficina, escritorio, laptop",
         pageURL: "https://pixabay.com/x/1868496",
         largeImageURL: "https://cdn.example/1868496.jpg",
+        webformatURL: "https://cdn.example/1868496-web.jpg",
         user: "autor-a",
       },
       {
@@ -427,11 +499,17 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
         tags: "laptop, escritorio, oficina, moderno, trabajo",
         pageURL: "https://pixabay.com/x/2846221",
         largeImageURL: "https://cdn.example/2846221.jpg",
+        webformatURL: "https://cdn.example/2846221-web.jpg",
         user: "autor-b",
       },
     ],
   }));
   __setDownloadToFileForTesting(async () => {});
+  // Esta prueba se enfoca en el reintento/diagnóstico de la CAPA B
+  // (ver más abajo el bloque dedicado a probar lo mismo para la Capa
+  // C) -- se inyecta la Capa C aparte para que no comparta el mismo
+  // cliente de Anthropic falso y no se mezclen los conteos de llamadas.
+  __setVisualValidatorForTesting(acceptVisually);
   __setAnthropicClientForTesting({
     messages: {
       create: async (params) => {
@@ -472,6 +550,224 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
   __setAnthropicClientForTesting(null);
   __setFetchJsonForTesting(null);
   __setDownloadToFileForTesting(null);
+  __setVisualValidatorForTesting(null);
+}
+
+// --- Capa C (validación VISUAL sobre la miniatura real) ------------------
+// Autorización de Alex, 01-nov-2026, tras el defecto real: la Capa B
+// aprobó #2846221 por sus etiquetas ("macbook", "escritorio", "oficina
+// en casa") para "laptop sobre un escritorio de oficina moderno", pero
+// la foto real era un celular sobre un cuaderno.
+
+{
+  // DEFECTO REAL reproducido: la Capa B aprueba #2846221 (por
+  // etiquetas), pero la Capa C -- viendo la miniatura real -- lo
+  // rechaza ("es un celular, no una laptop") y cascadea al OTRO
+  // finalista de la misma búsqueda (#1868496), que sí aprueba
+  // visualmente. El recurso termina ACEPTADO con el candidato
+  // correcto, no con el que la Capa B había elegido.
+  let visualCalls = 0;
+  const visualEvaluated = [];
+  __setFetchJsonForTesting(async () => ({
+    hits: [
+      { id: 2846221, tags: "macbook, escritorio, oficina en casa, computadora", pageURL: "https://pixabay.com/es/photos/negocio-computadora-movil-2846221/", largeImageURL: "https://cdn.example/2846221-large.jpg", webformatURL: "https://cdn.example/2846221-web.jpg", user: "autor-b" },
+      { id: 1868496, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/1868496", largeImageURL: "https://cdn.example/1868496-large.jpg", webformatURL: "https://cdn.example/1868496-web.jpg", user: "autor-a" },
+    ],
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 2846221, reason: "las etiquetas mencionan macbook/escritorio/oficina", usage: { input_tokens: 400, output_tokens: 20 } }));
+  __setVisualValidatorForTesting(async ({ hit }) => {
+    visualCalls++;
+    visualEvaluated.push(hit.id);
+    if (hit.id === 2846221) {
+      return { aprobado: false, motivo: "la miniatura muestra un celular sobre un cuaderno, no una laptop", usage: { input_tokens: 300, output_tokens: 18 }, thumbnailUrl: "https://cdn.example/2846221-web.jpg" };
+    }
+    return { aprobado: true, motivo: "la miniatura muestra una laptop real sobre un escritorio", usage: { input_tokens: 300, output_tokens: 16 }, thumbnailUrl: "https://cdn.example/1868496-web.jpg" };
+  });
+  const resource = { id: "test-image-positivo-cascada", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-cascada-acepta"), assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("cascada: la Capa C evaluó los 2 finalistas en orden (primero el de la Capa B, luego el otro)", visualEvaluated.join(",") === "2846221,1868496");
+  check("cascada: se detiene apenas uno aprueba -- exactamente 2 evaluaciones, no reintenta de más", visualCalls === 2);
+  check("cascada: el recurso queda ACEPTADO con el candidato que la Capa C aprobó (1868496), no con el de la Capa B (2846221)", resolved.resolvedAsset?.assetId === 1868496);
+  const rechazoParcialLine = logLines.find((l) => l.includes("Capa C") && l.includes("#2846221") && l.includes("rechazado"));
+  check("log: queda registrado el rechazo del candidato de la Capa B por la Capa C, con su motivo", rechazoParcialLine?.includes("celular"));
+  const elegidoLine = logLines.find((l) => l.includes("ELEGIDO"));
+  check("log: ELEGIDO aclara que este candidato no pasó por la Capa B (la aprobó otro que la Capa C rechazó)", elegidoLine?.includes("capa B había aprobado otro candidato (#2846221)"));
+  check("log: ELEGIDO incluye el motivo real de la Capa C para el candidato aceptado", elegidoLine?.includes("laptop real sobre un escritorio"));
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
+}
+
+{
+  // Si la Capa C rechaza TODOS los finalistas disponibles (hasta el
+  // máximo de 3), el recurso queda pendiente -- nunca se fuerza una
+  // elección ni se vuelve al candidato de la Capa B "por defecto".
+  let visualCalls = 0;
+  __setFetchJsonForTesting(async () => ({
+    hits: [
+      { id: 101, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/101", webformatURL: "https://cdn.example/101-web.jpg", user: "x" },
+      { id: 102, tags: "laptop, oficina, escritorio, trabajo", pageURL: "https://pixabay.com/x/102", webformatURL: "https://cdn.example/102-web.jpg", user: "x" },
+      { id: 103, tags: "laptop, oficina, escritorio, computadora", pageURL: "https://pixabay.com/x/103", webformatURL: "https://cdn.example/103-web.jpg", user: "x" },
+    ],
+  }));
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 101, reason: "mejor coincidencia de etiquetas", usage: { input_tokens: 400, output_tokens: 20 } }));
+  __setVisualValidatorForTesting(async ({ hit }) => {
+    visualCalls++;
+    return { aprobado: false, motivo: `candidato #${hit.id}: no corresponde al sujeto pedido`, usage: { input_tokens: 300, output_tokens: 15 }, thumbnailUrl: `https://cdn.example/${hit.id}-web.jpg` };
+  });
+  const resource = { id: "test-todos-rechazados", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-todos-rechazados"), assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("todos rechazados: se evaluaron los 3 finalistas, ni uno más (tope autorizado por Alex)", visualCalls === 3);
+  check("todos rechazados: el recurso queda pendiente, no se inserta nada", resolved.resolvedAsset === undefined);
+  check("todos rechazados: el motivo incluye los 3 candidatos evaluados con su motivo", ["101", "102", "103"].every((id) => resolved.acquisitionFailureReason?.includes(`#${id}`)));
+  const rechazadoLine = logLines.find((l) => l.includes("RECHAZADO (capa C)"));
+  check("log: RECHAZADO (capa C) menciona el recurso y conserva al presentador", rechazadoLine?.includes("test-todos-rechazados") && rechazadoLine?.includes("presentador en pantalla"));
+  __setFetchJsonForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
+}
+
+{
+  // Fallo TÉCNICO de la Capa C en un candidato (no un rechazo de
+  // sujeto) -- debe cascadear al siguiente finalista igual, no
+  // confundir "no pude evaluarlo" con "lo evalué y no corresponde".
+  let visualCalls = 0;
+  __setFetchJsonForTesting(async () => ({
+    hits: [
+      { id: 201, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/201", webformatURL: "https://cdn.example/201-web.jpg", user: "x" },
+      { id: 202, tags: "laptop, oficina, escritorio, trabajo", pageURL: "https://pixabay.com/x/202", webformatURL: "https://cdn.example/202-web.jpg", user: "x" },
+    ],
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 201, reason: "mejor coincidencia", usage: { input_tokens: 400, output_tokens: 20 } }));
+  __setVisualValidatorForTesting(async ({ hit }) => {
+    visualCalls++;
+    if (hit.id === 201) {
+      const err = new Error("timeout de red descargando la miniatura (simulado)");
+      throw err;
+    }
+    return { aprobado: true, motivo: "corresponde", usage: { input_tokens: 300, output_tokens: 16 }, thumbnailUrl: "https://cdn.example/202-web.jpg" };
+  });
+  const resource = { id: "test-fallo-tecnico-cascada", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-fallo-tecnico-cascada"), assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("fallo técnico en el 1er candidato: cascadea al 2do y lo acepta", resolved.resolvedAsset?.assetId === 202);
+  check("fallo técnico: se intentó 2 veces el reintento del 1er candidato antes de pasar al 2do", visualCalls === 3); // 201 (intento 1 + reintento) + 202 (1 intento)
+  const fallaLine = logLines.find((l) => l.includes("quedó sin validar tras un fallo técnico"));
+  check("log: el fallo técnico del 1er candidato queda registrado aparte del rechazo semántico", fallaLine?.includes("#201") && fallaLine?.includes("timeout de red"));
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
+}
+
+{
+  // Video sin ningún campo de miniatura utilizable en ningún tamaño:
+  // la Capa C no puede evaluar nada -- el recurso queda pendiente
+  // "sin miniatura utilizable", NUNCA se inserta confiando solo en la
+  // Capa B. Usa la función REAL (sin inyectar __setVisualValidatorForTesting)
+  // porque el fallo ocurre ANTES de cualquier llamada a Anthropic --
+  // no hay red ni clave de por medio.
+  __setFetchJsonForTesting(async () => ({
+    hits: [
+      {
+        id: 301,
+        tags: "ilustracion, molecula, dopamina, cerebro",
+        pageURL: "https://pixabay.com/videos/id-301/",
+        videos: { medium: { url: "https://cdn.example/301.mp4" } }, // sin "thumbnail" en ningún tamaño
+        user: "x",
+        type: "film",
+      },
+    ],
+  }));
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 301, reason: "única coincidencia real", usage: { input_tokens: 300, output_tokens: 15 } }));
+  const resource = { id: "test-video-sin-miniatura", type: "broll", description: "x", visualQuery: "ilustración de una molécula de dopamina en el cerebro" };
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-video-sin-miniatura"), assetsDir, jobId: "job-test" });
+  check("video sin miniatura: queda pendiente, nunca se inserta sin validar visualmente", resolved.resolvedAsset === undefined);
+  check("video sin miniatura: el motivo dice que no había miniatura utilizable", resolved.acquisitionFailureReason?.includes("miniatura"));
+  __setFetchJsonForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+}
+
+{
+  // La miniatura NUNCA se manda como `source: {type: "url"}` apuntando
+  // al CDN de Pixabay (decisión explícita, ver comentario grande en
+  // resource-acquisition.mjs: los términos de Pixabay prohíben el
+  // hotlinking permanente) -- siempre se descarga primero (inyectando
+  // __setDownloadBytesForTesting, nunca la red real) y se manda en
+  // base64. Se verifica contra la llamada REAL a messages.create (vía
+  // el cliente de Anthropic falso), no contra un resumen de alto nivel.
+  let downloadedUrl = null;
+  let sentImageBlock = null;
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 401, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/401", previewURL: "https://cdn.example/401-preview.jpg", webformatURL: "https://cdn.example/401-web.jpg", user: "x" }],
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 401, reason: "coincide", usage: { input_tokens: 300, output_tokens: 15 } }));
+  __setDownloadBytesForTesting(async (url) => {
+    downloadedUrl = url;
+    return { buffer: Buffer.from("contenido-falso-de-imagen"), contentType: "image/jpeg" };
+  });
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        sentImageBlock = params.messages[0].content.find((b) => b.type === "image");
+        return { content: [{ type: "text", text: '{"aprobado": true, "motivo": "corresponde"}' }], stop_reason: "end_turn", usage: { input_tokens: 300, output_tokens: 16 } };
+      },
+    },
+  });
+  const resource = { id: "test-nunca-url-directa", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-nunca-url"), assetsDir, jobId: "job-test" });
+  check("nunca URL directa: se descargó la miniatura con webformatURL (nunca previewURL)", downloadedUrl === "https://cdn.example/401-web.jpg");
+  check("nunca URL directa: el bloque de imagen mandado a Anthropic usa 'base64', nunca 'url'", sentImageBlock?.source?.type === "base64" && sentImageBlock?.source?.data === Buffer.from("contenido-falso-de-imagen").toString("base64"));
+  check("nunca URL directa: el recurso se acepta normalmente con esta ruta", resolved.resolvedAsset?.assetId === 401);
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setDownloadBytesForTesting(null);
+  __setAnthropicClientForTesting(null);
+}
+
+{
+  // Variante del incidente real de la Capa B (respuesta vacía),
+  // ahora en la CAPA C: primer intento de messages.create devuelve
+  // texto vacío (misma forma del incidente real), el reintento trae
+  // JSON válido -- confirma que la Capa C tiene el mismo
+  // diagnóstico/reintento, ejercitando la función REAL (no un
+  // validador inyectado de alto nivel).
+  let createCalls = 0;
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 501, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/501", webformatURL: "https://cdn.example/501-web.jpg", user: "x" }],
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 501, reason: "coincide", usage: { input_tokens: 300, output_tokens: 15 } }));
+  __setDownloadBytesForTesting(async () => ({ buffer: Buffer.from("img"), contentType: "image/jpeg" }));
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async () => {
+        createCalls++;
+        if (createCalls === 1) {
+          return { content: [], stop_reason: "end_turn", usage: { input_tokens: 420, output_tokens: 0 } };
+        }
+        return { content: [{ type: "text", text: '{"aprobado": true, "motivo": "la miniatura real muestra una laptop en un escritorio"}' }], stop_reason: "end_turn", usage: { input_tokens: 420, output_tokens: 18 } };
+      },
+    },
+  });
+  const resource = { id: "test-capa-c-respuesta-vacia", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-capa-c-vacia"), assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("Capa C respuesta vacía + reintento: hubo 2 llamadas reales, se acepta tras la segunda", createCalls === 2 && resolved.resolvedAsset?.assetId === 501);
+  const diagLine = logLines.find((l) => l.includes("Capa C -- intento 1/2"));
+  check("log: diagnóstico real de la Capa C (stop_reason, bloques, VACÍA) -- sin claves", diagLine?.includes('stop_reason="end_turn"') && diagLine?.includes("VACÍA") && !diagLine.includes("fake"));
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setDownloadBytesForTesting(null);
+  __setAnthropicClientForTesting(null);
 }
 
 {
@@ -504,18 +800,22 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
 }
 
 {
-  // Falla la descarga (red) tras que la Capa B aprueba un candidato: no tumba nada.
-  __setFetchJsonForTesting(async () => ({ hits: [{ id: 10, tags: "neurona, cerebro, primer-plano, fotografia", largeImageURL: "https://cdn.example/10.jpg", user: "x" }] }));
+  // Falla la descarga (red) tras que la Capa B y la Capa C aprueban un candidato: no tumba nada.
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 10, tags: "neurona, cerebro, primer-plano, fotografia", largeImageURL: "https://cdn.example/10.jpg", webformatURL: "https://cdn.example/10-web.jpg", user: "x" }],
+  }));
   __setDownloadToFileForTesting(async () => {
     throw new Error("ECONNRESET (simulado)");
   });
   __setRelevanceValidatorForTesting(acceptBestFinalist);
+  __setVisualValidatorForTesting(acceptVisually);
   const resource = { id: "ai-resource-3", type: "image", description: "x", visualQuery: "fotografía de una neurona en primer plano" };
   const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir, assetsDir, jobId: "job-test" });
   check("resolveOneResource: fallo de descarga -- sin resolvedAsset, con motivo, sin lanzar", resolved.resolvedAsset === undefined && resolved.acquisitionFailureReason?.includes("ECONNRESET"));
   __setFetchJsonForTesting(null);
   __setDownloadToFileForTesting(null);
   __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
 }
 
 {
@@ -534,9 +834,12 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
 // --- acquireResourcesForJob ---
 
 {
-  __setFetchJsonForTesting(async () => ({ hits: [{ id: 20, tags: "sinapsis, cerebro, ilustracion, neurociencia", largeImageURL: "https://cdn.example/20.jpg", user: "x" }] }));
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 20, tags: "sinapsis, cerebro, ilustracion, neurociencia", largeImageURL: "https://cdn.example/20.jpg", webformatURL: "https://cdn.example/20-web.jpg", user: "x" }],
+  }));
   __setDownloadToFileForTesting(async () => {});
   __setRelevanceValidatorForTesting(acceptBestFinalist);
+  __setVisualValidatorForTesting(acceptVisually);
   const resources = [
     { id: "r0", type: "image", description: "x", visualQuery: "ilustración de una sinapsis cerebral" },
     { id: "r1", type: "graphic", description: "no debería tocarse", graphicVariant: "stat", graphicData: { value: "1", label: "x" } },
@@ -552,6 +855,7 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
   __setFetchJsonForTesting(null);
   __setDownloadToFileForTesting(null);
   __setRelevanceValidatorForTesting(null);
+  __setVisualValidatorForTesting(null);
 }
 
 await fs.rm(tmpDir, { recursive: true, force: true });
