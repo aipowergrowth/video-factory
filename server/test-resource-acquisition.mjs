@@ -43,6 +43,7 @@ import {
   RELEVANCE_MODEL_INPUT_PRICE_PER_TOKEN,
   RELEVANCE_MODEL_OUTPUT_PRICE_PER_TOKEN,
   pickThumbnailUrl,
+  detectImageContentTypeFromBytes,
   searchPixabay,
   resolveOneResource,
   acquireResourcesForJob,
@@ -187,6 +188,21 @@ check(
 );
 check("pickThumbnailUrl (video): si falta 'tiny', sube a 'small', luego 'medium', luego 'large'", pickThumbnailUrl({ videos: { large: { thumbnail: "L" } } }, "video") === "L");
 check("pickThumbnailUrl (video): sin ningún thumbnail en ningún tamaño, null", pickThumbnailUrl({ videos: { medium: { url: "solo-url-sin-thumbnail" } } }, "video") === null);
+
+// --- detectImageContentTypeFromBytes (defecto real: #1868496 vino con
+// cabecera image/jpeg pero el archivo real era PNG -- Anthropic lo
+// rechazó con HTTP 400. El tipo se determina por la firma de bytes,
+// nunca por la cabecera ni la extensión de la URL.) ---
+
+check("detectImageContentTypeFromBytes: firma JPEG (FF D8 FF)", detectImageContentTypeFromBytes(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10])) === "image/jpeg");
+check(
+  "detectImageContentTypeFromBytes: firma PNG (89 50 4E 47 0D 0A 1A 0A) -- el defecto real: esto NO es jpeg aunque la cabecera lo diga",
+  detectImageContentTypeFromBytes(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00])) === "image/png",
+);
+check("detectImageContentTypeFromBytes: firma GIF89a", detectImageContentTypeFromBytes(Buffer.from("GIF89a", "latin1")) === "image/gif");
+check("detectImageContentTypeFromBytes: firma WebP (RIFF....WEBP)", detectImageContentTypeFromBytes(Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.from([0, 0, 0, 0]), Buffer.from("WEBP", "latin1")])) === "image/webp");
+check("detectImageContentTypeFromBytes: bytes sin firma reconocida -- null, nunca adivina", detectImageContentTypeFromBytes(Buffer.from("esto no es una imagen de ningún tipo")) === null);
+check("detectImageContentTypeFromBytes: buffer vacío -- null, sin lanzar", detectImageContentTypeFromBytes(Buffer.alloc(0)) === null);
 
 // --- computeRelevanceCallCostUsd ---
 
@@ -797,6 +813,153 @@ check("computeRelevanceCallCostUsd: sin uso, costo 0", computeRelevanceCallCostU
   check("log: el diagnóstico distingue 'VACÍA' de un JSON simplemente mal formado", logLines.some((l) => l.includes("VACÍA")));
   __setAnthropicClientForTesting(null);
   __setFetchJsonForTesting(null);
+}
+
+{
+  // DEFECTO 1 REAL reproducido EXACTO (job b7c0c8ac, 01-nov-2026):
+  // candidato #2846221 -- la API devolvió stop_reason="max_tokens" con
+  // bloques [thinking, text], y el texto quedó TRUNCADO a mitad de un
+  // veredicto que SÍ rechazaba el candidato ({"aprobado": false,
+  // "motivo": "Aparece una laptop, pero el escritorio es de madera
+  // rústica..." -- sin cerrar). Esto debe tratarse como un FALLO
+  // TÉCNICO (JSON incompleto), NUNCA como un veredicto válido --
+  // aunque el texto truncado "diga" aprobado:false, no se puede leer
+  // como una decisión real. Confirma también que la llamada ahora
+  // manda `thinking: {type: "disabled"}` (el arreglo de raíz).
+  let createCalls = 0;
+  let sentThinkingConfig = null;
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 2846221, tags: "macbook, escritorio, oficina en casa, computadora", pageURL: "https://pixabay.com/es/photos/negocio-computadora-movil-2846221/", webformatURL: "https://cdn.example/2846221-web.jpg", user: "x" }],
+  }));
+  __setDownloadBytesForTesting(async () => ({ buffer: Buffer.from([0xff, 0xd8, 0xff]), contentType: "image/jpeg" }));
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 2846221, reason: "coincide por etiquetas", usage: { input_tokens: 400, output_tokens: 20 } }));
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        createCalls++;
+        sentThinkingConfig = params.thinking;
+        return {
+          content: [
+            { type: "thinking", thinking: "" },
+            { type: "text", text: '{"aprobado": false, "motivo": "Aparece una laptop, pero el escritorio es de madera rústica con un cuaderno, un teléfono y un bolígrafo, sin un entor' },
+          ],
+          stop_reason: "max_tokens",
+          usage: { input_tokens: 500, output_tokens: 300 },
+        };
+      },
+    },
+  });
+  const resource = { id: "defecto-1-thinking-truncado", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-defecto-1"), assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("defecto 1: la llamada manda thinking:{type:'disabled'} (el arreglo de raíz)", sentThinkingConfig?.type === "disabled");
+  check("defecto 1: el JSON truncado con 'aprobado: false' a medias NUNCA cuenta como veredicto válido", createCalls === 2); // se reintentó -- no se tomó el texto truncado como respuesta
+  check("defecto 1: tras 2 intentos iguales, el recurso queda pendiente (fallo técnico, no un rechazo semántico real)", resolved.resolvedAsset === undefined);
+  // El motivo final SÍ puede citar el texto truncado (es diagnóstico
+  // útil), pero debe quedar etiquetado como "fallo técnico" -- nunca
+  // como si "aprobado: false" fuera un veredicto real que se respetó.
+  check("defecto 1: el motivo del rechazo queda etiquetado como fallo técnico, no como un veredicto real respetado", resolved.acquisitionFailureReason?.includes("fallo técnico"));
+  const diagLine = logLines.find((l) => l.includes("Capa C -- intento 1/2"));
+  check("log: el diagnóstico distingue bloques [thinking, text] y stop_reason=max_tokens -- no confunde el texto parcial con un veredicto", diagLine?.includes("bloques de contenido=[thinking, text]") && diagLine?.includes('stop_reason="max_tokens"'));
+  __setFetchJsonForTesting(null);
+  __setDownloadBytesForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setAnthropicClientForTesting(null);
+}
+
+{
+  // Lo mismo que el defecto 1, pero para la Capa B (texto, sin imagen)
+  // -- confirma que el MISMO arreglo (thinking: disabled) se aplicó
+  // ahí también, no solo en la Capa C. Esto es, con evidencia, la
+  // explicación real y completa del incidente de respuesta vacía del
+  // 01-nov-2026 (job 0e88b0b1): la hipótesis original ("solo
+  // max_tokens insuficiente") era parcial.
+  let sentThinkingConfig = null;
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 601, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/601", webformatURL: "https://cdn.example/601-web.jpg", user: "x" }],
+  }));
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        sentThinkingConfig = params.thinking;
+        return { content: [], stop_reason: "end_turn", usage: { input_tokens: 300, output_tokens: 0 } };
+      },
+    },
+  });
+  const resource = { id: "defecto-1-capa-b-thinking", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-defecto-1-capa-b"), assetsDir, jobId: "job-test" });
+  check("defecto 1 (Capa B): la llamada de texto también manda thinking:{type:'disabled'}", sentThinkingConfig?.type === "disabled");
+  __setFetchJsonForTesting(null);
+  __setAnthropicClientForTesting(null);
+}
+
+{
+  // DEFECTO 2 REAL reproducido EXACTO: candidato #1868496 -- el CDN
+  // declaró la miniatura como image/jpeg (cabecera HTTP), pero el
+  // archivo real era un PNG -- Anthropic respondió HTTP 400. Con el
+  // arreglo (detectar por firma de bytes, no por cabecera/extensión),
+  // esto debe funcionar: se manda media_type:"image/png" de verdad, y
+  // Anthropic lo acepta.
+  let sentMediaType = null;
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+  __setFetchJsonForTesting(async () => ({
+    hits: [{ id: 1868496, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/1868496", webformatURL: "https://cdn.example/1868496-web.jpg", user: "x" }], // URL termina en nada que sugiera PNG -- a propósito
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 1868496, reason: "coincide", usage: { input_tokens: 300, output_tokens: 15 } }));
+  __setDownloadBytesForTesting(async () => ({ buffer: pngBytes, contentType: detectImageContentTypeFromBytes(pngBytes) }));
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async (params) => {
+        sentMediaType = params.messages[0].content.find((b) => b.type === "image")?.source?.media_type;
+        return { content: [{ type: "text", text: '{"aprobado": true, "motivo": "corresponde"}' }], stop_reason: "end_turn", usage: { input_tokens: 300, output_tokens: 16 } };
+      },
+    },
+  });
+  const resource = { id: "defecto-2-png-con-cabecera-jpeg", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-defecto-2"), assetsDir, jobId: "job-test" });
+  check("defecto 2: el tipo real (PNG, detectado por firma de bytes) se manda correctamente, aunque la cabecera/URL sugirieran otra cosa", sentMediaType === "image/png");
+  check("defecto 2: el recurso se acepta normalmente con el tipo correcto", resolved.resolvedAsset?.assetId === 1868496);
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setDownloadBytesForTesting(null);
+  __setAnthropicClientForTesting(null);
+}
+
+{
+  // Variante del defecto 2: la miniatura descargada no tiene ninguna
+  // firma reconocible (ni JPEG/PNG/GIF/WebP) -- nunca se adivina un
+  // tipo, el candidato queda rechazado con ese motivo técnico y
+  // cascadea al siguiente finalista.
+  __setFetchJsonForTesting(async () => ({
+    hits: [
+      { id: 701, tags: "laptop, oficina, escritorio, moderno", pageURL: "https://pixabay.com/x/701", webformatURL: "https://cdn.example/701-web.jpg", user: "x" },
+      { id: 702, tags: "laptop, oficina, escritorio, trabajo", pageURL: "https://pixabay.com/x/702", webformatURL: "https://cdn.example/702-web.jpg", user: "x" },
+    ],
+  }));
+  __setDownloadToFileForTesting(async () => {});
+  __setRelevanceValidatorForTesting(async () => ({ chosenId: 701, reason: "coincide", usage: { input_tokens: 300, output_tokens: 15 } }));
+  __setDownloadBytesForTesting(async (url) => {
+    const bytes = url.includes("701") ? Buffer.from("no es ninguna imagen reconocible") : Buffer.from([0xff, 0xd8, 0xff]);
+    return { buffer: bytes, contentType: detectImageContentTypeFromBytes(bytes) };
+  });
+  __setAnthropicClientForTesting({
+    messages: {
+      create: async () => ({ content: [{ type: "text", text: '{"aprobado": true, "motivo": "corresponde"}' }], stop_reason: "end_turn", usage: { input_tokens: 300, output_tokens: 16 } }),
+    },
+  });
+  const resource = { id: "defecto-2-sin-firma-reconocible", type: "image", description: "x", visualQuery: "laptop sobre un escritorio de oficina moderno" };
+  const logLines = [];
+  const resolved = await resolveOneResource({ resource, apiKey: "fake", cacheDir: path.join(tmpDir, "cache-defecto-2-sin-firma"), assetsDir, jobId: "job-test", log: (m) => logLines.push(m) });
+  check("sin firma reconocible: cascadea al 2do candidato (con firma JPEG válida) y lo acepta", resolved.resolvedAsset?.assetId === 702);
+  const fallaLine = logLines.find((l) => l.includes("#701") && l.includes("quedó sin validar"));
+  check("log: el candidato sin firma reconocible queda registrado con ese motivo técnico, nunca se adivina un tipo", fallaLine?.includes("firma de bytes"));
+  __setFetchJsonForTesting(null);
+  __setDownloadToFileForTesting(null);
+  __setRelevanceValidatorForTesting(null);
+  __setDownloadBytesForTesting(null);
+  __setAnthropicClientForTesting(null);
 }
 
 {

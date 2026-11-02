@@ -296,13 +296,22 @@ export const computeRelevanceCallCostUsd = (usage) =>
 // repetidas ("iphone" x4, "oficina" x5 en los datos crudos de
 // Pixabay), la llamada devolvió texto VACÍO y el recurso (un caso
 // positivo real) quedó rechazado por el fail-safe en vez de aceptado.
-// 200 tokens de salida era insuficiente margen; se sube a 1024 --
-// el costo real no sube con esto, porque se cobra por lo que el
-// modelo efectivamente genera, no por el tope. No se pide "thinking"
-// (razonamiento extendido) en ningún parámetro -- está apagado por
-// default en la API de Mensajes; si alguna vez apareciera un bloque de
-// ese tipo, los diagnósticos de abajo lo mostrarían en vez de fallar
-// en silencio.
+// CAUSA RAÍZ real, confirmada el 01-nov-2026 con una segunda corrida
+// real (ver Capa C abajo): esta hipótesis original ("era solo
+// max_tokens insuficiente") era PARCIAL. La causa de fondo es que la
+// API de Mensajes tiene el razonamiento extendido ("thinking") ENCENDIDO
+// POR DEFECTO, y claude-haiku-5-5 por defecto usa thinking ADAPTATIVO
+// sin que se pida nada -- confirmado en la documentación oficial
+// (platform.claude.com/docs/en/build-with-claude/thinking: "Messages
+// API: On by default"; tabla por modelo: Haiku 5.5 sin el campo
+// "thinking" -> "Adaptive thinking"). Eso consumía el presupuesto de
+// salida con un bloque "thinking" antes de completar el JSON. Se
+// corrige con `thinking: {type: "disabled"}` (confirmado que Haiku 5.5
+// acepta ese valor, con thinking apagado del todo, mientras no se le
+// pida un "effort" de xhigh/max -- no se pide ninguno aquí). Además,
+// se sube el margen de salida de 200 a 1024 tokens como defensa
+// adicional -- el costo real no sube con esto, porque se cobra por lo
+// que el modelo efectivamente genera, no por el tope.
 const RELEVANCE_MAX_OUTPUT_TOKENS = 1024;
 // 1 reintento automático ante un fallo TÉCNICO (respuesta vacía, JSON
 // no parseable, error de red/timeout) -- nunca ante un veredicto real
@@ -405,6 +414,7 @@ const realValidateRelevanceWithAI = async ({ query, finalists }) => {
   const response = await client.messages.create({
     model: RELEVANCE_MODEL,
     max_tokens: RELEVANCE_MAX_OUTPUT_TOKENS,
+    thinking: { type: "disabled" },
     messages: [{ role: "user", content: buildRelevancePrompt(query, finalists) }],
   });
   const usage = response.usage ?? { input_tokens: 0, output_tokens: 0 };
@@ -480,7 +490,17 @@ const VISUAL_MAX_EVALUATIONS = 3;
 // TÉCNICO (nunca ante un "no corresponde" -- eso es un veredicto
 // válido, no un error).
 const VISUAL_MAX_ATTEMPTS = 2;
-const VISUAL_MAX_OUTPUT_TOKENS = 300;
+// DEFECTO REAL (job b7c0c8ac, 01-nov-2026): con 300 tokens de salida y
+// el razonamiento extendido encendido por defecto (ver Capa B arriba),
+// la llamada se agotó en stop_reason="max_tokens" con un bloque
+// "thinking" que consumió el presupuesto -- el JSON quedó truncado a
+// mitad de un veredicto que SÍ rechazaba el candidato correctamente
+// ({"aprobado": false, "motivo": "Aparece una laptop, pero el
+// escritorio es de madera rústica..." -- cortado ahí). Mismo arreglo
+// que la Capa B: `thinking: {type: "disabled"}` en la llamada de abajo,
+// más este margen subido de 300 a 1024 como defensa adicional (sin
+// costo real extra -- se cobra por lo generado, no por el tope).
+const VISUAL_MAX_OUTPUT_TOKENS = 1024;
 
 // DECISIÓN (pedida explícitamente por Alex antes de codificar esto):
 // la miniatura NUNCA se manda como `source: {type: "url", url: ...}`
@@ -496,6 +516,43 @@ const VISUAL_MAX_OUTPUT_TOKENS = 300;
 // pueda alcanzar el CDN de Pixabay desde sus propios servidores (no
 // confirmado, y ahora irrelevante porque no se usa esa vía).
 const SUPPORTED_IMAGE_CONTENT_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+/**
+ * DEFECTO REAL (job b7c0c8ac, 01-nov-2026): el candidato #1868496 vino
+ * declarado como `image/jpeg` (por la cabecera HTTP que mandó el CDN)
+ * pero el archivo real era un PNG -- Anthropic lo rechazó con HTTP 400
+ * ("the image appears to be a image/png image"). Ni la cabecera
+ * Content-Type ni la extensión de la URL son confiables (un CDN puede
+ * mentir en cualquiera de las dos); el tipo real se determina por la
+ * FIRMA DE BYTES del archivo descargado, que nunca miente. Devuelve
+ * `null` si no reconoce ninguna firma soportada -- eso es, a propósito,
+ * un fallo técnico (nunca se adivina un tipo).
+ */
+export const detectImageContentTypeFromBytes = (buffer) => {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (buffer.length >= 6 && buffer.toString("latin1", 0, 3) === "GIF" && buffer[3] === 0x38 && (buffer[4] === 0x37 || buffer[4] === 0x39) && buffer[5] === 0x61) {
+    return "image/gif";
+  }
+  if (buffer.length >= 12 && buffer.toString("latin1", 0, 4) === "RIFF" && buffer.toString("latin1", 8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  return null;
+};
 
 /**
  * La miniatura a evaluar visualmente -- NUNCA la imagen/video completo.
@@ -527,7 +584,10 @@ const realDownloadBytes = async (url) => {
     throw new Error(`HTTP ${res.status} al descargar la miniatura`);
   }
   const buffer = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get("content-type")?.split(";")[0]?.trim() ?? "image/jpeg";
+  // El tipo se determina por la firma de bytes del archivo real, NUNCA
+  // por la cabecera Content-Type ni por la extensión de la URL -- ver
+  // el comentario grande de detectImageContentTypeFromBytes arriba.
+  const contentType = detectImageContentTypeFromBytes(buffer);
   return { buffer, contentType };
 };
 let downloadBytes = realDownloadBytes;
@@ -601,14 +661,19 @@ const realEvaluateCandidateVisually = async ({ query, hit, mediaType }) => {
   } catch (err) {
     throw new Error(`no se pudo descargar la miniatura del candidato #${hit.id} (${thumbnailUrl}): ${err.message ?? err}`);
   }
-  if (!SUPPORTED_IMAGE_CONTENT_TYPES.has(image.contentType)) {
-    throw new Error(`la miniatura del candidato #${hit.id} vino con un tipo no soportado ("${image.contentType}").`);
+  if (!image.contentType || !SUPPORTED_IMAGE_CONTENT_TYPES.has(image.contentType)) {
+    throw new Error(
+      image.contentType
+        ? `la miniatura del candidato #${hit.id} es un formato no soportado por Anthropic ("${image.contentType}", detectado por la firma de bytes real del archivo).`
+        : `la miniatura del candidato #${hit.id} no tiene una firma de bytes reconocible como JPEG/PNG/GIF/WebP -- no se puede determinar su tipo real con confianza.`,
+    );
   }
 
   const client = getClient();
   const response = await client.messages.create({
     model: RELEVANCE_MODEL,
     max_tokens: VISUAL_MAX_OUTPUT_TOKENS,
+    thinking: { type: "disabled" },
     messages: [
       {
         role: "user",
