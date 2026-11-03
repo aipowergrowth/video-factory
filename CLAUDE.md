@@ -209,6 +209,7 @@ node server/test-subtitles.mjs
 node server/test-timeline.mjs
 node server/test-atomic-json-store.mjs
 node server/test-video-normalization.mjs
+node server/test-channel-editorial-loader.mjs
 ```
 
 Estas tres **no** corren en esta Mac (necesitan FFmpeg/Chrome reales, que

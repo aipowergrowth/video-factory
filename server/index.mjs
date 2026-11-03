@@ -23,6 +23,7 @@ import { acquireResourcesForJob, readPixabayApiKey } from "./resource-acquisitio
 import { readGeminiApiKey } from "./image-generation.mjs";
 import { createAtomicJsonWriter } from "./atomic-json-store.mjs";
 import { isAutoConvertibleCodec, probeBasicVideoInfo, normalizeVideoInputCodec } from "./video-normalization.mjs";
+import { loadChannelEditorialContext } from "./channel-editorial-loader.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -515,25 +516,6 @@ const readChannelVisualStyle = async (channel) => {
   }
 };
 
-const loadChannelEditorialContext = async (channel, layout) => {
-  const channelDir = path.join(PROJECT_ROOT, "public/channels", channel);
-  const guidelines =
-    (layout &&
-      (await fsp
-        .readFile(path.join(channelDir, `editorial-guidelines.${layout}.md`), "utf8")
-        .catch(() => null))) ??
-    (await fsp.readFile(path.join(channelDir, "editorial-guidelines.md"), "utf8").catch(() => null));
-  const resourceProfile = await fsp
-    .readFile(path.join(channelDir, "editorial-profile.json"), "utf8")
-    .then(JSON.parse)
-    .catch(() => null);
-  const correctionsHistory = await fsp
-    .readFile(path.join(channelDir, "editorial-corrections.json"), "utf8")
-    .then(JSON.parse)
-    .catch(() => []);
-  return { guidelines, resourceProfile, correctionsHistory };
-};
-
 const planEditIfNeeded = async (jobId, job) => {
   throwIfCancelled(jobId);
   if (job.input.type !== "recorded-video") return job;
@@ -544,6 +526,7 @@ const planEditIfNeeded = async (jobId, job) => {
   if (!Array.isArray(job.captions) || job.captions.length === 0) return job;
 
   const { guidelines, resourceProfile, correctionsHistory } = await loadChannelEditorialContext(
+    PROJECT_ROOT,
     job.channel,
     job.layout,
   );
@@ -1180,6 +1163,7 @@ app.post("/jobs/:id/replan", async (req, res) => {
   // el job guardado, si no ninguno (guía base del canal).
   const layout = (req.is("application/json") && req.body?.layout) || job.layout;
   const { guidelines, resourceProfile, correctionsHistory } = await loadChannelEditorialContext(
+    PROJECT_ROOT,
     job.channel,
     layout,
   );
