@@ -22,6 +22,7 @@ import { resolveCompositorFfprobe, resolveCompositorFfmpeg, binaryEnv } from "./
 import { shouldBurnCaptions, buildSrt } from "./subtitles.mjs";
 import { acquireResourcesForJob, readPixabayApiKey } from "./resource-acquisition.mjs";
 import { readGeminiApiKey } from "./image-generation.mjs";
+import { createAtomicJsonWriter } from "./atomic-json-store.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -213,11 +214,44 @@ const jobFilePath = (jobId) => path.join(UPLOADS_JOBS_DIR, `${jobId}.json`);
 const statusFilePath = (jobId) =>
   path.join(UPLOADS_JOBS_DIR, `${jobId}.status.json`);
 
+/**
+ * Causa raíz verificada de 7 archivos `.status.json` reales con un
+ * JSON válido seguido de caracteres sobrantes (02-nov-2026): la
+ * versión anterior de `writeStatus` llamaba `fs.writeFile` (no
+ * atómico) sin esperar su propia finalización -- cualquier dos
+ * llamadas para el MISMO job podían tener sus escrituras en disco
+ * corriendo a la vez, sin ninguna relación de orden entre ellas.
+ * Ejemplo real y concreto en este mismo archivo, no hipotético:
+ * `enqueue()` escribe "queued" y, en el mismo tick (sin ningún await
+ * de por medio más que una lectura de archivo), `processQueue()` ya
+ * está corriendo `resolveJobInput()`, que escribe "downloading" --
+ * dos `fs.writeFile` al mismo path, despachados al threadpool de
+ * libuv sin ninguna sincronización. El mecanismo exacto de la
+ * corrupción, y la corrección (archivo temporal + rename atómico,
+ * serializado por job), viven en `./atomic-json-store.mjs` -- separado
+ * para poder probarlo sin levantar este servidor (igual que
+ * resource-acquisition.mjs/editorial.mjs/etc.). El callback de error
+ * vacío de la versión anterior (`() => {}`) hacía que cualquier fallo
+ * de escritura, incluida esta corrupción, nunca apareciera en ningún
+ * lado -- ahora se reporta en el log.
+ *
+ * La firma y el valor de retorno de `writeStatus` quedan IGUAL --
+ * sigue siendo síncrona desde afuera, actualiza `jobs` de inmediato;
+ * ningún llamador existente cambia.
+ */
+const statusWriter = createAtomicJsonWriter({
+  onError: (jobId, err) => {
+    console.log(
+      `[job ${jobId}] no se pudo persistir el estado en disco (${err.message ?? err}) -- el estado en memoria sigue correcto, pero no sobrevive un reinicio del servicio.`,
+    );
+  },
+});
+
 const writeStatus = (jobId, patch) => {
   const current = jobs.get(jobId) ?? {};
   const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
   jobs.set(jobId, next);
-  fs.writeFile(statusFilePath(jobId), JSON.stringify(next, null, 2), () => {});
+  statusWriter.write(jobId, statusFilePath(jobId), next);
   return next;
 };
 
@@ -952,6 +986,7 @@ const cleanupOldFiles = async () => {
       }
     }
     jobs.delete(jobId);
+    statusWriter.forget(jobId);
   }
 
   if (deleted > 0) {
