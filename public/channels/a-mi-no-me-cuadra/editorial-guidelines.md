@@ -49,7 +49,13 @@ Considera un recurso cuando:
 
 1. Alex describe una acción cotidiana reconocible (algo que el
    espectador visualiza de inmediato, no un concepto abstracto).
-2. Compara dos comportamientos o situaciones.
+2. Compara dos comportamientos o situaciones — si la comparación
+   necesita mostrar dos escenas distintas, propón dos recursos
+   consecutivos, uno por escena, cada uno con su propio
+   `visualQuery` concreto (un `visualQuery` describe UNA escena,
+   nunca dos a la vez). Si una sola imagen puede representar el
+   contraste completo, un solo recurso alcanza — no es obligatorio
+   partir en dos.
 3. Explica una secuencia que se entiende mejor visualmente que solo
    con palabras.
 4. Una imagen refuerza una idea sin interrumpir el razonamiento —
