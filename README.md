@@ -187,8 +187,12 @@ swift scripts/trim_video.swift entrada.mp4 salida.mp4 <duracionSeg> <inicioSeg>
 
 `trim_video.swift` reencoda a H.264: el Chromium que usa Remotion para
 renderizar **no decodifica HEVC/H.265** (formato típico de iPhone/cámara).
-Todo video original en HEVC debe pasar por aquí (o por el equivalente en
-la API — ver abajo) antes de usarse como `baseVideo`.
+Si vas a recortar un video HEVC con esta herramienta local, pasa por acá
+primero. La API (`POST /jobs`, Drive o subida directa) ya NO necesita este
+paso: convierte HEVC/H.265 a H.264 automáticamente dentro del motor antes
+de procesar el trabajo (autorizado 03-nov-2026, ver
+`server/video-normalization.mjs`) — solo rechaza códecs que no sean
+H.264/VP8/VP9/AV1 ni HEVC/H.265.
 
 ## Renderizar en macOS 12 (Monterey)
 

@@ -55,3 +55,6 @@ jobs:
 
       - name: Pruebas de regresión con audio real (mismo FFmpeg que producción)
         run: node server/test-audio-regression.mjs
+
+      - name: Pruebas de regresión de conversión de video (mismo FFmpeg que producción)
+        run: node server/test-video-conversion-regression.mjs

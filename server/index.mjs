@@ -1,7 +1,6 @@
 import express from "express";
 import multer from "multer";
-import { spawn, execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -23,8 +22,7 @@ import { shouldBurnCaptions, buildSrt } from "./subtitles.mjs";
 import { acquireResourcesForJob, readPixabayApiKey } from "./resource-acquisition.mjs";
 import { readGeminiApiKey } from "./image-generation.mjs";
 import { createAtomicJsonWriter } from "./atomic-json-store.mjs";
-
-const execFileAsync = promisify(execFile);
+import { isAutoConvertibleCodec, probeBasicVideoInfo, normalizeVideoInputCodec } from "./video-normalization.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -77,6 +75,21 @@ const RETENTION_DAYS = Number(process.env.RETENTION_DAYS ?? 7);
 const CLEANUP_INTERVAL_HOURS = Number(
   process.env.CLEANUP_INTERVAL_HOURS ?? 6,
 );
+// Conversión automática HEVC/H.265 -> H.264 (autorizado por Alex,
+// 03-nov-2026 -- ver server/video-normalization.mjs para la causa raíz
+// y el diseño completo). Un video de iPhone en 4K puede tardar bastante
+// en convertirse con 4 CPUs (ver docker-stack.yml); el margen por
+// defecto es generoso pero independiente del timeout de render (180
+// min), porque pasa ANTES del render, no durante.
+const VIDEO_CONVERSION_TIMEOUT_MINUTES = Number(
+  process.env.VIDEO_CONVERSION_TIMEOUT_MINUTES ?? 120,
+);
+const VIDEO_CONVERSION_PRESET = process.env.VIDEO_CONVERSION_PRESET ?? "veryfast";
+const VIDEO_CONVERSION_CRF = Number(process.env.VIDEO_CONVERSION_CRF ?? 20);
+// Mismo límite que "cpus: 4" en docker-stack.yml -- no dejar que ffmpeg
+// use más hilos de los que el contenedor en realidad tiene.
+const VIDEO_CONVERSION_THREADS = Number(process.env.VIDEO_CONVERSION_THREADS ?? 4);
+
 // Reintentos para la descarga desde Google Drive.
 const DRIVE_DOWNLOAD_MAX_ATTEMPTS = Number(
   process.env.DRIVE_DOWNLOAD_MAX_ATTEMPTS ?? 3,
@@ -141,40 +154,7 @@ const resolveFfmpeg = () => resolveCompositorFfmpeg({ binariesDirectory: REMOTIO
  */
 const probeVideoInfo = async (filePath) => {
   const ffprobePath = resolveFfprobe();
-  const env = binaryEnv(ffprobePath);
-  const { stdout } = await execFileAsync(
-    ffprobePath,
-    [
-      "-v",
-      "error",
-      "-select_streams",
-      "v:0",
-      "-show_entries",
-      "stream=codec_name,width,height",
-      "-show_entries",
-      "format=duration",
-      "-of",
-      "default=nw=1",
-      filePath,
-    ],
-    { env },
-  );
-  const fields = Object.fromEntries(
-    stdout
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => {
-        const idx = line.indexOf("=");
-        return [line.slice(0, idx), line.slice(idx + 1)];
-      }),
-  );
-  return {
-    codec: fields.codec_name,
-    width: fields.width ? Number(fields.width) : null,
-    height: fields.height ? Number(fields.height) : null,
-    durationSeconds: fields.duration ? Number(fields.duration) : null,
-  };
+  return probeBasicVideoInfo(filePath, { ffprobePath, env: binaryEnv(ffprobePath) });
 };
 
 /**
@@ -255,6 +235,40 @@ const writeStatus = (jobId, patch) => {
   return next;
 };
 
+/**
+ * Normaliza el códec de un video de entrada (Drive o subida directa, ya
+ * unificados en un solo `sourcePath` local por quien llama) -- wrapper
+ * fino sobre `normalizeVideoInputCodec` de video-normalization.mjs,
+ * donde vive toda la lógica real (así se puede probar con FFmpeg real
+ * en CI sin levantar este servidor, ver test-video-conversion-regression.mjs).
+ * Acá solo se conectan las piezas propias de este servidor: estado del
+ * job, log con prefijo `[job <id>]`, y el mecanismo de cancelación ya
+ * existente (`runningChildren`/`cancelledJobIds`/`CancelledError`).
+ */
+const normalizeVideoCodec = (jobId, sourcePath, destPath) => {
+  const ffmpegPath = resolveFfmpeg();
+  const ffprobePath = resolveFfprobe();
+  return normalizeVideoInputCodec({
+    jobId,
+    sourcePath,
+    destPath,
+    allowedCodecs: ALLOWED_VIDEO_CODECS,
+    ffmpegPath,
+    ffprobePath,
+    env: binaryEnv(ffmpegPath),
+    threads: VIDEO_CONVERSION_THREADS,
+    preset: VIDEO_CONVERSION_PRESET,
+    crf: VIDEO_CONVERSION_CRF,
+    timeoutMs: VIDEO_CONVERSION_TIMEOUT_MINUTES * 60 * 1000,
+    onStatus: (patch) => writeStatus(jobId, patch),
+    onLog: (message) => console.log(`[job ${jobId}] ${message}`),
+    registerChild: (child) => runningChildren.set(jobId, child),
+    unregisterChild: () => runningChildren.delete(jobId),
+    isCancelled: () => cancelledJobIds.has(jobId),
+    makeCancelledError: () => new CancelledError(jobId),
+  });
+};
+
 const recoverJobsFromDisk = () => {
   let recovered = 0;
   let markedAsInterrupted = 0;
@@ -267,6 +281,7 @@ const recoverJobsFromDisk = () => {
       if (
         status.status === "queued" ||
         status.status === "downloading" ||
+        status.status === "converting" ||
         status.status === "transcribing" ||
         status.status === "planning" ||
         status.status === "cancelling" ||
@@ -365,45 +380,47 @@ const runRender = (jobId) =>
   });
 
 /**
- * Si el trabajo vino con una referencia de Drive (en vez de un archivo ya
- * subido), lo descarga ahora: streaming a disco, con reintentos y
- * verificación de tamaño/MD5. Si ya tiene `baseVideo` (subida directa),
- * no hace nada.
+ * Si el trabajo vino con una referencia de Drive, lo descarga ahora:
+ * streaming a disco, con reintentos y verificación de tamaño/MD5. Si
+ * vino por subida directa pero necesitaba conversión de códec (HEVC),
+ * el archivo ya está en disco (`pendingVideoFile`, dejado por
+ * `POST /jobs`) y solo falta normalizarlo. Si ya tiene `baseVideo`
+ * (subida directa sin conversión necesaria), no hace nada. En ambos
+ * casos de descarga/subida pendiente, el códec se normaliza acá mismo
+ * (ver `normalizeVideoCodec`) antes de continuar el resto del pipeline.
  */
 const resolveJobInput = async (jobId, job) => {
   throwIfCancelled(jobId);
   if (job.input.type !== "recorded-video" || job.input.baseVideo) {
     return job;
   }
-  if (!job.input.driveFileId) {
+  if (!job.input.driveFileId && !job.input.pendingVideoFile) {
     throw new Error(
       'input.type es "recorded-video": falta "baseVideo" (subida directa) o "driveFileId" (Drive).',
     );
   }
 
-  writeStatus(jobId, { status: "downloading" });
-  console.log(`[job ${jobId}] descargando de Drive: ${job.input.driveFileId}`);
-
   const destPath = path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`);
-  const partPath = `${destPath}.part`;
+  let sourcePath;
 
-  await downloadFileWithRetry(job.input.driveFileId, partPath, {
-    maxAttempts: DRIVE_DOWNLOAD_MAX_ATTEMPTS,
-    waitMs: DRIVE_DOWNLOAD_WAIT_MS,
-  });
-
-  const info = await probeVideoInfo(partPath);
-  if (!ALLOWED_VIDEO_CODECS.has(info.codec)) {
-    await fsp.unlink(partPath).catch(() => {});
-    throw new Error(
-      `Códec de video "${info.codec}" no soportado (se necesita H.264/VP8/VP9/AV1, no HEVC/H.265). Convierte el video antes de subirlo a Drive.`,
-    );
+  if (job.input.driveFileId) {
+    writeStatus(jobId, { status: "downloading" });
+    console.log(`[job ${jobId}] descargando de Drive: ${job.input.driveFileId}`);
+    sourcePath = `${destPath}.part`;
+    await downloadFileWithRetry(job.input.driveFileId, sourcePath, {
+      maxAttempts: DRIVE_DOWNLOAD_MAX_ATTEMPTS,
+      waitMs: DRIVE_DOWNLOAD_WAIT_MS,
+    });
+  } else {
+    sourcePath = path.join(UPLOADS_VIDEOS_DIR, job.input.pendingVideoFile);
   }
 
-  await safeRename(partPath, destPath);
+  const info = await normalizeVideoCodec(jobId, sourcePath, destPath);
+
   job.input.baseVideo = `uploads/videos/${jobId}.mp4`;
   job.input.durationInSeconds = info.durationSeconds;
   delete job.input.driveFileId;
+  delete job.input.pendingVideoFile;
   await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
 
   return job;
@@ -975,6 +992,14 @@ const cleanupOldFiles = async () => {
     for (const file of [
       path.join(OUTPUTS_DIR, `${jobId}.mp4`),
       path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`),
+      // Huérfanos posibles si el servicio se reinició a mitad de una
+      // conversión HEVC->H.264 (ver normalizeVideoCodec): el archivo
+      // original pendiente de convertir, y el archivo de salida a
+      // medio escribir. recoverJobsFromDisk() ya marca el job como
+      // "error" en ese caso -- esto solo limpia los archivos.
+      path.join(UPLOADS_VIDEOS_DIR, `${jobId}.source.mp4`),
+      path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4.converting.mp4`),
+      path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4.part`),
       jobFilePath(jobId),
       statusFilePath(jobId),
     ]) {
@@ -1032,25 +1057,38 @@ app.post("/jobs", upload.single("video"), async (req, res) => {
         const info = await probeVideoInfo(req.file.path).catch((probeErr) => {
           throw new Error(`No se pudo verificar el video subido: ${probeErr.message}`);
         });
-        if (!ALLOWED_VIDEO_CODECS.has(info.codec)) {
+
+        if (ALLOWED_VIDEO_CODECS.has(info.codec)) {
+          const videoDest = path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`);
+          await safeRename(req.file.path, videoDest);
+          job.input.baseVideo = `uploads/videos/${jobId}.mp4`;
+          job.input.durationInSeconds = info.durationSeconds;
+        } else if (isAutoConvertibleCodec(info.codec)) {
+          // HEVC/H.265 (típico de iPhone): se acepta igual, pero la
+          // conversión a H.264 puede tardar minutos en un video largo
+          // -- no se hace acá (bloquearía esta respuesta HTTP), pasa en
+          // la cola (resolveJobInput/normalizeVideoCodec), igual que ya
+          // pasa con la descarga de Drive. Solo se deja el archivo en
+          // su ubicación definitiva, pendiente de normalizar.
+          const pendingFileName = `${jobId}.source.mp4`;
+          await safeRename(req.file.path, path.join(UPLOADS_VIDEOS_DIR, pendingFileName));
+          job.input.pendingVideoFile = pendingFileName;
+        } else {
           await fsp.unlink(req.file.path).catch(() => {});
           return res.status(422).json({
-            error: `Códec de video "${info.codec}" no soportado (se necesita H.264/VP8/VP9/AV1, no HEVC/H.265). Convierte el video antes de subirlo.`,
+            error: `Códec de video "${info.codec}" no soportado. H.264/VP8/VP9/AV1 se aceptan directamente; HEVC/H.265 (típico de iPhone) se convierte automáticamente. Este códec no es ninguno de esos -- convierte el video antes de subirlo.`,
           });
         }
-
-        const videoDest = path.join(UPLOADS_VIDEOS_DIR, `${jobId}.mp4`);
-        await safeRename(req.file.path, videoDest);
-        job.input.baseVideo = `uploads/videos/${jobId}.mp4`;
-        job.input.durationInSeconds = info.durationSeconds;
       } else if (!job.input.driveFileId) {
         return res.status(400).json({
           error:
             'input.type es "recorded-video": falta el archivo "video" (subida directa) o "input.driveFileId" (Drive).',
         });
       }
-      // Si vino driveFileId, la descarga pasa en la cola (resolveJobInput),
-      // no aquí — así el POST responde al instante aunque el archivo pese GBs.
+      // Si vino driveFileId, o si el archivo subido necesita conversión
+      // de códec, el trabajo pesado pasa en la cola (resolveJobInput),
+      // no aquí — así el POST responde al instante aunque el archivo
+      // pese GBs o la conversión tarde minutos.
     }
 
     await fsp.writeFile(jobFilePath(jobId), JSON.stringify(job, null, 2));
