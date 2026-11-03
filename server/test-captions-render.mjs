@@ -118,11 +118,62 @@ await fs.writeFile(
   ),
 );
 
-/** Cuadro en frame 15 (0.5s a 30fps) -- bien dentro de la ventana del subtítulo (0-3000ms). */
-const renderStill = async (jobFileRelPath, outputPngPath) => {
+// Estilo dinámico vertical (03-nov-2026, autorizado por Alex): un
+// recurso "emoji" (requiere fonts-noto-color-emoji en el contenedor,
+// ver Dockerfile) + subtítulos con desglose por palabra (ver
+// server/captions.mjs#groupCaptions) -- una línea con DOS palabras,
+// "UNO" (0-1500ms) y "DOS" (1500-3000ms), para confirmar con un render
+// real que la palabra resaltada cambia de una a otra, no un color fijo.
+const dynamicStyleJobRelPath = `${FIXTURES_REL_DIR}/dynamic-style-test.json`;
+await fs.writeFile(
+  path.join(PROJECT_ROOT, "public", dynamicStyleJobRelPath),
+  JSON.stringify(
+    {
+      channel: "a-mi-no-me-cuadra", // theme.accentColor = "#E53935" (rojo), conocido para esta prueba
+      destination: "vertical-9-16",
+      input: { type: "recorded-video", baseVideo: BASE_VIDEO_REL, durationInSeconds: 3 },
+      overlays: [],
+      captions: [
+        {
+          text: "UNO DOS",
+          startMs: 0,
+          endMs: 3000,
+          timestampMs: null,
+          confidence: null,
+          words: [
+            { text: "UNO", startFraction: 0, endFraction: 0.5 },
+            { text: "DOS", startFraction: 0.5, endFraction: 1 },
+          ],
+        },
+      ],
+      cuts: [],
+      zooms: [],
+      resources: [
+        {
+          id: "test-emoji",
+          startSeconds: 0,
+          endSeconds: 3,
+          type: "emoji",
+          description: "prueba de render real",
+          emojiChar: "🚨",
+          editorialGoal: "emotion",
+          segment: "development",
+          intensity: "moderate",
+          veracityRequirement: "illustrative-ok",
+          essential: false,
+        },
+      ],
+    },
+    null,
+    2,
+  ),
+);
+
+/** Cuadro en el frame pedido (15 por defecto = 0.5s a 30fps) -- bien dentro de la ventana del subtítulo (0-3000ms). */
+const renderStill = async (jobFileRelPath, outputPngPath, frame = 15) => {
   await execFileAsync(
     "npx",
-    ["remotion", "still", "VideoEngine", outputPngPath, `--props=${JSON.stringify({ jobFile: jobFileRelPath })}`, "--frame=15", "--image-format=png"],
+    ["remotion", "still", "VideoEngine", outputPngPath, `--props=${JSON.stringify({ jobFile: jobFileRelPath })}`, `--frame=${frame}`, "--image-format=png"],
     { cwd: PROJECT_ROOT, env: process.env, maxBuffer: 1024 * 1024 * 64 },
   );
 };
@@ -234,6 +285,47 @@ const countWhitePixelsInBand = ({ width, height, channels, pixels }, { topFracti
 const countWhitePixelsInCaptionBand = (frame, threshold) => countWhitePixelsInBand(frame, { topFraction: 0.75, bottomFraction: 1 }, threshold);
 const countWhitePixelsInCenterBand = (frame, threshold) => countWhitePixelsInBand(frame, { topFraction: 0.35, bottomFraction: 0.65 }, threshold);
 
+/**
+ * Cuenta píxeles "con color real" (no grises/blancos/negros: la
+ * diferencia entre su canal más alto y más bajo supera el umbral) en
+ * una región rectangular del cuadro (fracciones de ancho/alto 0-1).
+ * Estilo dinámico vertical (03-nov-2026): el fondo del fixture es negro
+ * puro (max-min=0) y el texto de subtítulos/CTA es blanco o gris (igual
+ * max-min bajo) -- un emoji con fuente de color (`fonts-noto-color-emoji`,
+ * ver Dockerfile) tiene matices reales (rojo/azul/amarillo), así que
+ * esto distingue "hay un emoji de verdad" de "tofu" (un glifo vacío
+ * también sería monocromático) o de cualquier otro texto ya existente.
+ */
+const countColorfulPixelsInRegion = (
+  { width, height, channels, pixels },
+  { leftFraction, rightFraction, topFraction, bottomFraction },
+  saturationThreshold = 40,
+) => {
+  const left = Math.floor(width * leftFraction);
+  const right = Math.floor(width * rightFraction);
+  const top = Math.floor(height * topFraction);
+  const bottom = Math.floor(height * bottomFraction);
+  let count = 0;
+  for (let y = top; y < bottom; y++) {
+    for (let x = left; x < right; x++) {
+      const offset = (y * width + x) * channels;
+      const r = pixels[offset];
+      const g = pixels[offset + 1];
+      const b = pixels[offset + 2];
+      if (Math.max(r, g, b) - Math.min(r, g, b) > saturationThreshold) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+};
+/** Top-derecha, donde `EmojiOverlay` posiciona el emoji (ver src/engine/EmojiOverlay.tsx). */
+const countColorfulPixelsInEmojiRegion = (frame) =>
+  countColorfulPixelsInRegion(frame, { leftFraction: 0.55, rightFraction: 1, topFraction: 0, bottomFraction: 0.3 });
+/** Dentro de la franja de subtítulos, buscando el color de acento del canal (resaltado de palabra). */
+const countAccentColoredPixelsInCaptionBand = (frame) =>
+  countColorfulPixelsInRegion(frame, { leftFraction: 0, rightFraction: 1, topFraction: 0.75, bottomFraction: 1 });
+
 for (const [destination, jobRelPath] of Object.entries(jobPaths)) {
   const pngPath = path.join(FIXTURES_DIR, `${destination}.png`);
   try {
@@ -266,6 +358,51 @@ for (const [destination, jobRelPath] of Object.entries(jobPaths)) {
     check("graphic (stat): ResourceRenderer despachó a StatCallout -- hay contenido visible en el centro del cuadro", whitePixels > 20, `whitePixels=${whitePixels}`);
   } catch (err) {
     check("graphic (stat): el still de Remotion se renderizó sin error", false, String(err.message ?? err));
+  }
+}
+
+{
+  // Estilo dinámico vertical: emoji con color real (fuente instalada
+  // en el contenedor) + resaltado de palabra activo en dos cuadros
+  // distintos del mismo job (cada uno debería tener EXACTAMENTE una
+  // palabra resaltada, "UNO" o "DOS" según el cuadro -- la aritmética
+  // exacta de qué palabra corresponde a qué fracción ya se prueba de
+  // forma aislada y determinística en test-captions-grouping.mjs; esta
+  // prueba solo confirma que un render real de Remotion/Chromium
+  // efectivamente pinta el color de acento en la franja de subtítulos
+  // cuando `words` está presente, no un resaltado fijo en un color o
+  // ausente).
+  const pngUno = path.join(FIXTURES_DIR, "dynamic-style-uno.png");
+  const pngDos = path.join(FIXTURES_DIR, "dynamic-style-dos.png");
+  try {
+    // Frame 15 (0.5s): dentro de la mitad "UNO" (fracción 0-0.5 de 0-3000ms).
+    await renderStill(dynamicStyleJobRelPath, pngUno, 15);
+    // Frame 75 (2.5s): dentro de la mitad "DOS" (fracción 0.5-1).
+    await renderStill(dynamicStyleJobRelPath, pngDos, 75);
+    check("estilo dinámico: ambos cuadros se renderizaron sin error", true);
+
+    const frameUno = await readPngAsRgb(pngUno);
+    const frameDos = await readPngAsRgb(pngDos);
+
+    const emojiPixelsUno = countColorfulPixelsInEmojiRegion(frameUno);
+    const emojiPixelsDos = countColorfulPixelsInEmojiRegion(frameDos);
+    console.log(`[dynamic-style] píxeles con color real en la región del emoji: frame15=${emojiPixelsUno}, frame75=${emojiPixelsDos}`);
+    check(
+      "emoji: hay píxeles con color real en su región (no son tofu ni fondo negro) en AMBOS cuadros -- la fuente de emoji está instalada y Remotion lo dibuja",
+      emojiPixelsUno > 5 && emojiPixelsDos > 5,
+      `emojiPixelsUno=${emojiPixelsUno} emojiPixelsDos=${emojiPixelsDos}`,
+    );
+
+    const accentPixelsUno = countAccentColoredPixelsInCaptionBand(frameUno);
+    const accentPixelsDos = countAccentColoredPixelsInCaptionBand(frameDos);
+    console.log(`[dynamic-style] píxeles con el color de acento en la franja de subtítulos: frame15(UNO activa)=${accentPixelsUno}, frame75(DOS activa)=${accentPixelsDos}`);
+    check(
+      "resaltado de palabra: aparece el color de acento del canal en la franja de subtítulos en AMBOS cuadros (nunca texto plano blanco) -- confirma que Captions.tsx usó el desglose por palabra de verdad en un render real, no el fallback de línea completa",
+      accentPixelsUno > 5 && accentPixelsDos > 5,
+      `accentPixelsUno=${accentPixelsUno} accentPixelsDos=${accentPixelsDos}`,
+    );
+  } catch (err) {
+    check("estilo dinámico: el still de Remotion se renderizó sin error", false, String(err.message ?? err));
   }
 }
 

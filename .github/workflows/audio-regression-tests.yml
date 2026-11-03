@@ -52,6 +52,10 @@ jobs:
           node server/test-drive-simulated.mjs
           node server/test-audio-analysis.mjs
           node server/test-quality-gate.mjs
+          node server/test-atomic-json-store.mjs
+          node server/test-video-normalization.mjs
+          node server/test-channel-editorial-loader.mjs
+          node server/test-captions-grouping.mjs
 
       - name: Pruebas de regresión con audio real (mismo FFmpeg que producción)
         run: node server/test-audio-regression.mjs

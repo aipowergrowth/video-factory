@@ -156,6 +156,7 @@ export const isValidGraphicData = (variant, data) => {
 export const isRenderableByEngine = (resource) =>
   Boolean(resource.ctaPosition) ||
   (resource.type === "text-highlight" && Boolean(resource.displayText)) ||
+  (resource.type === "emoji" && Boolean(resource.emojiChar)) ||
   (resource.type === "graphic" && isValidGraphicData(resource.graphicVariant, resource.graphicData)) ||
   ((resource.type === "broll" || resource.type === "image") && Boolean(resource.resolvedAsset));
 
@@ -185,9 +186,13 @@ export const computePendingResources = (resources, log) => {
         resource.acquisitionFailureReason ??
         (resource.type === "text-highlight"
           ? 'recurso "text-highlight" sin "displayText" -- el modelo no definió el texto exacto a mostrar; nunca se usa "description" como reemplazo.'
-          : resource.type === "graphic"
-            ? 'recurso "graphic" sin datos estructurados válidos ("graphicVariant"/"graphicData") -- nunca se inventan cifras o pasos para completarlo.'
-            : `tipo "${resource.type}" todavía no se puede representar visualmente -- pendiente de adquisición y/o verificación de un recurso real.`),
+          : resource.type === "emoji"
+            ? 'recurso "emoji" sin "emojiChar" -- el modelo no definió qué emoji mostrar.'
+            : resource.type === "graphic"
+              ? 'recurso "graphic" sin datos estructurados válidos ("graphicVariant"/"graphicData") -- nunca se inventan cifras o pasos para completarlo.'
+              : resource.type === "music" || resource.type === "sfx"
+                ? `recurso "${resource.type}" sin fuente de audio con licencia conectada todavía -- Pixabay (ya integrado para broll/image) no tiene una API de audio pública; falta autorizar y conectar un proveedor con licencia verificable (p.ej. Freesound) antes de poder resolver esto. Nunca se inserta sin una licencia clara.`
+                : `tipo "${resource.type}" todavía no se puede representar visualmente -- pendiente de adquisición y/o verificación de un recurso real.`),
     }));
 
   if (pending.length > 0) {

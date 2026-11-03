@@ -122,7 +122,12 @@ const RESOURCE_TYPES = [
   "transition",
   "music",
   "sfx",
+  "emoji",
 ];
+// Estilo dinámico vertical (03-nov-2026, autorizado por Alex): intensidad
+// por defecto si el perfil del canal no define la suya -- ver
+// "verticalStyleIntensity" en editorial-profile.json.
+const DEFAULT_VERTICAL_STYLE_INTENSITY = "moderate";
 const EDITORIAL_GOALS = ["evidence", "comprehension", "context", "emotion", "emphasis", "transition"];
 const SEGMENTS = ["intro", "development", "demonstration", "transition", "closing"];
 const INTENSITIES = ["subtle", "moderate", "prominent"];
@@ -140,6 +145,7 @@ const buildPrompt = ({
   granularity,
   durationInSeconds,
   destination,
+  layout,
 }) => {
   const cutPrecisionInstruction =
     granularity === "word"
@@ -152,6 +158,48 @@ const buildPrompt = ({
         ? ` NUNCA inventes ni presentes como real: ${resourceProfile.neverFabricate.join(", ")}.`
         : "")
     : "";
+
+  // Estilo dinámico vertical (03-nov-2026, autorizado por Alex): por
+  // defecto en vertical-9-16 con presentador a cámara (nunca en
+  // screen-share, donde la guía propia del canal ya dice explícitamente
+  // "no zooms"/"resources: [] por defecto" -- esta sección NUNCA debe
+  // contradecir eso). Ajustable por canal sin tocar este archivo vía
+  // "verticalStyleIntensity" en editorial-profile.json ("off" lo apaga
+  // por completo). En 16:9 el comportamiento queda idéntico al de antes
+  // -- esta sección entera queda vacía.
+  const verticalStyleIntensity =
+    destination === "vertical-9-16" && layout !== "screen-share" && resourceProfile?.hasOnCameraPresenter !== false
+      ? resourceProfile?.verticalStyleIntensity ?? DEFAULT_VERTICAL_STYLE_INTENSITY
+      : "off";
+  const verticalDynamicStyleText =
+    verticalStyleIntensity === "off"
+      ? ""
+      : `## Estilo dinámico de formato corto (este video es vertical, presentador a cámara)
+
+Este formato (TikTok/Instagram/Shorts) se edita con más dinamismo visual que YouTube horizontal. Intensidad configurada para este canal: "${verticalStyleIntensity}". Tomalo como una inclinación hacia MÁS zooms de énfasis y MÁS texto clave en pantalla que en 16:9 -- SIEMPRE dentro del mismo criterio de la guía de arriba sobre CUÁNDO corresponde cada uno. Esta sección ajusta la frecuencia esperada hacia arriba, nunca el criterio editorial de cuándo usarlos -- nunca inventes un momento de énfasis que no existe en el discurso solo para cumplir con "más dinamismo".
+${
+  verticalStyleIntensity === "subtle"
+    ? 'Con intensidad "subtle", el ajuste es mínimo: prioriza casi siempre la cámara estable, con muy pocos momentos de énfasis adicionales respecto al criterio base del canal.'
+    : verticalStyleIntensity === "prominent"
+      ? 'Con intensidad "prominent", busca activamente más momentos de énfasis que el criterio base del canal sugeriría en 16:9 -- sin inventar ninguno que no esté en el discurso, y sin que deje de verse profesional (nunca sobrecargado).'
+      : 'Con intensidad "moderate" (la intermedia), un poco más de densidad que en 16:9, sin llegar a saturar.'
+}
+
+Los subtítulos de este formato YA resaltan automáticamente, palabra por palabra, la que se está diciendo en cada instante -- lo hace el sistema solo con los tiempos reales de la transcripción. No es algo que decidas ni que tengas que proponer como recurso.
+
+### Nuevo tipo de recurso: "emoji"
+
+Un emoji Unicode contextual, POCO FRECUENTE, solo donde refuerza con claridad una emoción o idea del discurso (p.ej. 🚨 para una alerta que el presentador describe, no para cualquier mención de "cuidado"). "emojiChar" debe ser el emoji en sí -- uno, o una secuencia corta tipo bandera/ZWJ -- nunca una palabra ni una descripción de qué emoji poner. No reemplaza a "text-highlight": es una nota emocional breve, no texto.
+${
+  resourceProfile?.neverFabricate?.length
+    ? `Regla que pesa más que cualquier otra de esta sección: NUNCA un emoji (ni ningún otro recurso nuevo de esta sección) cerca de ${resourceProfile.neverFabricate.join(", ")} -- un emoji al lado de una cifra real puede leerse como que esa cifra fue resaltada o verificada editorialmente, y no lo fue.`
+    : ""
+}
+
+### "music"/"sfx" en este formato
+
+Podés proponerlos si de verdad aportan (música baja de fondo, un efecto sutil) -- pero hoy no hay ninguna fuente de audio con licencia conectada al sistema, así que cualquier "music"/"sfx" que propongas queda pendiente (nunca se inserta sin licencia clara) hasta que Alex autorice y conecte un proveedor. No los propongas por rutina solo para "sonar completo" -- únicamente si el valor editorial es alto, igual que cualquier otro recurso.
+`;
 
   const correctionsText =
     Array.isArray(correctionsHistory) && correctionsHistory.length > 0
@@ -173,6 +221,7 @@ ${guidelines}
 
 ${resourceProfileText}
 
+${verticalDynamicStyleText}
 ${correctionsText}
 ## Precisión de los cortes
 
@@ -217,7 +266,7 @@ Piensa los tiempos de cada recurso en el tiempo del video ORIGINAL, igual que lo
 
 - Para "text-highlight": "displayText" debe ser SOLO palabras, cifras o nombres que el presentador diga literalmente en la transcripción -- nunca una paráfrasis ni un resumen tuyo. Si no hay una frase concreta y breve del presentador que puedas citar así, no propongas el recurso.
 - Para cualquier recurso con "ctaPosition" (CTA): "displayText" es una frase corta (como un cartel, no una oración larga) que invite a la acción -- nunca un enlace, un @usuario ni un nombre de perfil inventado. Si el presentador no dio pie a una frase concreta, podés omitir "displayText" en el CTA (el sistema usa una frase fija del canal) -- nunca inventes un dato de contacto para rellenarlo.
-- Para los demás tipos de recurso (broll, image, graphic, document-reference, transition, music, sfx), "displayText" no aplica -- no lo incluyas.
+- Para los demás tipos de recurso (broll, image, graphic, document-reference, transition, music, sfx, emoji), "displayText" no aplica -- no lo incluyas.
 
 ## "visualQuery" (solo para "broll" e "image"): qué buscar, no por qué
 
@@ -310,7 +359,8 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto antes ni después, si
       "displayText": "texto EXACTO a mostrar en pantalla (solo text-highlight y CTA, ver arriba) | null",
       "visualQuery": "qué buscar en un banco de imágenes/video, concreto y visual (solo broll/image, ver arriba) | null",
       "graphicVariant": "${GRAPHIC_VARIANTS.join('" | "')}" | null,
-      "graphicData": "objeto con la forma exacta de graphicVariant, con datos REALES dichos por el presentador (solo graphic, ver arriba) | null"
+      "graphicData": "objeto con la forma exacta de graphicVariant, con datos REALES dichos por el presentador (solo graphic, ver arriba) | null",
+      "emojiChar": "un emoji Unicode, o una secuencia corta tipo bandera/ZWJ (solo type=emoji, ver arriba) | null"
     }
   ],
   "notes": "resumen breve de tu criterio editorial para que un humano lo revise"
@@ -561,6 +611,14 @@ export const parseEditorialResponse = (rawText, durationInSeconds) => {
         // Fase 3B (31-oct-2026): consulta visual para broll/image (NUNCA
         // `description`, que es prosa editorial, no una búsqueda).
         visualQuery: typeof resource.visualQuery === "string" && resource.visualQuery.trim().length > 0 ? resource.visualQuery.trim() : undefined,
+        // Estilo dinámico vertical (03-nov-2026): un emoji/secuencia
+        // corta, nunca texto -- límite de longitud generoso (ZWJ/banderas
+        // combinan varios code points) pero suficiente para rechazar
+        // que el modelo ponga una palabra o frase ahí por error.
+        emojiChar:
+          resource.type === "emoji" && typeof resource.emojiChar === "string" && resource.emojiChar.trim().length > 0 && resource.emojiChar.trim().length <= 8
+            ? resource.emojiChar.trim()
+            : undefined,
         // graphicVariant/graphicData viajan juntos: si la forma no es
         // válida para la variante declarada, se descartan LOS DOS --
         // nunca se intenta "arreglar" datos a medio completar; el
@@ -1190,6 +1248,11 @@ export const planEdit = async ({
   correctionsHistory,
   durationInSeconds,
   destination,
+  // Opcional: estilo dinámico vertical (03-nov-2026) nunca debe
+  // activarse en screen-share, aunque algún día exista un job vertical
+  // con ese layout -- su propia guía ya dice "no zooms"/"resources: []
+  // por defecto" y esta sección jamás debe contradecirla.
+  layout,
   model = DEFAULT_MODEL,
   onLog = () => {},
 }) => {
@@ -1202,6 +1265,7 @@ export const planEdit = async ({
     granularity: useWords ? "word" : "line",
     durationInSeconds,
     destination,
+    layout,
   });
 
   const anthropic = getClient();

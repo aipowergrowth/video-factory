@@ -1197,5 +1197,158 @@ const w = (text, startSec, endSec) => ({ text, startMs: startSec * 1000, endMs: 
   if (previousKey) process.env.ANTHROPIC_API_KEY = previousKey;
 }
 
+// --- Estilo dinámico vertical (03-nov-2026, autorizado por Alex) ---
+
+// "emojiChar" (tipo "emoji") se parsea tal cual cuando es válido, y
+// NUNCA se inventa si falta o es demasiado largo (texto, no emoji).
+{
+  const withEmoji = JSON.stringify({
+    cuts: [], zooms: [],
+    resources: [
+      {
+        startSeconds: 5, endSeconds: 7,
+        type: "emoji",
+        description: "Reforzar la alerta que da el presentador",
+        emojiChar: "🚨",
+        editorialGoal: "emotion", segment: "development",
+      },
+      {
+        startSeconds: 10, endSeconds: 12,
+        type: "emoji",
+        description: "Recurso sin emojiChar -- no debe inventarse",
+        editorialGoal: "emotion", segment: "development",
+      },
+      {
+        startSeconds: 15, endSeconds: 17,
+        type: "emoji",
+        description: "emojiChar demasiado largo -- parece texto, no un emoji",
+        emojiChar: "esto no es un emoji, es una frase larga",
+        editorialGoal: "emotion", segment: "development",
+      },
+    ],
+    notes: "",
+  });
+  const plan = parseEditorialResponse(withEmoji, 200);
+  const withChar = plan.resources.find((r) => r.startSeconds === 5);
+  const withoutChar = plan.resources.find((r) => r.startSeconds === 10);
+  const tooLong = plan.resources.find((r) => r.startSeconds === 15);
+  check("emoji: emojiChar válido se parsea tal cual", withChar && withChar.emojiChar === "🚨");
+  check("emoji: sin emojiChar, el campo queda undefined (nunca se inventa)", withoutChar && withoutChar.emojiChar === undefined);
+  check("emoji: emojiChar demasiado largo (texto, no emoji) se descarta", tooLong && tooLong.emojiChar === undefined);
+}
+
+// El estilo dinámico vertical se inyecta en el prompt real SOLO para
+// vertical-9-16 con presentador a cámara (nunca en 16:9, nunca en
+// screen-share) -- probado contra el prompt de verdad que se le manda
+// a Claude (capturado del cliente falso), no una reimplementación.
+const makeCapturingFakeClient = () => {
+  let capturedPrompt = null;
+  const client = {
+    messages: {
+      create: async (params) => {
+        if (capturedPrompt === null) capturedPrompt = params.messages[0].content;
+        return {
+          content: [{ type: "text", text: JSON.stringify({ cuts: [], zooms: [], resources: [], notes: "" }) }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      },
+    },
+  };
+  return { client, getPrompt: () => capturedPrompt };
+};
+
+{
+  const { client, getPrompt } = makeCapturingFakeClient();
+  __setAnthropicClientForTesting(client);
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    resourceProfile: { hasOnCameraPresenter: true, verticalStyleIntensity: "prominent" },
+    durationInSeconds: 8,
+    destination: "vertical-9-16",
+  });
+  const prompt = getPrompt();
+  check("vertical-9-16: el prompt incluye la sección de estilo dinámico", prompt.includes("Estilo dinámico de formato corto"));
+  check("vertical-9-16: el prompt respeta la intensidad configurada por el canal (\"prominent\")", prompt.includes('"prominent"'));
+  check("vertical-9-16: el prompt menciona el nuevo tipo de recurso \"emoji\"", prompt.includes('Nuevo tipo de recurso: "emoji"'));
+}
+
+{
+  const { client, getPrompt } = makeCapturingFakeClient();
+  __setAnthropicClientForTesting(client);
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    resourceProfile: { hasOnCameraPresenter: true },
+    durationInSeconds: 8,
+    destination: "youtube-16-9",
+  });
+  check("youtube-16-9: el prompt NO incluye la sección de estilo dinámico (comportamiento idéntico al de antes)", !getPrompt().includes("Estilo dinámico de formato corto"));
+}
+
+{
+  // Vertical pero con layout "screen-share": la guía propia de ese
+  // formato ya dice "no zooms"/"resources: [] por defecto" -- el
+  // estilo dinámico NUNCA debe contradecirla.
+  const { client, getPrompt } = makeCapturingFakeClient();
+  __setAnthropicClientForTesting(client);
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de pantalla compartida",
+    resourceProfile: { hasOnCameraPresenter: true },
+    durationInSeconds: 8,
+    destination: "vertical-9-16",
+    layout: "screen-share",
+  });
+  check("vertical-9-16 + layout screen-share: el estilo dinámico NO se activa", !getPrompt().includes("Estilo dinámico de formato corto"));
+}
+
+{
+  // Canal sin presentador a cámara (p.ej. la-nave-tierra, hoy no
+  // funcional): el estilo dinámico tampoco debe activarse, aunque el
+  // destino sea vertical.
+  const { client, getPrompt } = makeCapturingFakeClient();
+  __setAnthropicClientForTesting(client);
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    resourceProfile: { hasOnCameraPresenter: false },
+    durationInSeconds: 8,
+    destination: "vertical-9-16",
+  });
+  check("vertical-9-16 sin presentador a cámara: el estilo dinámico NO se activa", !getPrompt().includes("Estilo dinámico de formato corto"));
+}
+
+{
+  // "off" explícito en el perfil del canal apaga el estilo dinámico
+  // sin tocar el motor -- criterio de aceptación 8.
+  const { client, getPrompt } = makeCapturingFakeClient();
+  __setAnthropicClientForTesting(client);
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    resourceProfile: { hasOnCameraPresenter: true, verticalStyleIntensity: "off" },
+    durationInSeconds: 8,
+    destination: "vertical-9-16",
+  });
+  check('vertical-9-16 con verticalStyleIntensity="off" en el perfil del canal: el estilo dinámico NO se activa', !getPrompt().includes("Estilo dinámico de formato corto"));
+}
+
+{
+  // La regla de nunca fabricar datos financieros se reitera dentro de
+  // la sección de estilo dinámico cuando el canal la tiene configurada
+  // (p.ej. Alex Cripto y Negocios) -- nunca "emoji" la pisa.
+  const { client, getPrompt } = makeCapturingFakeClient();
+  __setAnthropicClientForTesting(client);
+  await planEdit({
+    captions: fakeCaptions,
+    guidelines: "guía de prueba",
+    resourceProfile: { hasOnCameraPresenter: true, neverFabricate: ["financial-data"] },
+    durationInSeconds: 8,
+    destination: "vertical-9-16",
+  });
+  check("vertical-9-16 con neverFabricate: la sección de estilo dinámico reitera la regla", getPrompt().includes("financial-data"));
+}
+
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);
 process.exit(failures === 0 ? 0 : 1);

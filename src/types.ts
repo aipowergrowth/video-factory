@@ -1,6 +1,24 @@
 import type { CSSProperties } from "react";
 
 /**
+ * Una palabra dentro de una línea de subtítulo, para resaltar la que se
+ * está diciendo en este instante (estilo dinámico vertical, 03-nov-2026).
+ * Las fracciones son relativas a `[Caption.startMs, Caption.endMs]` de la
+ * línea que la contiene -- no un tiempo absoluto -- así sobreviven el
+ * remapeo por cortes (`engine/timeline.ts`) sin recalcularse: la línea ya
+ * remapeada sigue siendo un intervalo lineal, y la posición PROPORCIONAL
+ * de cada palabra dentro de ese intervalo no cambia, se haya cortado o
+ * no el video. Ver `server/captions.mjs#groupCaptions`, que las calcula
+ * a partir de los tiempos reales (por palabra) de whisper, ANTES de
+ * cualquier remapeo -- por eso son fracciones, no ms absolutos.
+ */
+export type CaptionWord = {
+  text: string;
+  startFraction: number;
+  endFraction: number;
+};
+
+/**
  * Compatible con el tipo `Caption` de `@remotion/captions`.
  * Se define a mano para no añadir esa dependencia hasta que haga falta
  * el resto de su API (agrupado estilo TikTok, resaltado de palabra, etc).
@@ -11,6 +29,15 @@ export type Caption = {
   endMs: number;
   timestampMs: number | null;
   confidence: number | null;
+  /**
+   * Opcional: desglose palabra por palabra de esta línea, para resaltar
+   * la que se está diciendo (`Captions.tsx`). Ausente en captions
+   * manuales/antiguas (sin transcripción por palabra) -- sin esto,
+   * `Captions.tsx` muestra la línea completa sin resaltado, exactamente
+   * el comportamiento de antes (fail-safe: nunca rompe, solo deja de
+   * resaltar).
+   */
+  words?: CaptionWord[];
 };
 
 type OverlayBase = {
@@ -236,7 +263,8 @@ export type ResourceType =
   | "text-highlight"
   | "transition"
   | "music"
-  | "sfx";
+  | "sfx"
+  | "emoji";
 
 export type CtaPosition = "start" | "middle" | "end";
 
@@ -276,6 +304,17 @@ export type Resource = {
    * motor usa la frase fija del canal (`ChannelProfile.theme.defaultCtaText`).
    */
   displayText?: string;
+
+  /**
+   * Estilo dinámico vertical (03-nov-2026), solo para `type: "emoji"`:
+   * un emoji Unicode (o una secuencia corta, p.ej. bandera/ZWJ) -- NUNCA
+   * texto, NUNCA una descripción. Sin esto, el recurso queda pendiente
+   * (ver `isRenderableByEngine`). Zero licencia/costo: es un glifo
+   * Unicode, no un archivo descargado -- lo único que hace falta es que
+   * el contenedor de render tenga una fuente de emoji instalada (ver
+   * Dockerfile, `fonts-noto-color-emoji`).
+   */
+  emojiChar?: string;
 
   /**
    * Fase 3B (31-oct-2026), solo para `type: "broll" | "image"`: consulta
@@ -393,6 +432,7 @@ export const isValidGraphicData = (
 export const isRenderableByEngine = (resource: Resource): boolean =>
   Boolean(resource.ctaPosition) ||
   (resource.type === "text-highlight" && Boolean(resource.displayText)) ||
+  (resource.type === "emoji" && Boolean(resource.emojiChar)) ||
   (resource.type === "graphic" && isValidGraphicData(resource.graphicVariant, resource.graphicData)) ||
   ((resource.type === "broll" || resource.type === "image") && Boolean(resource.resolvedAsset));
 

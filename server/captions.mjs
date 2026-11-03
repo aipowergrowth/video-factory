@@ -105,12 +105,28 @@ export const groupCaptions = (
     if (buf.length === 0) return;
     const text = bufText.trim();
     if (text.length > 0) {
+      const lineEnd = buf[buf.length - 1].endMs;
+      const lineSpan = lineEnd - bufStart;
+      // Estilo dinámico vertical (03-nov-2026): desglose palabra por
+      // palabra, como FRACCIÓN del tramo de la línea (no ms absolutos)
+      // -- así sobrevive el remapeo por cortes sin recalcularse (ver
+      // el comentario de `CaptionWord` en src/types.ts). `buf` ya tiene
+      // exactamente las palabras (post-corrección) que forman esta
+      // línea -- no hace falta volver a buscarlas.
+      const words = buf
+        .map((w) => ({
+          text: w.text.trim(),
+          startFraction: lineSpan > 0 ? (w.startMs - bufStart) / lineSpan : 0,
+          endFraction: lineSpan > 0 ? (w.endMs - bufStart) / lineSpan : 1,
+        }))
+        .filter((w) => w.text.length > 0);
       lines.push({
         text,
         startMs: bufStart,
-        endMs: buf[buf.length - 1].endMs,
+        endMs: lineEnd,
         timestampMs: null,
         confidence: null,
+        words,
       });
     }
     buf = [];

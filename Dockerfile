@@ -47,7 +47,10 @@ RUN node install-whisper.mjs
 FROM node:22-bookworm-slim
 
 # Dependencias de Chrome Headless Shell + libgomp (whisper.cpp la necesita
-# en tiempo de ejecución para el paralelismo de la inferencia).
+# en tiempo de ejecución para el paralelismo de la inferencia) +
+# fonts-noto-color-emoji (estilo dinámico vertical, 03-nov-2026: sin un
+# font de emoji instalado, Chromium no tiene ningún glifo de emoji para
+# dibujar -- rendería "tofu" (cuadrados vacíos) en vez del emoji real).
 RUN apt-get update && apt-get install -y --no-install-recommends \
   libnss3 \
   libdbus-1-3 \
@@ -64,6 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libcairo2 \
   libcups2 \
   libgomp1 \
+  fonts-noto-color-emoji \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

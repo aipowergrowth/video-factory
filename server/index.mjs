@@ -555,6 +555,7 @@ const planEditIfNeeded = async (jobId, job) => {
       correctionsHistory,
       durationInSeconds: job.input.durationInSeconds,
       destination: job.destination,
+      layout: job.layout,
       onLog: (msg) => console.log(`[job ${jobId}] ${msg}`),
     });
   } catch (err) {
@@ -685,7 +686,8 @@ const planEditIfNeeded = async (jobId, job) => {
   for (const resource of plan.resources) {
     console.log(
       `[job ${jobId}]   recurso [${resource.segment}/${resource.type}] ${resource.startSeconds.toFixed(2)}-${resource.endSeconds.toFixed(2)}s ` +
-        `(${resource.editorialGoal}, esencial=${resource.essential}): ${resource.description}`,
+        `(${resource.editorialGoal}, esencial=${resource.essential}): ${resource.description}` +
+        (resource.emojiChar ? ` -- emoji: ${resource.emojiChar}` : ""),
     );
   }
 
@@ -1180,6 +1182,7 @@ app.post("/jobs/:id/replan", async (req, res) => {
       correctionsHistory,
       durationInSeconds: job.input.durationInSeconds,
       destination: job.destination,
+      layout,
       onLog: (msg) => console.log(`[replan ${jobId}] ${msg}`),
     });
 

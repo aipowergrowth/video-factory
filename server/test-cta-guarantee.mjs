@@ -188,6 +188,56 @@ const noopLog = () => {};
   );
 }
 
+// --- Estilo dinámico vertical (03-nov-2026, autorizado por Alex) ---
+
+{
+  check("emoji CON emojiChar es renderizable", isRenderableByEngine({ type: "emoji", emojiChar: "🚨" }));
+  check("emoji SIN emojiChar NO es renderizable (nunca se inventa qué emoji poner)", !isRenderableByEngine({ type: "emoji", description: "una alerta" }));
+}
+
+{
+  // Defecto real corregido: un emoji sin emojiChar queda pendiente con
+  // un motivo específico (no el genérico de "tipo no soportado").
+  const pending = computePendingResources(
+    [{ id: "emoji-sin-char", type: "emoji", description: "Reforzar la alerta", essential: false }],
+    () => {},
+  );
+  check("emoji sin emojiChar: queda pendiente con motivo específico", pending.length === 1 && pending[0].reason.includes("emojiChar"));
+}
+
+{
+  // music/sfx: hoy no hay ninguna fuente de audio con licencia
+  // conectada (Pixabay no tiene API de audio pública, verificado
+  // 03-nov-2026) -- deben quedar pendientes con un motivo ESPECÍFICO
+  // que lo explique, no el genérico de "tipo no soportado" (que no
+  // decía nada sobre POR QUÉ). Nunca se inserta un recurso de audio
+  // sin licencia clara -- fail-safe por construcción: ninguna rama de
+  // isRenderableByEngine reconoce "music"/"sfx", así que siempre caen
+  // acá mientras no se conecte un proveedor real.
+  const pending = computePendingResources(
+    [
+      { id: "music-1", type: "music", description: "música baja de fondo", essential: false },
+      { id: "sfx-1", type: "sfx", description: "efecto sutil de alerta", essential: false },
+    ],
+    () => {},
+  );
+  check("music: NO es renderizable hoy (sin proveedor de audio conectado)", !isRenderableByEngine({ type: "music" }));
+  check("sfx: NO es renderizable hoy (sin proveedor de audio conectado)", !isRenderableByEngine({ type: "sfx" }));
+  check("music/sfx: ambos quedan pendientes", pending.length === 2);
+  check(
+    "music: el motivo explica POR QUÉ (sin fuente de audio con licencia conectada), no el genérico",
+    pending.find((p) => p.id === "music-1").reason.includes("licencia") && !pending.find((p) => p.id === "music-1").reason.includes("todavía no se puede representar visualmente"),
+  );
+  check(
+    "sfx: mismo motivo específico",
+    pending.find((p) => p.id === "sfx-1").reason.includes("licencia"),
+  );
+  check(
+    "music/sfx: el motivo nunca inventa que SÍ hay una licencia -- deja explícito que falta conectar un proveedor",
+    pending.find((p) => p.id === "music-1").reason.toLowerCase().includes("falta"),
+  );
+}
+
 {
   // El motivo específico de una adquisición fallida reemplaza al genérico.
   const resources = [

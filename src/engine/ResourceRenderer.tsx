@@ -1,6 +1,7 @@
 import type { Resource } from "../types";
 import { CtaOverlay } from "./CtaOverlay";
 import { TextHighlightOverlay } from "./TextHighlightOverlay";
+import { EmojiOverlay } from "./EmojiOverlay";
 import { ImageOverlay } from "./ImageOverlay";
 import { BRollOverlay } from "./BRollOverlay";
 import { KenBurnsImageOverlay } from "./KenBurnsImageOverlay";
@@ -41,6 +42,9 @@ export const ResourceRenderer: React.FC<{ resource: Resource }> = ({
   }
   if (resource.type === "text-highlight") {
     return <TextHighlightOverlay resource={resource} />;
+  }
+  if (resource.type === "emoji") {
+    return <EmojiOverlay resource={resource} />;
   }
   if (resource.type === "graphic") {
     switch (resource.graphicVariant) {
