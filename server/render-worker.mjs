@@ -96,6 +96,25 @@ export class RenderTimeoutError extends Error {
 }
 
 /**
+ * Render trabado (Fase 0, render trabado, 08-nov-2026): el proceso
+ * sigue vivo pero ningún cuadro nuevo se completa -- distinto de
+ * `RenderTimeoutError` (que corta un render que SÍ avanza, solo que
+ * tarda demasiado en total). Confirmado como un modo de falla real y
+ * conocido de Remotion (no una hipótesis): un issue del propio
+ * repositorio de Remotion describe exactamente esto -- "every process
+ * at 0% CPU and never reaches its own delayRender timeout... sat for
+ * 70 minutes until we killed it" -- y confirma que Remotion NO tiene
+ * ninguna recuperación propia para un cuelgue así. Ver el informe de
+ * esta tarea para la cita completa y el enlace.
+ */
+export class RenderStuckError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RenderStuckError";
+  }
+}
+
+/**
  * Arma los argumentos de `npx remotion render` -- pura, sin ejecutar
  * nada (separada de `runRemotionRender` para poder probarla sola).
  */
@@ -134,6 +153,15 @@ export const runRemotionRender = ({
   browserExecutable,
   binariesDirectory,
   timeoutMs = 0,
+  // Vigilante de render trabado (criterio 3): si pasan
+  // `stuckAfterMs` sin NINGÚN evento de progreso nuevo (ni rendering
+  // ni encoding -- cualquiera cuenta como "avanzó"), se corta el
+  // proceso con RenderStuckError. 0 = desactivado. Se revisa cada
+  // `stuckCheckIntervalMs` -- no hace falta más fino que eso para
+  // detectar algo del orden de minutos.
+  stuckAfterMs = 0,
+  stuckCheckIntervalMs = 30_000,
+  onStuck = () => {},
   onProgress = () => {},
   onLog = () => {},
   registerChild = () => {},
@@ -149,6 +177,20 @@ export const runRemotionRender = ({
     let stderrTail = "";
     let stdoutLineBuffer = "";
     let timedOut = false;
+    let stuck = false;
+    // Arranca en el momento del spawn, no recién en el primer evento
+    // -- si el proceso nunca llega a emitir NINGUNA línea de progreso
+    // (atascado en el bundling o en abrir el navegador), el vigilante
+    // tiene que poder detectar eso también, no solo un cuelgue A MITAD
+    // del render.
+    let lastProgressAt = Date.now();
+    let lastProgressEvent = null;
+
+    const recordProgress = (event) => {
+      lastProgressAt = Date.now();
+      lastProgressEvent = event;
+      onProgress(event);
+    };
 
     child.stderr.on("data", (chunk) => {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
@@ -163,7 +205,7 @@ export const runRemotionRender = ({
       stdoutLineBuffer = lines.pop() ?? "";
       for (const line of lines) {
         const event = parseRenderProgressLine(line);
-        if (event) onProgress(event);
+        if (event) recordProgress(event);
       }
     });
 
@@ -177,6 +219,24 @@ export const runRemotionRender = ({
       }, timeoutMs);
     }
 
+    let stuckTimer = null;
+    if (stuckAfterMs > 0) {
+      stuckTimer = setInterval(() => {
+        const msSinceLastProgress = Date.now() - lastProgressAt;
+        if (msSinceLastProgress >= stuckAfterMs) {
+          stuck = true;
+          clearInterval(stuckTimer);
+          onStuck({ lastProgressEvent, msSinceLastProgress });
+          onLog(
+            `SIN NINGÚN cuadro nuevo en ${Math.round(msSinceLastProgress / 60000)} min (umbral: ${Math.round(stuckAfterMs / 60000)} min) -- ` +
+              `último evento: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno (nunca empezó a reportar progreso)"}. Terminando el proceso.`,
+          );
+          child.kill("SIGTERM");
+          setTimeout(() => child.kill("SIGKILL"), 10_000);
+        }
+      }, stuckCheckIntervalMs);
+    }
+
     // "close" (no "exit"): Node garantiza que para entonces los stdio
     // del hijo ya terminaron de emitir todos sus "data" -- con "exit"
     // la ÚLTIMA línea de stdout (p.ej. "Rendered 180/180", justo antes
@@ -187,18 +247,26 @@ export const runRemotionRender = ({
     // 100%"; con "close" + el flush de abajo, no.
     child.on("close", (code, signal) => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (stuckTimer) clearInterval(stuckTimer);
       unregisterChild();
       // La última línea puede no haber tenido un "\n" final antes de
       // que el proceso cerrara su stdout -- se parsea igual en vez de
       // descartarla en silencio.
       if (stdoutLineBuffer) {
         const event = parseRenderProgressLine(stdoutLineBuffer);
-        if (event) onProgress(event);
+        if (event) recordProgress(event);
         stdoutLineBuffer = "";
       }
       onLog(`proceso hijo salió: code=${code} signal=${signal}`);
       if (isCancelled()) {
         reject(makeCancelledError());
+      } else if (stuck) {
+        reject(
+          new RenderStuckError(
+            `El render se quedó sin reportar ningún cuadro nuevo durante ${Math.round(stuckAfterMs / 60000)} min -- se terminó el proceso. ` +
+              `Último evento visto: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno"}.`,
+          ),
+        );
       } else if (timedOut) {
         reject(new RenderTimeoutError(`El render superó el límite de ${Math.round(timeoutMs / 60000)} minutos.`));
       } else if (code === 0) {
@@ -209,6 +277,7 @@ export const runRemotionRender = ({
     });
     child.on("error", (err) => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (stuckTimer) clearInterval(stuckTimer);
       unregisterChild();
       onLog(`error al lanzar el proceso: ${err.message}`);
       reject(err);

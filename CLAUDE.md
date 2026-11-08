@@ -211,9 +211,13 @@ node server/test-atomic-json-store.mjs
 node server/test-video-normalization.mjs
 node server/test-channel-editorial-loader.mjs
 node server/test-captions-grouping.mjs
+node server/test-render-worker.mjs
+node server/test-container-metrics.mjs
+node server/test-job-retry.mjs
+node server/test-source-video-diagnostics.mjs
 ```
 
-Estas tres **no** corren en esta Mac (necesitan FFmpeg/Chrome reales, que
+Estas **no** corren en esta Mac (necesitan FFmpeg/Chrome reales, que
 macOS 12 no puede ejecutar aquí — ver `README.md`) — corren solo en GitHub
 Actions, disparadas automáticamente en cada push a `main` que toque las
 rutas correspondientes:
@@ -222,6 +226,7 @@ rutas correspondientes:
 node server/test-audio-regression.mjs             # .github/workflows/audio-regression-tests.yml
 node server/test-video-conversion-regression.mjs  # .github/workflows/audio-regression-tests.yml
 node server/test-captions-render.mjs              # .github/workflows/captions-destination-test.yml
+node server/test-render-observability.mjs         # .github/workflows/captions-destination-test.yml
 ```
 
 ## Mantenimiento

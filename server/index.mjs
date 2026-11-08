@@ -24,7 +24,8 @@ import { createAtomicJsonWriter } from "./atomic-json-store.mjs";
 import { isAutoConvertibleCodec, probeBasicVideoInfo, normalizeVideoInputCodec } from "./video-normalization.mjs";
 import { loadChannelEditorialContext } from "./channel-editorial-loader.mjs";
 import { runRemotionRender, DESTINATION_DIMENSIONS, ENGINE_FPS } from "./render-worker.mjs";
-import { startContainerMetricsSampling } from "./container-metrics.mjs";
+import { startContainerMetricsSampling, readContainerMemoryBytes, readContainerCpuUsageMicros } from "./container-metrics.mjs";
+import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
 import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExists } from "./job-retry.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -88,6 +89,19 @@ const RENDER_PROGRESS_LOG_INTERVAL_MS = Number(
 // fino que esto para un pico/promedio útil.
 const RENDER_METRICS_SAMPLE_INTERVAL_MS = Number(
   process.env.RENDER_METRICS_SAMPLE_INTERVAL_MS ?? 10_000,
+);
+// Vigilante de render trabado (render trabado, 08-nov-2026, criterio
+// 3): si pasan estos minutos SIN NINGÚN cuadro nuevo (ni rendering ni
+// encoding), se corta el render con un error claro en vez de ocupar
+// el servidor sin límite -- confirmado como un modo de falla real de
+// Remotion sin recuperación propia (issue público del proyecto: "sat
+// for 70 minutes until we killed it", "every process at 0% CPU"). 10
+// min es generoso frente a un render normal (donde el progreso avanza
+// cada pocos segundos) pero corta mucho antes que las 3h de
+// RENDER_TIMEOUT_MINUTES -- valor propio, no viene de ninguna
+// documentación de Remotion/FFmpeg, ajustable sin tocar código.
+const RENDER_STUCK_TIMEOUT_MINUTES = Number(
+  process.env.RENDER_STUCK_TIMEOUT_MINUTES ?? 10,
 );
 // Limpieza automática: entradas/salidas terminadas más viejas que esto se
 // borran, para no llenar el disco con el uso semanal.
@@ -338,7 +352,7 @@ const recoverJobsFromDisk = () => {
  * log/estado, y muestreo de CPU/memoria del contenedor durante el
  * render (server/container-metrics.mjs).
  */
-const runRender = (jobId, job) => {
+const runRender = async (jobId, job) => {
   const outputPath = path.join(OUTPUTS_DIR, `${jobId}.mp4`);
   const dims = DESTINATION_DIMENSIONS[job.destination];
   const startedAt = Date.now();
@@ -346,6 +360,24 @@ const runRender = (jobId, job) => {
     `[render ${jobId}] iniciando -- destino=${job.destination} (${dims ? `${dims.width}x${dims.height}` : "resolución desconocida"}@${ENGINE_FPS}fps), ` +
       `concurrencia de Remotion=${REMOTION_CONCURRENCY}, hora=${new Date().toISOString()}`,
   );
+
+  // Diagnóstico del video FUENTE (render trabado, 08-nov-2026, criterio
+  // 2) -- antes de este cambio, nunca se sabía nada del video de
+  // entrada (códec/fps/bitrate/keyframes) cuando un render se quedaba
+  // sin avanzar. Nunca bloquea el render si el probe falla -- es un
+  // dato de diagnóstico, no un requisito para renderizar.
+  if (job.input?.type === "recorded-video" && job.input.baseVideo) {
+    try {
+      const ffprobePath = resolveFfprobe();
+      const diag = await probeSourceVideoDiagnostics(path.join(PROJECT_ROOT, "public", job.input.baseVideo), {
+        ffprobePath,
+        env: binaryEnv(ffprobePath),
+      });
+      console.log(`[render ${jobId}] video fuente -- ${formatSourceVideoDiagnosticsLine(diag)}`);
+    } catch (err) {
+      console.log(`[render ${jobId}] no se pudo diagnosticar el video fuente (se continúa igual): ${err.message ?? err}`);
+    }
+  }
 
   const metrics = startContainerMetricsSampling({ intervalMs: RENDER_METRICS_SAMPLE_INTERVAL_MS });
   let lastLoggedPercent = -1000;
@@ -405,6 +437,31 @@ const runRender = (jobId, job) => {
     browserExecutable: REMOTION_BROWSER_EXECUTABLE,
     binariesDirectory: REMOTION_BINARIES_DIRECTORY,
     timeoutMs: RENDER_TIMEOUT_MINUTES * 60 * 1000,
+    stuckAfterMs: RENDER_STUCK_TIMEOUT_MINUTES * 60 * 1000,
+    onStuck: async ({ lastProgressEvent, msSinceLastProgress }) => {
+      // Diagnóstico de CPU en el momento del atasco -- distingue las
+      // dos hipótesis reales conocidas de Remotion (ver
+      // render-worker.mjs#RenderStuckError): si el proceso está
+      // realmente en 0% de CPU (coincide con el issue público citado
+      // ahí) o si está ocupado decodificando algo muy lento (keyframes
+      // dispersos) sin avanzar en cuadros todavía. Dos muestras con
+      // una pausa corta -- una sola lectura de cpu.stat es acumulada
+      // desde el inicio del contenedor, no sirve sola para esto.
+      const memBytes = await readContainerMemoryBytes();
+      const usageBefore = await readContainerCpuUsageMicros();
+      const sampleWindowMs = 3000;
+      await new Promise((r) => setTimeout(r, sampleWindowMs));
+      const usageAfter = await readContainerCpuUsageMicros();
+      const cpuCoresInWindow =
+        usageBefore !== null && usageAfter !== null ? (usageAfter - usageBefore) / (sampleWindowMs * 1000) : null;
+      console.log(
+        `[render ${jobId}] DIAGNÓSTICO DE ATASCO -- sin cuadros nuevos en ${Math.round(msSinceLastProgress / 60000)} min. ` +
+          `Último evento: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno (nunca llegó a reportar progreso)"}. ` +
+          `Memoria actual=${memBytes !== null ? `${Math.round(memBytes / 1024 / 1024)}MB` : "desconocida"}. ` +
+          `CPU en los últimos ${sampleWindowMs / 1000}s=${cpuCoresInWindow !== null ? `${cpuCoresInWindow.toFixed(2)} núcleos` : "desconocida"} ` +
+          `(cerca de 0 = proceso realmente colgado/sin actividad; alto = ocupado pero sin terminar un cuadro, posible decodificación muy lenta).`,
+      );
+    },
     onProgress: (event) => {
       if (event.stage === "rendering" || event.stage === "encoding") {
         maybeLogAndStoreProgress(event);
@@ -1641,6 +1698,7 @@ app.listen(PORT, () => {
   console.log(`  concurrencia de Remotion (pestañas/hilos DENTRO de un render) -> ${REMOTION_CONCURRENCY}`);
   console.log(`  tope de subida directa -> ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB`);
   console.log(`  timeout de render -> ${RENDER_TIMEOUT_MINUTES} min`);
+  console.log(`  vigilante de render trabado (sin cuadros nuevos) -> ${RENDER_STUCK_TIMEOUT_MINUTES} min`);
   console.log(`  retención -> ${RETENTION_DAYS} días (limpieza cada ${CLEANUP_INTERVAL_HOURS}h)`);
   console.log(`  credenciales de Drive -> ${process.env.GOOGLE_APPLICATION_CREDENTIALS ? "configuradas" : "NO configuradas"}`);
   console.log(`  subida del MP4 final a Drive -> ${DRIVE_OUTPUT_FOLDER_ID ? `carpeta ${DRIVE_OUTPUT_FOLDER_ID}` : "NO configurada (se omite)"}`);
