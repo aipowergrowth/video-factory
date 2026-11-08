@@ -25,6 +25,7 @@ import { isAutoConvertibleCodec, probeBasicVideoInfo, normalizeVideoInputCodec }
 import { loadChannelEditorialContext } from "./channel-editorial-loader.mjs";
 import { runRemotionRender, DESTINATION_DIMENSIONS, ENGINE_FPS } from "./render-worker.mjs";
 import { startContainerMetricsSampling } from "./container-metrics.mjs";
+import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExists } from "./job-retry.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -1533,6 +1534,55 @@ app.post("/jobs/:id/cancel", (req, res) => {
   }
   const next = writeStatus(jobId, { status: "cancelling" });
   console.log(`[job ${jobId}] cancelación pedida (en curso: ${status.status}).`);
+  res.json({ jobId, ...next });
+});
+
+/**
+ * Reintenta un job que falló o se canceló -- SIN repetir transcripción,
+ * plan editorial ni adquisición de recursos que ya estén en el
+ * job.json persistido (ver server/job-retry.mjs para la causa raíz: el
+ * pipeline ya es idempotente por construcción, esto solo lo expone
+ * como endpoint y lo deja visible en el log). Si el archivo del job o
+ * el video base ya no existen (p.ej. la limpieza automática de
+ * RETENTION_DAYS ya corrió), rechaza con un error claro en vez de
+ * encolar un job roto -- no hay nada que recuperar en ese caso, hay
+ * que volver a subir el video.
+ */
+app.post("/jobs/:id/retry", async (req, res) => {
+  const jobId = req.params.id;
+  const status = jobs.get(jobId);
+  const retryCheck = canRetryJob(status);
+  if (!retryCheck.ok) {
+    return res.status(status ? 409 : 404).json({ error: retryCheck.reason });
+  }
+
+  const fileCheck = await readJobFileForRetry(jobFilePath(jobId), RETENTION_DAYS);
+  if (!fileCheck.ok) {
+    return res.status(409).json({ error: fileCheck.reason });
+  }
+  const job = fileCheck.job;
+
+  if (job.input?.type === "recorded-video" && job.input.baseVideo) {
+    const videoCheck = await checkBaseVideoExists(path.join(PROJECT_ROOT, "public", job.input.baseVideo), RETENTION_DAYS);
+    if (!videoCheck.ok) {
+      return res.status(409).json({ error: videoCheck.reason });
+    }
+  }
+
+  const plan = describeRetryPlan(job);
+  console.log(`[job ${jobId}] reintento pedido -- plan de recuperación:`);
+  for (const step of plan) {
+    console.log(`[job ${jobId}]   ${step.skipped ? "SE OMITE" : "SE REPITE"} -- ${step.name}: ${step.detail}`);
+  }
+
+  // A diferencia de enqueue() (jobs nuevos), nunca se pisa createdAt --
+  // es el mismo job de antes, no uno nuevo. Tampoco queda el `error`
+  // viejo colgado junto al estado "queued" nuevo.
+  cancelledJobIds.delete(jobId);
+  const next = writeStatus(jobId, { status: "queued", error: undefined, renderProgress: undefined });
+  queue.push(jobId);
+  processQueue();
+  console.log(`[job ${jobId}] reencolado para reintentar.`);
   res.json({ jobId, ...next });
 });
 
