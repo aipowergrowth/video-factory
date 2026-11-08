@@ -24,6 +24,7 @@ import { createAtomicJsonWriter } from "./atomic-json-store.mjs";
 import { isAutoConvertibleCodec, probeBasicVideoInfo, normalizeVideoInputCodec } from "./video-normalization.mjs";
 import { loadChannelEditorialContext } from "./channel-editorial-loader.mjs";
 import { runRemotionRender, DESTINATION_DIMENSIONS, ENGINE_FPS } from "./render-worker.mjs";
+import { killProcessGroup } from "./process-tree.mjs";
 import { startContainerMetricsSampling, readContainerMemoryBytes, readContainerCpuUsageMicros } from "./container-metrics.mjs";
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
 import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExists } from "./job-retry.mjs";
@@ -1586,8 +1587,11 @@ app.post("/jobs/:id/cancel", (req, res) => {
   cancelledJobIds.add(jobId);
   const child = runningChildren.get(jobId);
   if (child) {
-    child.kill("SIGTERM");
-    setTimeout(() => child.kill("SIGKILL"), 10_000);
+    // Corrección 08-nov-2026 (criterio 2): mismo mecanismo que el
+    // vigilante de atasco y el timeout -- termina TODO el grupo de
+    // procesos (npx + Remotion + Chrome), no solo el proceso directo.
+    killProcessGroup(child, "SIGTERM");
+    setTimeout(() => killProcessGroup(child, "SIGKILL"), 10_000);
   }
   const next = writeStatus(jobId, { status: "cancelling" });
   console.log(`[job ${jobId}] cancelación pedida (en curso: ${status.status}).`);

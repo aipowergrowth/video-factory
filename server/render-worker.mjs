@@ -19,6 +19,7 @@
 // `--log=verbose`: el nivel por defecto ya tiene todo lo necesario, con
 // mucho menos ruido en un render de 60 minutos real.
 import { spawn } from "node:child_process";
+import { killProcessGroup, countAliveProcessesInGroup } from "./process-tree.mjs";
 
 // Duplicados a propósito de src/types.ts (mismo patrón que
 // isRenderableByEngine/shouldBurnCaptions en cta-guarantee.mjs: el
@@ -161,6 +162,20 @@ export const runRemotionRender = ({
   // detectar algo del orden de minutos.
   stuckAfterMs = 0,
   stuckCheckIntervalMs = 30_000,
+  // Corrección del vigilante (08-nov-2026, revisión del operador
+  // contra f157a65): el diagnóstico de atasco (CPU/memoria) tiene que
+  // MEDIRSE antes de mandar cualquier señal al proceso -- medido
+  // después, tiende a marcar CPU cerca de 0 aunque el proceso
+  // estuviera ocupado, porque ya está muriendo. `stuckDiagnosisTimeoutMs`
+  // es el tope de espera para ese diagnóstico (no para el render
+  // entero) -- si `onStuck` tarda más que esto o falla, se corta el
+  // proceso igual, para que un diagnóstico roto nunca impida liberar
+  // el servidor.
+  stuckDiagnosisTimeoutMs = 20_000,
+  // Cuánto esperar después de que el proceso cierra antes de contar
+  // descendientes vivos (criterio 3) -- un instante para que SIGKILL
+  // termine de propagarse, no para "darle tiempo de más" al render.
+  processTreeCheckDelayMs = 1000,
   onStuck = () => {},
   onProgress = () => {},
   onLog = () => {},
@@ -171,7 +186,16 @@ export const runRemotionRender = ({
 }) =>
   new Promise((resolve, reject) => {
     const args = buildRenderArgs({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory });
-    const child = spawn(npxCommand, args, { cwd, env });
+    // `detached: true` (y no más que eso -- no `setsid`/nueva sesión,
+    // solo nuevo GRUPO de procesos): hace que `child.pid` sea el
+    // LÍDER de un grupo de procesos propio, distinto del grupo del
+    // servidor. Sin esto, matar "todo el grupo" habría arriesgado
+    // señalar al servidor mismo (heredaría el mismo grupo). Los
+    // descendientes de `child` (el compositor de Remotion, Chrome, los
+    // subprocesos de Chrome) heredan este mismo grupo salvo que alguno
+    // llame a `setpgid` por su cuenta -- confirmado real en Linux, no
+    // asumido (ver test-render-observability.mjs).
+    const child = spawn(npxCommand, args, { cwd, env, detached: true });
     registerChild(child);
 
     let stderrTail = "";
@@ -213,11 +237,38 @@ export const runRemotionRender = ({
     if (timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
         timedOut = true;
-        onLog(`superó ${Math.round(timeoutMs / 60000)} min, terminando el proceso.`);
-        child.kill("SIGTERM");
-        setTimeout(() => child.kill("SIGKILL"), 10_000);
+        onLog(`superó ${Math.round(timeoutMs / 60000)} min, terminando el proceso (grupo completo).`);
+        killProcessGroup(child, "SIGTERM");
+        setTimeout(() => killProcessGroup(child, "SIGKILL"), 10_000);
       }, timeoutMs);
     }
+
+    // Corrección 08-nov-2026: el diagnóstico (onStuck) se ESPERA acá,
+    // con un tope propio (`stuckDiagnosisTimeoutMs`), ANTES de mandar
+    // cualquier señal al proceso -- antes se llamaba a onStuck() sin
+    // esperarlo y la señal salía en la línea siguiente, así que la
+    // medición de CPU (una ventana de varios segundos) ocurría EN
+    // PARALELO con el proceso ya muriendo, no antes. El log deja
+    // constancia explícita de que la medición fue previa al corte.
+    const handleStuckDetected = async ({ lastProgressEvent, msSinceLastProgress }) => {
+      onLog(
+        `SIN NINGÚN cuadro nuevo en ${Math.round(msSinceLastProgress / 60000)} min (umbral: ${Math.round(stuckAfterMs / 60000)} min) -- ` +
+          `último evento: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno (nunca empezó a reportar progreso)"}. ` +
+          `Diagnosticando el proceso ANTES de tocarlo (tope: ${Math.round(stuckDiagnosisTimeoutMs / 1000)}s)...`,
+      );
+      const diagnosisStartedAt = Date.now();
+      await Promise.race([
+        Promise.resolve()
+          .then(() => onStuck({ lastProgressEvent, msSinceLastProgress }))
+          .catch((err) => onLog(`el diagnóstico de atasco falló (no bloquea el corte): ${err?.message ?? err}`)),
+        new Promise((resolve) => setTimeout(resolve, stuckDiagnosisTimeoutMs)),
+      ]);
+      onLog(
+        `diagnóstico completado en ${Date.now() - diagnosisStartedAt}ms, MEDIDO ANTES DE CUALQUIER SEÑAL -- terminando el proceso (grupo completo) ahora.`,
+      );
+      killProcessGroup(child, "SIGTERM");
+      setTimeout(() => killProcessGroup(child, "SIGKILL"), 10_000);
+    };
 
     let stuckTimer = null;
     if (stuckAfterMs > 0) {
@@ -226,13 +277,7 @@ export const runRemotionRender = ({
         if (msSinceLastProgress >= stuckAfterMs) {
           stuck = true;
           clearInterval(stuckTimer);
-          onStuck({ lastProgressEvent, msSinceLastProgress });
-          onLog(
-            `SIN NINGÚN cuadro nuevo en ${Math.round(msSinceLastProgress / 60000)} min (umbral: ${Math.round(stuckAfterMs / 60000)} min) -- ` +
-              `último evento: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno (nunca empezó a reportar progreso)"}. Terminando el proceso.`,
-          );
-          child.kill("SIGTERM");
-          setTimeout(() => child.kill("SIGKILL"), 10_000);
+          void handleStuckDetected({ lastProgressEvent, msSinceLastProgress });
         }
       }, stuckCheckIntervalMs);
     }
@@ -245,7 +290,7 @@ export const runRemotionRender = ({
     // render real en CI (08-nov-2026): con "exit" fallaba
     // intermitentemente la aserción de "el último evento llega al
     // 100%"; con "close" + el flush de abajo, no.
-    child.on("close", (code, signal) => {
+    child.on("close", async (code, signal) => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (stuckTimer) clearInterval(stuckTimer);
       unregisterChild();
@@ -258,6 +303,22 @@ export const runRemotionRender = ({
         stdoutLineBuffer = "";
       }
       onLog(`proceso hijo salió: code=${code} signal=${signal}`);
+
+      // Criterio 3 (corrección 08-nov-2026): solo tras un corte
+      // ANORMAL (atasco/timeout/cancelación -- nunca en un render que
+      // terminó bien solo) se confirma cuántos procesos del grupo
+      // siguen vivos. Un instante de margen para que el SIGKILL de
+      // arriba termine de propagarse antes de contar.
+      if (isCancelled() || stuck || timedOut) {
+        await new Promise((r) => setTimeout(r, processTreeCheckDelayMs));
+        const aliveCount = typeof child.pid === "number" ? await countAliveProcessesInGroup(child.pid) : null;
+        onLog(
+          aliveCount === null
+            ? `no se pudo comprobar procesos descendientes vivos (sin /proc disponible -- esperado en macOS de desarrollo, no en el contenedor de producción).`
+            : `procesos descendientes del render vivos tras el corte: ${aliveCount}${aliveCount === 0 ? " (ninguno)" : " -- REVISAR, se esperaba 0"}.`,
+        );
+      }
+
       if (isCancelled()) {
         reject(makeCancelledError());
       } else if (stuck) {

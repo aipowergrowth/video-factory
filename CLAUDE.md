@@ -215,6 +215,7 @@ node server/test-render-worker.mjs
 node server/test-container-metrics.mjs
 node server/test-job-retry.mjs
 node server/test-source-video-diagnostics.mjs
+node server/test-process-tree.mjs
 ```
 
 Estas **no** corren en esta Mac (necesitan FFmpeg/Chrome reales, que

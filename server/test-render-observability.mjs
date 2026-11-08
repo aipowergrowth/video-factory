@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { resolveCompositorFfmpeg, resolveCompositorFfprobe, binaryEnv } from "./compositor.mjs";
 import { runRemotionRender, RenderTimeoutError, RenderStuckError } from "./render-worker.mjs";
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
+import { killProcessGroup, countAliveProcessesInGroup } from "./process-tree.mjs";
 
 const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -133,11 +134,31 @@ try {
   check("caso 1 (render normal): no debería fallar", false, String(err.message ?? err));
 }
 
-// --- Caso 2: timeout -- el mismo mecanismo de antes sigue funcionando tras la extracción ---
+// Confirma, para un `child` ya cerrado, que no quedó NINGÚN
+// descendiente vivo en su grupo de procesos (criterio 2+4 de la
+// corrección 08-nov-2026) -- reutilizado por los casos 2, 3 y 6, que
+// cortan un render real por los tres motivos posibles (timeout,
+// cancelación, atasco).
+const checkNoOrphans = async (label, pid) => {
+  if (typeof pid !== "number") {
+    check(`${label}: no se pudo verificar huérfanos (no se registró el pid real)`, false);
+    return;
+  }
+  await new Promise((r) => setTimeout(r, 1500)); // margen para que el SIGKILL de respaldo termine de propagarse
+  const aliveCount = await countAliveProcessesInGroup(pid);
+  check(
+    `${label}: 0 procesos descendientes vivos en el grupo tras el corte (grupo completo terminado, no solo npx)`,
+    aliveCount === null || aliveCount === 0,
+    `aliveCount=${aliveCount}`,
+  );
+};
+
+// --- Caso 2: timeout -- el mismo mecanismo de antes, ahora corta el grupo completo (criterio 2) ---
 try {
   const jobRelPath = await makeJobFile("caso2", 6);
   const outputPath = path.join(FIXTURES_DIR, "caso2-out.mp4");
   let threw = null;
+  let childRef = null;
   try {
     await runRemotionRender({
       cwd: PROJECT_ROOT,
@@ -147,23 +168,28 @@ try {
       concurrency: "1",
       timeoutMs: 1, // garantiza el timeout de forma determinística
       onLog: () => {},
+      registerChild: (child) => {
+        childRef = child;
+      },
     });
   } catch (err) {
     threw = err;
   }
   check("caso 2: un timeout muy corto rechaza con RenderTimeoutError", threw instanceof RenderTimeoutError);
   check("caso 2: el mensaje menciona el límite de tiempo", /superó el límite/.test(threw?.message ?? ""));
+  await checkNoOrphans("caso 2 (timeout)", childRef?.pid);
 } catch (err) {
   check("caso 2 (timeout): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }
 
-// --- Caso 3: cancelación -- isCancelled/makeCancelledError se respetan igual que antes ---
+// --- Caso 3: cancelación -- isCancelled/makeCancelledError se respetan igual que antes, y corta el grupo completo (criterio 2) ---
 try {
   const jobRelPath = await makeJobFile("caso3", 6);
   const outputPath = path.join(FIXTURES_DIR, "caso3-out.mp4");
   class FakeCancelledError extends Error {}
   let cancelledFlag = false;
   let childRef = null;
+  let sawRealProgress = false;
   const renderPromise = runRemotionRender({
     cwd: PROJECT_ROOT,
     env: process.env,
@@ -171,6 +197,9 @@ try {
     propsJobFile: jobRelPath,
     concurrency: "1",
     timeoutMs: 60_000,
+    onProgress: () => {
+      sawRealProgress = true;
+    },
     onLog: () => {},
     registerChild: (child) => {
       childRef = child;
@@ -178,10 +207,20 @@ try {
     isCancelled: () => cancelledFlag,
     makeCancelledError: () => new FakeCancelledError("cancelado para la prueba"),
   });
-  // Deja arrancar el proceso real un instante y lo cancela "desde afuera" -- mismo patrón que POST /jobs/:id/cancel en index.mjs.
-  await new Promise((r) => setTimeout(r, 300));
+  // Espera a ver progreso REAL (bundling/rendering) antes de cancelar
+  // -- no un sleep fijo adivinado -- para asegurar que Chrome ya está
+  // lanzado como subproceso cuando se corta: así el chequeo de
+  // huérfanos de abajo prueba algo real, no un árbol vacío que nunca
+  // llegó a tener a Chrome. Tope de 20s por si algo sale mal.
+  const waitStartedAt = Date.now();
+  while (!sawRealProgress && Date.now() - waitStartedAt < 20_000) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  check("caso 3: se vio progreso real (Chrome ya lanzado) antes de cancelar", sawRealProgress);
   cancelledFlag = true;
-  childRef?.kill("SIGTERM");
+  // Mismo mecanismo que ahora usa el endpoint de cancelar en
+  // index.mjs -- termina el grupo completo, no solo el proceso npx.
+  killProcessGroup(childRef, "SIGTERM");
 
   let threw = null;
   try {
@@ -190,6 +229,7 @@ try {
     threw = err;
   }
   check("caso 3: cancelar mientras corre rechaza con el error que da makeCancelledError (no un error genérico)", threw instanceof FakeCancelledError);
+  await checkNoOrphans("caso 3 (cancelación, con Chrome real ya lanzado)", childRef?.pid);
 } catch (err) {
   check("caso 3 (cancelación): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }
@@ -333,17 +373,21 @@ try {
 }
 
 // --- Caso 6: vigilante de render trabado -- disparo determinístico
-// (criterio 3) -- mismo patrón que el caso 2 (timeoutMs=1 fuerza el
-// timeout de inmediato): stuckAfterMs=1 fuerza que el vigilante corte
-// el proceso en la primera revisión, sin depender de si el render real
-// se traba o no. Confirma el MECANISMO (RenderStuckError, onStuck,
-// proceso terminado) con un render real, no solo con datos simulados.
+// (criterio 3), AHORA además confirma la corrección 08-nov-2026 contra
+// la revisión del operador: (a) el diagnóstico se espera de verdad
+// ANTES de la señal -- se prueba con un onStuck real que tarda un
+// tiempo medible, y se confirma que el log de "terminando el proceso"
+// sale DESPUÉS de que ese tiempo pasó, no en paralelo; (b) no queda
+// ningún descendiente vivo tras el corte.
 try {
   const jobRelPath = await makeJobFile("caso6", 15);
   const outputPath = path.join(FIXTURES_DIR, "caso6-out.mp4");
   let threw = null;
   let stuckCallbackInfo = null;
   let childRef = null;
+  const logEvents = []; // { msg, at }
+  const DIAGNOSIS_DELAY_MS = 500; // simula un diagnóstico real que SÍ tarda -- si no se espera de verdad, el log de "terminando" saldría casi de inmediato, antes de este tiempo.
+  let onStuckResolvedAt = null;
   try {
     await runRemotionRender({
       cwd: PROJECT_ROOT,
@@ -354,10 +398,13 @@ try {
       timeoutMs: 60_000,
       stuckAfterMs: 1, // dispara en la primera revisión, de forma determinística
       stuckCheckIntervalMs: 50,
-      onStuck: (info) => {
+      stuckDiagnosisTimeoutMs: 20_000, // muy por encima de DIAGNOSIS_DELAY_MS -- no debe cortar el diagnóstico de esta prueba
+      onStuck: async (info) => {
         stuckCallbackInfo = info;
+        await new Promise((r) => setTimeout(r, DIAGNOSIS_DELAY_MS));
+        onStuckResolvedAt = Date.now();
       },
-      onLog: () => {},
+      onLog: (msg) => logEvents.push({ msg, at: Date.now() }),
       registerChild: (child) => {
         childRef = child;
       },
@@ -369,6 +416,20 @@ try {
   check("caso 6: el mensaje menciona que no se reportó ningún cuadro nuevo", /sin reportar ningún cuadro nuevo/.test(threw?.message ?? ""));
   check("caso 6: el callback onStuck se llamó con los datos esperados", stuckCallbackInfo !== null && typeof stuckCallbackInfo.msSinceLastProgress === "number");
   check("caso 6: se registró el proceso hijo real antes de cortarlo", childRef !== null && typeof childRef.pid === "number");
+
+  const diagnosingLog = logEvents.find((e) => e.msg.includes("Diagnosticando el proceso ANTES de tocarlo"));
+  const terminandoLog = logEvents.find((e) => e.msg.includes("MEDIDO ANTES DE CUALQUIER SEÑAL"));
+  check("caso 6: se registró el log de 'diagnosticando antes' Y el de 'terminando' (ambos, no solo uno)", Boolean(diagnosingLog) && Boolean(terminandoLog));
+  check(
+    "caso 6: el log de 'diagnosticando' sale ANTES que el de 'terminando' (orden real de los mensajes)",
+    Boolean(diagnosingLog) && Boolean(terminandoLog) && diagnosingLog.at <= terminandoLog.at,
+  );
+  check(
+    `caso 6: el log de 'terminando el proceso' sale DESPUÉS de que onStuck tardó ${DIAGNOSIS_DELAY_MS}ms de verdad -- la medición se ESPERÓ, no se disparó en paralelo con la señal`,
+    onStuckResolvedAt !== null && Boolean(terminandoLog) && terminandoLog.at >= onStuckResolvedAt,
+    `onStuckResolvedAt=${onStuckResolvedAt} terminandoLog.at=${terminandoLog?.at}`,
+  );
+  await checkNoOrphans("caso 6 (vigilante de atasco)", childRef?.pid);
 } catch (err) {
   check("caso 6 (vigilante de atasco): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }

@@ -60,6 +60,7 @@ jobs:
           node server/test-container-metrics.mjs
           node server/test-job-retry.mjs
           node server/test-source-video-diagnostics.mjs
+          node server/test-process-tree.mjs
 
       - name: Pruebas de regresión con audio real (mismo FFmpeg que producción)
         run: node server/test-audio-regression.mjs
