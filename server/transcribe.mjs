@@ -11,21 +11,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { transcribe, toCaptions } from "@remotion/install-whisper-cpp";
 import { groupCaptions } from "./captions.mjs";
+import { readContainerMemoryBytes } from "./container-metrics.mjs";
 
 const execFileAsync = promisify(execFile);
 
 const WHISPER_VERSION = "1.5.5";
-
-/** Lectura best-effort de la memoria usada por el contenedor (cgroup v2).
- * No existe en macOS (desarrollo local) — ahí simplemente no se reporta. */
-const readContainerMemoryBytes = async () => {
-  try {
-    const raw = await fs.readFile("/sys/fs/cgroup/memory.current", "utf8");
-    return Number(raw.trim());
-  } catch {
-    return null;
-  }
-};
 
 const extractAudioToWav = async (ffmpegPath, videoPath, wavPath, env) => {
   await execFileAsync(

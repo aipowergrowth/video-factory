@@ -1,6 +1,5 @@
 import express from "express";
 import multer from "multer";
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -24,6 +23,8 @@ import { readGeminiApiKey } from "./image-generation.mjs";
 import { createAtomicJsonWriter } from "./atomic-json-store.mjs";
 import { isAutoConvertibleCodec, probeBasicVideoInfo, normalizeVideoInputCodec } from "./video-normalization.mjs";
 import { loadChannelEditorialContext } from "./channel-editorial-loader.mjs";
+import { runRemotionRender, DESTINATION_DIMENSIONS, ENGINE_FPS } from "./render-worker.mjs";
+import { startContainerMetricsSampling } from "./container-metrics.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -69,6 +70,23 @@ const MAX_UPLOAD_BYTES = Number(
 // de margen por defecto para videos largos (40+ min).
 const RENDER_TIMEOUT_MINUTES = Number(
   process.env.RENDER_TIMEOUT_MINUTES ?? 180,
+);
+// Observabilidad del render (Fase 0, 08-nov-2026): cada cuánto se
+// vuelve a loguear/guardar el progreso -- lo que pase primero
+// (cambio de porcentaje o tiempo transcurrido). Pensado para no
+// inundar el log en un render de 60 min real (criterio explícito del
+// dictamen) sin dejar de ver avance en uno corto.
+const RENDER_PROGRESS_LOG_PERCENT_STEP = Number(
+  process.env.RENDER_PROGRESS_LOG_PERCENT_STEP ?? 5,
+);
+const RENDER_PROGRESS_LOG_INTERVAL_MS = Number(
+  process.env.RENDER_PROGRESS_LOG_INTERVAL_MS ?? 30_000,
+);
+// Cada cuánto se muestrea CPU/memoria del contenedor mientras dura el
+// render (ver server/container-metrics.mjs) -- no se necesita más
+// fino que esto para un pico/promedio útil.
+const RENDER_METRICS_SAMPLE_INTERVAL_MS = Number(
+  process.env.RENDER_METRICS_SAMPLE_INTERVAL_MS ?? 10_000,
 );
 // Limpieza automática: entradas/salidas terminadas más viejas que esto se
 // borran, para no llenar el disco con el uso semanal.
@@ -308,77 +326,119 @@ const recoverJobsFromDisk = () => {
   }
 };
 
-const runRender = (jobId) =>
-  new Promise((resolve, reject) => {
-    const jobFile = `uploads/jobs/${jobId}.json`;
-    const outputPath = path.join(OUTPUTS_DIR, `${jobId}.mp4`);
+/**
+ * Observabilidad del render (Fase 0, 08-nov-2026 -- ver
+ * server/render-worker.mjs para la causa raíz y la evidencia real de
+ * qué imprime `remotion render`). Wrapper fino: toda la ejecución real
+ * (spawn, parseo de progreso, timeout, cancelación) vive en
+ * `runRemotionRender`, probado con FFmpeg/Chrome reales en CI sin
+ * levantar este servidor. Acá solo se conecta con las piezas propias
+ * de este servidor: log con línea de inicio, throttling de
+ * log/estado, y muestreo de CPU/memoria del contenedor durante el
+ * render (server/container-metrics.mjs).
+ */
+const runRender = (jobId, job) => {
+  const outputPath = path.join(OUTPUTS_DIR, `${jobId}.mp4`);
+  const dims = DESTINATION_DIMENSIONS[job.destination];
+  const startedAt = Date.now();
+  console.log(
+    `[render ${jobId}] iniciando -- destino=${job.destination} (${dims ? `${dims.width}x${dims.height}` : "resolución desconocida"}@${ENGINE_FPS}fps), ` +
+      `concurrencia de Remotion=${REMOTION_CONCURRENCY}, hora=${new Date().toISOString()}`,
+  );
 
-    const args = [
-      "remotion",
-      "render",
-      "VideoEngine",
-      outputPath,
-      `--props=${JSON.stringify({ jobFile })}`,
-      `--concurrency=${REMOTION_CONCURRENCY}`,
-    ];
+  const metrics = startContainerMetricsSampling({ intervalMs: RENDER_METRICS_SAMPLE_INTERVAL_MS });
+  let lastLoggedPercent = -1000;
+  let lastLoggedAt = 0;
+  let totalFramesSeen = null;
 
-    if (ENABLE_MULTIPROCESS_ON_LINUX) {
-      args.push("--enable-multiprocess-on-linux");
-    }
-    if (REMOTION_BROWSER_EXECUTABLE) {
-      args.push(`--browser-executable=${REMOTION_BROWSER_EXECUTABLE}`);
-    }
-    if (REMOTION_BINARIES_DIRECTORY) {
-      args.push(`--binaries-directory=${REMOTION_BINARIES_DIRECTORY}`);
-    }
+  const maybeLogAndStoreProgress = (event) => {
+    const now = Date.now();
+    // "rendering" nunca reporta el tick exacto N=total (confirmado real
+    // en CI, 08-nov-2026: se queda en total-1, el índice del último
+    // cuadro, y pasa directo a "encoding") -- por eso la tolerancia de
+    // 1 acá; "encoding" sí llega exacto.
+    const isDone =
+      (event.stage === "rendering" && event.renderedFrames >= event.totalFrames - 1) ||
+      (event.stage === "encoding" && event.encodedFrames === event.totalFrames);
+    const shouldLog =
+      event.percent - lastLoggedPercent >= RENDER_PROGRESS_LOG_PERCENT_STEP ||
+      now - lastLoggedAt >= RENDER_PROGRESS_LOG_INTERVAL_MS ||
+      isDone;
+    if (!shouldLog) return;
+    lastLoggedPercent = event.percent;
+    lastLoggedAt = now;
+    const elapsedSeconds = Math.round((now - startedAt) / 1000);
 
-    const child = spawn("npx", args, {
-      cwd: PROJECT_ROOT,
-      env: process.env,
-    });
-    runningChildren.set(jobId, child);
-
-    let stderrTail = "";
-    let timedOut = false;
-    child.stderr.on("data", (chunk) => {
-      stderrTail = (stderrTail + chunk.toString()).slice(-4000);
-    });
-
-    const timeoutMs = RENDER_TIMEOUT_MINUTES * 60 * 1000;
-    const timeoutTimer = setTimeout(() => {
-      timedOut = true;
+    if (event.stage === "rendering") {
+      totalFramesSeen = event.totalFrames;
       console.log(
-        `[render ${jobId}] superó ${RENDER_TIMEOUT_MINUTES} min, terminando el proceso.`,
+        `[render ${jobId}] renderizando: ${event.renderedFrames}/${event.totalFrames} cuadros (${event.percent}%), ` +
+          `transcurrido=${elapsedSeconds}s` + (event.etaSeconds !== null ? `, restante_estimado=${event.etaSeconds}s` : ""),
       );
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 10_000);
-    }, timeoutMs);
+    } else {
+      console.log(
+        `[render ${jobId}] codificando: ${event.encodedFrames}/${event.totalFrames} cuadros (${event.percent}%), transcurrido=${elapsedSeconds}s`,
+      );
+    }
+    writeStatus(jobId, {
+      status: "rendering",
+      renderProgress: {
+        stage: event.stage,
+        percent: event.percent,
+        renderedFrames: event.stage === "rendering" ? event.renderedFrames : undefined,
+        encodedFrames: event.stage === "encoding" ? event.encodedFrames : undefined,
+        totalFrames: event.totalFrames,
+        etaSeconds: event.stage === "rendering" ? event.etaSeconds : undefined,
+        elapsedSeconds,
+      },
+    });
+  };
 
-    child.on("exit", (code, signal) => {
-      clearTimeout(timeoutTimer);
-      runningChildren.delete(jobId);
-      console.log(`[render ${jobId}] proceso hijo salió: code=${code} signal=${signal}`);
-      if (cancelledJobIds.has(jobId)) {
-        reject(new CancelledError(jobId));
-      } else if (timedOut) {
-        reject(new Error(`El render superó el límite de ${RENDER_TIMEOUT_MINUTES} minutos.`));
-      } else if (code === 0) {
-        resolve();
-      } else {
-        reject(
-          new Error(
-            `remotion render exited with code=${code} signal=${signal}: ${stderrTail}`,
-          ),
-        );
+  return runRemotionRender({
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    outputPath,
+    propsJobFile: `uploads/jobs/${jobId}.json`,
+    concurrency: REMOTION_CONCURRENCY,
+    enableMultiprocessOnLinux: ENABLE_MULTIPROCESS_ON_LINUX,
+    browserExecutable: REMOTION_BROWSER_EXECUTABLE,
+    binariesDirectory: REMOTION_BINARIES_DIRECTORY,
+    timeoutMs: RENDER_TIMEOUT_MINUTES * 60 * 1000,
+    onProgress: (event) => {
+      if (event.stage === "rendering" || event.stage === "encoding") {
+        maybeLogAndStoreProgress(event);
+      } else if (event.stage === "stitched") {
+        console.log(`[render ${jobId}] unión final de cuadros: ${event.durationMs}ms`);
       }
-    });
-    child.on("error", (err) => {
-      clearTimeout(timeoutTimer);
-      runningChildren.delete(jobId);
-      console.log(`[render ${jobId}] error al lanzar el proceso:`, err);
-      reject(err);
-    });
+    },
+    onLog: (msg) => console.log(`[render ${jobId}] ${msg}`),
+    registerChild: (child) => runningChildren.set(jobId, child),
+    unregisterChild: () => runningChildren.delete(jobId),
+    isCancelled: () => cancelledJobIds.has(jobId),
+    makeCancelledError: () => new CancelledError(jobId),
+  }).finally(async () => {
+    const summary = await metrics.stop();
+    if (!summary.available) {
+      console.log(`[render ${jobId}] métricas de contenedor no disponibles en este entorno (sin cgroup -- normal fuera de Linux).`);
+      return;
+    }
+    console.log(
+      `[render ${jobId}] contenedor durante el render -- memoria: pico=${summary.peakMemoryMB}MB promedio=${summary.avgMemoryMB}MB; ` +
+        `CPU: pico=${summary.peakCpuCores ?? "?"} núcleos (${summary.peakCpuPercentOfLimit ?? "?"}% del límite), promedio=${summary.avgCpuCores ?? "?"} núcleos (${summary.avgCpuPercentOfLimit ?? "?"}% del límite), ` +
+        `límite del contenedor=${summary.cpuLimitCores ?? "desconocido"} núcleos.`,
+    );
+    if (totalFramesSeen) {
+      const elapsedSeconds = (Date.now() - startedAt) / 1000;
+      const outputDurationSeconds = totalFramesSeen / ENGINE_FPS;
+      const fps = totalFramesSeen / elapsedSeconds;
+      console.log(
+        `[render ${jobId}] rendimiento medido -- ${fps.toFixed(2)} cuadros/s, ` +
+          `${(elapsedSeconds / outputDurationSeconds).toFixed(2)} min de render por min de video de SALIDA (ya editado), ` +
+          `concurrencia de Remotion=${REMOTION_CONCURRENCY}.`,
+      );
+    }
   });
+};
 
 /**
  * Si el trabajo vino con una referencia de Drive, lo descarga ahora:
@@ -933,7 +993,7 @@ const processQueue = () => {
     }
 
     writeStatus(jobId, { status: "rendering" });
-    await runRender(jobId);
+    await runRender(jobId, job);
     console.log(`[render ${jobId}] terminado OK`);
 
     await finalizeJobOutput(jobId);
@@ -1527,7 +1587,8 @@ app.listen(PORT, () => {
   console.log(`  uploads/jobs   -> ${UPLOADS_JOBS_DIR}`);
   console.log(`  uploads/videos -> ${UPLOADS_VIDEOS_DIR}`);
   console.log(`  outputs        -> ${OUTPUTS_DIR}`);
-  console.log(`  concurrencia de renders -> ${RENDER_CONCURRENCY}`);
+  console.log(`  concurrencia de renders (jobs en paralelo) -> ${RENDER_CONCURRENCY}`);
+  console.log(`  concurrencia de Remotion (pestañas/hilos DENTRO de un render) -> ${REMOTION_CONCURRENCY}`);
   console.log(`  tope de subida directa -> ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB`);
   console.log(`  timeout de render -> ${RENDER_TIMEOUT_MINUTES} min`);
   console.log(`  retención -> ${RETENTION_DAYS} días (limpieza cada ${CLEANUP_INTERVAL_HOURS}h)`);

@@ -12,11 +12,17 @@ on:
       - "src/**"
       - "server/subtitles.mjs"
       - "server/test-captions-render.mjs"
+      - "server/render-worker.mjs"
+      - "server/container-metrics.mjs"
+      - "server/test-render-observability.mjs"
       - ".github/workflows/captions-destination-test.yml"
   pull_request:
     paths:
       - "src/**"
       - "server/subtitles.mjs"
+      - "server/render-worker.mjs"
+      - "server/container-metrics.mjs"
+      - "server/test-render-observability.mjs"
   workflow_dispatch: {}
 
 jobs:
@@ -39,3 +45,6 @@ jobs:
 
       - name: Render de prueba por destino (confirma subtítulos pegados/no pegados)
         run: node server/test-captions-render.mjs
+
+      - name: Observabilidad del render con FFmpeg/Chrome reales (progreso, timeout, cancelación)
+        run: node server/test-render-observability.mjs
