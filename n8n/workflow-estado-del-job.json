@@ -1,0 +1,114 @@
+{
+  "name": "Fabrica Videos - Estado del job",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-640, 0],
+      "id": "trigger-manual",
+      "name": "Ejecutar manualmente"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "jobid-field",
+              "name": "jobId",
+              "value": "PEGA_AQUI_EL_JOBID",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-400, 0],
+      "id": "jobid",
+      "name": "jobId a consultar"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://fabrica-videos-engine:3001/jobs/{{ $json.jobId }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 0],
+      "id": "consultar-estado",
+      "name": "Consultar estado"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f-status",
+              "name": "status",
+              "value": "={{ $json.status }}",
+              "type": "string"
+            },
+            {
+              "id": "f-progress",
+              "name": "renderProgress",
+              "value": "={{ $json.renderProgress }}",
+              "type": "object"
+            },
+            {
+              "id": "f-updated",
+              "name": "actualizado",
+              "value": "={{ $json.updatedAt }}",
+              "type": "string"
+            },
+            {
+              "id": "f-error",
+              "name": "error",
+              "value": "={{ $json.error }}",
+              "type": "string"
+            },
+            {
+              "id": "f-drive",
+              "name": "drive",
+              "value": "={{ $json.drive }}",
+              "type": "object"
+            },
+            {
+              "id": "f-render-evidence",
+              "name": "evidenciaDelRender",
+              "value": "={{ $json.renderEvidence }}",
+              "type": "object",
+              "notes": "NUEVO (09-nov-2026, causa raíz con evidencia, criterio 1) -- solo presente cuando el último intento terminó en error por atasco, timeout o salida anormal. Trae: endedReason (stuck/timeout/exit-error), sourceVideoDiagnosticsLine (códec/fps/keyframes del video fuente), stuckDiagnosis (memoria/CPU medidas ANTES del corte -- null si no se llegó a trabar), descendantProcessesAliveAfterCut (0 = no quedó nada; cualquier otro número necesita revisión), stdoutTail/stderrTail (últimos ~4000 caracteres reales de Remotion/Chrome)."
+            },
+            {
+              "id": "f-attempts",
+              "name": "historialDeIntentos",
+              "value": "={{ $json.attempts }}",
+              "type": "array",
+              "notes": "NUEVO (09-nov-2026, criterio 2) -- hasta los 5 intentos más recientes de este job, cada uno con attemptNumber/startedAt/endedAt/outcome/error/renderEvidence. Un reintento YA NO borra el motivo del intento anterior -- queda acá."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [100, 0],
+      "id": "resumen",
+      "name": "Resumen"
+    }
+  ],
+  "connections": {
+    "Ejecutar manualmente": {
+      "main": [[{ "node": "jobId a consultar", "type": "main", "index": 0 }]]
+    },
+    "jobId a consultar": {
+      "main": [[{ "node": "Consultar estado", "type": "main", "index": 0 }]]
+    },
+    "Consultar estado": {
+      "main": [[{ "node": "Resumen", "type": "main", "index": 0 }]]
+    }
+  }
+}

@@ -27,7 +27,8 @@ import { runRemotionRender, DESTINATION_DIMENSIONS, ENGINE_FPS } from "./render-
 import { killProcessGroup } from "./process-tree.mjs";
 import { startContainerMetricsSampling, readContainerMemoryBytes, readContainerCpuUsageMicros } from "./container-metrics.mjs";
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
-import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExists } from "./job-retry.mjs";
+import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExists, appendAttemptHistory } from "./job-retry.mjs";
+import { runDiagnosticRender, buildDiagnosticFrameRanges } from "./render-diagnose.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -103,6 +104,13 @@ const RENDER_METRICS_SAMPLE_INTERVAL_MS = Number(
 // documentación de Remotion/FFmpeg, ajustable sin tocar código.
 const RENDER_STUCK_TIMEOUT_MINUTES = Number(
   process.env.RENDER_STUCK_TIMEOUT_MINUTES ?? 10,
+);
+// Render de diagnóstico (causa raíz con evidencia del VPS, 09-nov-2026,
+// criterio 3) -- acotado a unos pocos minutos a propósito: si no
+// completa en este tiempo, ESO ya es la evidencia (dónde se detiene),
+// no un error que haya que corregir subiendo el valor.
+const RENDER_DIAGNOSE_TIMEOUT_MINUTES = Number(
+  process.env.RENDER_DIAGNOSE_TIMEOUT_MINUTES ?? 3,
 );
 // Limpieza automática: entradas/salidas terminadas más viejas que esto se
 // borran, para no llenar el disco con el uso semanal.
@@ -366,7 +374,12 @@ const runRender = async (jobId, job) => {
   // 2) -- antes de este cambio, nunca se sabía nada del video de
   // entrada (códec/fps/bitrate/keyframes) cuando un render se quedaba
   // sin avanzar. Nunca bloquea el render si el probe falla -- es un
-  // dato de diagnóstico, no un requisito para renderizar.
+  // dato de diagnóstico, no un requisito para renderizar. Se guarda en
+  // `sourceVideoDiagnosticsLine` (criterio 1, 09-nov-2026) para que
+  // viaje con la evidencia hacia `GET /jobs/:id` si el render termina
+  // en error -- antes solo existía en este console.log, invisible para
+  // Alex si el visor de Portainer se queda sin mostrar líneas.
+  let sourceVideoDiagnosticsLine = null;
   if (job.input?.type === "recorded-video" && job.input.baseVideo) {
     try {
       const ffprobePath = resolveFfprobe();
@@ -374,8 +387,10 @@ const runRender = async (jobId, job) => {
         ffprobePath,
         env: binaryEnv(ffprobePath),
       });
-      console.log(`[render ${jobId}] video fuente -- ${formatSourceVideoDiagnosticsLine(diag)}`);
+      sourceVideoDiagnosticsLine = formatSourceVideoDiagnosticsLine(diag);
+      console.log(`[render ${jobId}] video fuente -- ${sourceVideoDiagnosticsLine}`);
     } catch (err) {
+      sourceVideoDiagnosticsLine = `no se pudo diagnosticar (${err.message ?? err})`;
       console.log(`[render ${jobId}] no se pudo diagnosticar el video fuente (se continúa igual): ${err.message ?? err}`);
     }
   }
@@ -428,7 +443,7 @@ const runRender = async (jobId, job) => {
     });
   };
 
-  return runRemotionRender({
+  const renderPromise = runRemotionRender({
     cwd: PROJECT_ROOT,
     env: process.env,
     outputPath,
@@ -448,6 +463,9 @@ const runRender = async (jobId, job) => {
       // dispersos) sin avanzar en cuadros todavía. Dos muestras con
       // una pausa corta -- una sola lectura de cpu.stat es acumulada
       // desde el inicio del contenedor, no sirve sola para esto.
+      // Devuelve el diagnóstico (en vez de solo loguearlo, como antes
+      // de la causa raíz con evidencia del 09-nov-2026): render-worker
+      // lo adjunta al error final para que llegue a `GET /jobs/:id`.
       const memBytes = await readContainerMemoryBytes();
       const usageBefore = await readContainerCpuUsageMicros();
       const sampleWindowMs = 3000;
@@ -455,13 +473,20 @@ const runRender = async (jobId, job) => {
       const usageAfter = await readContainerCpuUsageMicros();
       const cpuCoresInWindow =
         usageBefore !== null && usageAfter !== null ? (usageAfter - usageBefore) / (sampleWindowMs * 1000) : null;
+      const diagnosis = {
+        memoryMB: memBytes !== null ? Math.round(memBytes / 1024 / 1024) : null,
+        cpuCoresInWindow: cpuCoresInWindow !== null ? Math.round(cpuCoresInWindow * 100) / 100 : null,
+        sampleWindowSeconds: sampleWindowMs / 1000,
+        measuredBeforeKill: true,
+      };
       console.log(
         `[render ${jobId}] DIAGNÓSTICO DE ATASCO -- sin cuadros nuevos en ${Math.round(msSinceLastProgress / 60000)} min. ` +
           `Último evento: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno (nunca llegó a reportar progreso)"}. ` +
-          `Memoria actual=${memBytes !== null ? `${Math.round(memBytes / 1024 / 1024)}MB` : "desconocida"}. ` +
-          `CPU en los últimos ${sampleWindowMs / 1000}s=${cpuCoresInWindow !== null ? `${cpuCoresInWindow.toFixed(2)} núcleos` : "desconocida"} ` +
+          `Memoria actual=${diagnosis.memoryMB !== null ? `${diagnosis.memoryMB}MB` : "desconocida"}. ` +
+          `CPU en los últimos ${sampleWindowMs / 1000}s=${diagnosis.cpuCoresInWindow !== null ? `${diagnosis.cpuCoresInWindow} núcleos` : "desconocida"} ` +
           `(cerca de 0 = proceso realmente colgado/sin actividad; alto = ocupado pero sin terminar un cuadro, posible decodificación muy lenta).`,
       );
+      return diagnosis;
     },
     onProgress: (event) => {
       if (event.stage === "rendering" || event.stage === "encoding") {
@@ -475,7 +500,18 @@ const runRender = async (jobId, job) => {
     unregisterChild: () => runningChildren.delete(jobId),
     isCancelled: () => cancelledJobIds.has(jobId),
     makeCancelledError: () => new CancelledError(jobId),
-  }).finally(async () => {
+  }).catch((err) => {
+    // Criterio 1: la línea del video fuente se mide ACÁ (arriba, antes
+    // de llamar a runRemotionRender), no dentro de render-worker.mjs
+    // -- se adjunta a la misma evidencia del error en vez de quedar
+    // separada.
+    if (err && typeof err === "object") {
+      err.evidence = { ...(err.evidence ?? {}), sourceVideoDiagnosticsLine };
+    }
+    throw err;
+  });
+
+  return renderPromise.finally(async () => {
     const summary = await metrics.stop();
     if (!summary.available) {
       console.log(`[render ${jobId}] métricas de contenedor no disponibles en este entorno (sin cgroup -- normal fuera de Linux).`);
@@ -1031,6 +1067,8 @@ const processQueue = () => {
   const jobId = queue.shift();
   active += 1;
 
+  const attemptStartedAt = new Date().toISOString();
+
   (async () => {
     console.log(`[job ${jobId}] iniciando (active=${active})`);
     const job = JSON.parse(await fsp.readFile(jobFilePath(jobId), "utf8"));
@@ -1059,12 +1097,37 @@ const processQueue = () => {
     writeStatus(jobId, { status: "done" });
   })()
     .catch((err) => {
+      // Evidencia accesible por la API + historial de intentos (Fase
+      // 0, causa raíz con evidencia del VPS, 09-nov-2026, autorizado
+      // por Alex, criterios 1+2). Causa raíz real confirmada contra el
+      // código: antes, `error`/`renderProgress` se guardaban en el
+      // estado del job, pero (a) nunca llevaban nada de lo que
+      // Remotion/Chrome dijeron durante un atasco (solo el mensaje
+      // final), y (b) un reintento posterior los borraba sin dejar
+      // rastro del intento anterior. `renderEvidence` lleva TODO lo
+      // que render-worker.mjs capturó (adjuntado en `err.evidence`
+      // cuando el error viene de un render real -- undefined para
+      // errores de otras etapas, p.ej. transcripción/plan/recursos,
+      // donde no aplica). `attempts` conserva el historial acotado
+      // ANTES de que el próximo reintento pise `error`/`renderProgress`.
+      const renderEvidence = err?.evidence ?? undefined;
+      const current = jobs.get(jobId) ?? {};
+      const attemptRecord = {
+        attemptNumber: (current.attempts?.length ?? 0) + 1,
+        startedAt: attemptStartedAt,
+        endedAt: new Date().toISOString(),
+        outcome: err instanceof CancelledError ? "cancelled" : "error",
+        error: err instanceof CancelledError ? undefined : String(err.message ?? err),
+        renderEvidence,
+      };
+      const attempts = appendAttemptHistory(current.attempts, attemptRecord);
+
       if (err instanceof CancelledError) {
         console.log(`[job ${jobId}] cancelado.`);
-        writeStatus(jobId, { status: "cancelled" });
+        writeStatus(jobId, { status: "cancelled", attempts });
       } else {
         console.log(`[job ${jobId}] terminó con error:`, err.message ?? err);
-        writeStatus(jobId, { status: "error", error: String(err.message ?? err) });
+        writeStatus(jobId, { status: "error", error: String(err.message ?? err), renderEvidence, attempts });
       }
     })
     .finally(() => {
@@ -1647,6 +1710,81 @@ app.post("/jobs/:id/retry", async (req, res) => {
   res.json({ jobId, ...next });
 });
 
+/**
+ * Render de DIAGNÓSTICO (causa raíz con evidencia del VPS, 09-nov-2026,
+ * autorizado por Alex, criterio 3) -- sobre el video base y el
+ * job.json YA persistidos de un job existente, corre un render MUY
+ * corto (los primeros cuadros y una ventana en el medio del video, ver
+ * render-diagnose.mjs) con registro detallado de Remotion/Chrome
+ * activado SOLO en este modo. Nunca toca el estado del job real
+ * (nunca llama a `writeStatus`), nunca escribe en `OUTPUTS_DIR`, y
+ * nunca llama a ninguna API de pago -- sin costo. No corre si hay un
+ * render real en curso (de este job o de cualquier otro -- compite por
+ * CPU con él y contaminaría la medición de actividad).
+ */
+app.post("/jobs/:id/diagnose", async (req, res) => {
+  const jobId = req.params.id;
+  if (active > 0 || runningChildren.has(jobId)) {
+    return res.status(409).json({
+      error: "Hay un render real en curso -- el diagnóstico no corre junto a un render real (competiría por CPU y contaminaría la medición de actividad).",
+    });
+  }
+
+  const fileCheck = await readJobFileForRetry(jobFilePath(jobId), RETENTION_DAYS);
+  if (!fileCheck.ok) {
+    return res.status(404).json({ error: fileCheck.reason });
+  }
+  const job = fileCheck.job;
+
+  if (job.input?.type !== "recorded-video" || !job.input.baseVideo) {
+    return res.status(409).json({ error: "El job no tiene un video base grabado -- no hay nada que diagnosticar." });
+  }
+  const baseVideoAbsolutePath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
+  const videoCheck = await checkBaseVideoExists(baseVideoAbsolutePath, RETENTION_DAYS);
+  if (!videoCheck.ok) {
+    return res.status(409).json({ error: videoCheck.reason });
+  }
+
+  let sourceVideoDiagnosticsLine = null;
+  try {
+    const ffprobePath = resolveFfprobe();
+    const diag = await probeSourceVideoDiagnostics(baseVideoAbsolutePath, { ffprobePath, env: binaryEnv(ffprobePath) });
+    sourceVideoDiagnosticsLine = formatSourceVideoDiagnosticsLine(diag);
+  } catch (err) {
+    sourceVideoDiagnosticsLine = `no se pudo diagnosticar (${err.message ?? err})`;
+  }
+
+  const totalFrames = Math.round((job.input.durationInSeconds ?? 0) * ENGINE_FPS);
+  const frames = buildDiagnosticFrameRanges(totalFrames);
+  if (!frames) {
+    return res.status(409).json({ error: `No se pudo determinar cuántos cuadros tiene el job (durationInSeconds=${job.input.durationInSeconds}).` });
+  }
+
+  const diagnosticsDir = path.join(PROJECT_ROOT, "diagnostics");
+  await fsp.mkdir(diagnosticsDir, { recursive: true });
+  const outputPath = path.join(diagnosticsDir, `${jobId}-${Date.now()}.mp4`);
+
+  console.log(`[diagnóstico ${jobId}] iniciando -- frames=${frames}, video fuente -- ${sourceVideoDiagnosticsLine}`);
+  const result = await runDiagnosticRender({
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    outputPath,
+    propsJobFile: `uploads/jobs/${jobId}.json`,
+    concurrency: REMOTION_CONCURRENCY,
+    enableMultiprocessOnLinux: ENABLE_MULTIPROCESS_ON_LINUX,
+    browserExecutable: REMOTION_BROWSER_EXECUTABLE,
+    binariesDirectory: REMOTION_BINARIES_DIRECTORY,
+    frames,
+    timeoutMs: RENDER_DIAGNOSE_TIMEOUT_MINUTES * 60 * 1000,
+  });
+  console.log(
+    `[diagnóstico ${jobId}] terminado -- completed=${result.completed} timedOut=${result.timedOut} ` +
+      `huérfanos=${result.descendantProcessesAliveAfterCut ?? "desconocido"} hitos=${JSON.stringify(result.milestones)}`,
+  );
+
+  res.json({ jobId, sourceVideoDiagnosticsLine, totalFrames, frames, ...result });
+});
+
 app.get("/jobs/:id/download", (req, res) => {
   const status = jobs.get(req.params.id);
   if (!status || status.status !== "done") {
@@ -1702,7 +1840,12 @@ app.listen(PORT, () => {
   console.log(`  concurrencia de Remotion (pestañas/hilos DENTRO de un render) -> ${REMOTION_CONCURRENCY}`);
   console.log(`  tope de subida directa -> ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB`);
   console.log(`  timeout de render -> ${RENDER_TIMEOUT_MINUTES} min`);
-  console.log(`  vigilante de render trabado (sin cuadros nuevos) -> ${RENDER_STUCK_TIMEOUT_MINUTES} min`);
+  console.log(
+    `  vigilante de render trabado -> ${RENDER_STUCK_TIMEOUT_MINUTES} min SIN cuadros nuevos Y SIN actividad de CPU del grupo de procesos ` +
+      `(criterio rediseñado 09-nov-2026: si hay actividad de CPU real -- bundling, navegador arrancando, decodificación lenta -- NO corta, aunque no haya cuadros; ` +
+      `el timeout total de render sigue siendo el límite absoluto si nunca se puede medir la CPU)`,
+  );
+  console.log(`  timeout del render de diagnóstico (POST /jobs/:id/diagnose) -> ${RENDER_DIAGNOSE_TIMEOUT_MINUTES} min`);
   console.log(`  retención -> ${RETENTION_DAYS} días (limpieza cada ${CLEANUP_INTERVAL_HOURS}h)`);
   console.log(`  credenciales de Drive -> ${process.env.GOOGLE_APPLICATION_CREDENTIALS ? "configuradas" : "NO configuradas"}`);
   console.log(`  subida del MP4 final a Drive -> ${DRIVE_OUTPUT_FOLDER_ID ? `carpeta ${DRIVE_OUTPUT_FOLDER_ID}` : "NO configurada (se omite)"}`);

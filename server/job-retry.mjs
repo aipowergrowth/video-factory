@@ -26,6 +26,36 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 
+/**
+ * Historial de intentos (Fase 0, causa raíz con evidencia del VPS,
+ * 09-nov-2026, autorizado por Alex, criterio 2). Causa raíz real
+ * confirmada contra el código (f157a65/dca1c65, no asumida): el
+ * endpoint de reintentar hacía `writeStatus(jobId, { error: undefined,
+ * renderProgress: undefined })` -- eso BORRA el motivo del intento
+ * anterior (en JSON, una clave con valor `undefined` desaparece al
+ * serializar) antes de que nadie lo haya visto. Un job real (1fd239de)
+ * perdió así el motivo de su intento de las 19:33 cuando se reintentó
+ * a las 20:00.
+ *
+ * `appendAttemptHistory` es pura: recibe el historial actual (puede
+ * venir undefined si es el primer intento) y el nuevo intento
+ * concluido, devuelve un array nuevo con como máximo
+ * `maxEntries` -- los MÁS RECIENTES primero no hace falta; se guarda
+ * en orden cronológico (el más viejo primero) y quien lo muestre
+ * decide el orden de lectura. Recortar por `maxEntries` (no por bytes)
+ * porque cada entrada YA viene con sus propios campos acotados
+ * (`stdoutTail`/`stderrTail`, ver render-worker.mjs) -- un tamaño por
+ * entrada predecible hace que acotar la CANTIDAD de entradas sea
+ * suficiente para acotar el tamaño total.
+ */
+export const MAX_ATTEMPT_HISTORY_ENTRIES = 5;
+
+export const appendAttemptHistory = (existingAttempts, newAttempt, maxEntries = MAX_ATTEMPT_HISTORY_ENTRIES) => {
+  const current = Array.isArray(existingAttempts) ? existingAttempts : [];
+  const next = [...current, newAttempt];
+  return next.length > maxEntries ? next.slice(next.length - maxEntries) : next;
+};
+
 /** Solo error/cancelled se pueden reintentar -- un job en curso o ya
  * terminado con éxito no tiene nada que "reintentar". */
 export const RETRYABLE_STATUSES = ["error", "cancelled"];

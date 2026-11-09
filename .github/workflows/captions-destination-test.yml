@@ -15,6 +15,9 @@ on:
       - "server/render-worker.mjs"
       - "server/container-metrics.mjs"
       - "server/source-video-diagnostics.mjs"
+      - "server/process-tree.mjs"
+      - "server/render-diagnose.mjs"
+      - "server/verbose-log-milestones.mjs"
       - "server/test-render-observability.mjs"
       - ".github/workflows/captions-destination-test.yml"
   pull_request:
@@ -24,6 +27,9 @@ on:
       - "server/render-worker.mjs"
       - "server/container-metrics.mjs"
       - "server/source-video-diagnostics.mjs"
+      - "server/process-tree.mjs"
+      - "server/render-diagnose.mjs"
+      - "server/verbose-log-milestones.mjs"
       - "server/test-render-observability.mjs"
   workflow_dispatch: {}
 

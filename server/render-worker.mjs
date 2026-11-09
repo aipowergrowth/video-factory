@@ -19,7 +19,7 @@
 // `--log=verbose`: el nivel por defecto ya tiene todo lo necesario, con
 // mucho menos ruido en un render de 60 minutos real.
 import { spawn } from "node:child_process";
-import { killProcessGroup, countAliveProcessesInGroup } from "./process-tree.mjs";
+import { killProcessGroup, countAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
 
 // Duplicados a propósito de src/types.ts (mismo patrón que
 // isRenderableByEngine/shouldBurnCaptions en cta-guarantee.mjs: el
@@ -89,6 +89,36 @@ export const parseRenderProgressLine = (rawLine) => {
   return null;
 };
 
+/**
+ * Criterio REDISEÑADO del vigilante (Fase 0, causa raíz con evidencia,
+ * 09-nov-2026, autorizado por Alex, criterio 6 -- corrección del
+ * auditor sobre f157a65/dca1c65): antes, "sin cuadros nuevos en
+ * `stuckAfterMs`" bastaba por sí solo para cortar -- no distinguía un
+ * render genuinamente colgado (coincide con el issue público de
+ * Remotion #11864, "every process at 0% CPU") de uno que arrancó
+ * lento pero SIGUE TRABAJANDO (bundling largo, navegador lanzando,
+ * decodificación de keyframes dispersos) sin haber completado todavía
+ * un cuadro.
+ *
+ * Pura -- recibe los números ya medidos, nunca toca el proceso ni el
+ * reloj; así se prueba exhaustivamente con datos simulados (nivel 2)
+ * sin necesitar un proceso real para cada combinación.
+ *
+ * `cpuTicksDelta`: ticks de CPU nuevos del grupo completo desde la
+ * revisión anterior (ver `sumGroupCpuTicks`), o `null` si no se pudo
+ * medir (sin /proc, o aún no hay una segunda lectura con la que
+ * comparar). Decisión de diseño explícita: cuando no se puede medir,
+ * se mantiene el comportamiento ANTERIOR (cortar) -- "mantén la
+ * capacidad de cortar un cuelgue real" es un requisito duro; nunca se
+ * deja correr indefinidamente solo porque la nueva señal no esté
+ * disponible.
+ */
+export const shouldConsiderStuck = ({ msSinceLastProgress, stuckAfterMs, cpuTicksDelta }) => {
+  if (msSinceLastProgress < stuckAfterMs) return false;
+  if (cpuTicksDelta === null) return true; // no se puede distinguir -- se prioriza la capacidad de cortar
+  return cpuTicksDelta <= 0; // sin NINGÚN tick de CPU nuevo = inactividad real, no solo "lento"
+};
+
 export class RenderTimeoutError extends Error {
   constructor(message) {
     super(message);
@@ -118,12 +148,24 @@ export class RenderStuckError extends Error {
 /**
  * Arma los argumentos de `npx remotion render` -- pura, sin ejecutar
  * nada (separada de `runRemotionRender` para poder probarla sola).
+ *
+ * `frames` y `logLevel` son SOLO para el render de diagnóstico
+ * (criterio 3, 09-nov-2026) -- nunca se pasan en un render real de
+ * producción (quedan `undefined`, que no agrega ninguna bandera, el
+ * comportamiento exacto de antes). `--frames` (confirmado contra la
+ * documentación oficial vigente de `npx remotion render`, no asumido:
+ * acepta rangos como "0-29,20650-20679" para concatenar solo esos
+ * tramos) permite mirar el arranque Y una ventana intermedia del video
+ * SIN tocar la duración real de la composición ni renderizar el job
+ * completo.
  */
-export const buildRenderArgs = ({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory }) => {
+export const buildRenderArgs = ({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, logLevel }) => {
   const args = ["remotion", "render", compositionId, outputPath, `--props=${JSON.stringify({ jobFile: propsJobFile })}`, `--concurrency=${concurrency}`];
   if (enableMultiprocessOnLinux) args.push("--enable-multiprocess-on-linux");
   if (browserExecutable) args.push(`--browser-executable=${browserExecutable}`);
   if (binariesDirectory) args.push(`--binaries-directory=${binariesDirectory}`);
+  if (frames) args.push(`--frames=${frames}`);
+  if (logLevel) args.push(`--log=${logLevel}`);
   return args;
 };
 
@@ -199,9 +241,22 @@ export const runRemotionRender = ({
     registerChild(child);
 
     let stderrTail = "";
+    // Diagnóstico accesible por la API (Fase 0, causa raíz con
+    // evidencia, 09-nov-2026, criterio 1): antes de este cambio, solo
+    // se interpretaban las líneas de progreso reconocidas (Bundling/
+    // Rendered/Encoded/Stitching) -- cualquier otra línea de stdout
+    // (lo que Remotion o Chrome digan durante un atasco) se
+    // descartaba en silencio. `stdoutTail` guarda TODO lo que llega,
+    // acotado igual que `stderrTail` -- es la evidencia que antes solo
+    // existía en el log de Portainer (que Alex no puede leer de forma
+    // fiable) y ahora viaja en el error final hacia `GET /jobs/:id`.
+    const EVIDENCE_TAIL_MAX_CHARS = 4000;
+    let stdoutTail = "";
     let stdoutLineBuffer = "";
     let timedOut = false;
     let stuck = false;
+    let stuckDiagnosis = null;
+    let lastGroupCpuTicks = null;
     // Arranca en el momento del spawn, no recién en el primer evento
     // -- si el proceso nunca llega a emitir NINGUNA línea de progreso
     // (atascado en el bundling o en abrir el navegador), el vigilante
@@ -217,11 +272,13 @@ export const runRemotionRender = ({
     };
 
     child.stderr.on("data", (chunk) => {
-      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
+      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-EVIDENCE_TAIL_MAX_CHARS);
     });
 
     child.stdout.on("data", (chunk) => {
-      stdoutLineBuffer += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      stdoutTail = (stdoutTail + text).slice(-EVIDENCE_TAIL_MAX_CHARS);
+      stdoutLineBuffer += text;
       const lines = stdoutLineBuffer.split("\n");
       // La última entrada puede ser una línea incompleta (el chunk no
       // vino alineado con un \n) -- se deja en el buffer para la
@@ -252,7 +309,7 @@ export const runRemotionRender = ({
     // constancia explícita de que la medición fue previa al corte.
     const handleStuckDetected = async ({ lastProgressEvent, msSinceLastProgress }) => {
       onLog(
-        `SIN NINGÚN cuadro nuevo en ${Math.round(msSinceLastProgress / 60000)} min (umbral: ${Math.round(stuckAfterMs / 60000)} min) -- ` +
+        `SIN NINGÚN cuadro nuevo en ${Math.round(msSinceLastProgress / 60000)} min (umbral: ${Math.round(stuckAfterMs / 60000)} min) Y SIN actividad de CPU del grupo -- ` +
           `último evento: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno (nunca empezó a reportar progreso)"}. ` +
           `Diagnosticando el proceso ANTES de tocarlo (tope: ${Math.round(stuckDiagnosisTimeoutMs / 1000)}s)...`,
       );
@@ -260,6 +317,9 @@ export const runRemotionRender = ({
       await Promise.race([
         Promise.resolve()
           .then(() => onStuck({ lastProgressEvent, msSinceLastProgress }))
+          .then((diagnosis) => {
+            stuckDiagnosis = diagnosis ?? null;
+          })
           .catch((err) => onLog(`el diagnóstico de atasco falló (no bloquea el corte): ${err?.message ?? err}`)),
         new Promise((resolve) => setTimeout(resolve, stuckDiagnosisTimeoutMs)),
       ]);
@@ -273,12 +333,47 @@ export const runRemotionRender = ({
     let stuckTimer = null;
     if (stuckAfterMs > 0) {
       stuckTimer = setInterval(() => {
-        const msSinceLastProgress = Date.now() - lastProgressAt;
-        if (msSinceLastProgress >= stuckAfterMs) {
+        void (async () => {
+          // La muestra de CPU se toma SIEMPRE, en CADA revisión, nunca
+          // solo cuando ya está añejo -- defecto real encontrado
+          // probando esto contra un render real (09-nov-2026, no en
+          // teoría): si la medición empezaba recién al llegar a
+          // `stuckAfterMs`, esa PRIMERA medición nunca tenía una
+          // lectura anterior con la que comparar -- `cpuTicksDelta`
+          // salía `null` SIEMPRE en la primera revisión posible,
+          // sin importar cuánto durara `stuckAfterMs`, y el
+          // fail-safe de `shouldConsiderStuck` (null -> cortar)
+          // terminaba el proceso de inmediato en TODOS los casos,
+          // incluso uno genuinamente activo. Midiendo desde la
+          // primera revisión (aunque todavía no esté añejo) ya hay
+          // una lectura anterior real con la que comparar para
+          // cuando SÍ se vuelve añejo.
+          const currentTicks = typeof child.pid === "number" ? await sumGroupCpuTicks(child.pid) : null;
+          const cpuTicksDelta = lastGroupCpuTicks !== null && currentTicks !== null ? currentTicks - lastGroupCpuTicks : null;
+          if (currentTicks !== null) lastGroupCpuTicks = currentTicks;
+
+          const msSinceLastProgress = Date.now() - lastProgressAt;
+          if (msSinceLastProgress < stuckAfterMs) return;
+
+          // Criterio 6: antes de decidir que está "trabado", se usa
+          // la muestra de arriba para ver si el grupo de procesos usó
+          // algo de CPU desde la revisión anterior -- si sí, está
+          // ocupado (bundling, navegador arrancando, decodificando
+          // algo lento), no colgado; se sigue esperando sin cortar (el
+          // timeout total de render, sin cambios, sigue siendo el
+          // límite final absoluto).
+          if (!shouldConsiderStuck({ msSinceLastProgress, stuckAfterMs, cpuTicksDelta })) {
+            onLog(
+              `sin cuadros nuevos en ${Math.round(msSinceLastProgress / 60000)} min, pero el grupo de procesos SÍ usó CPU en los últimos ${Math.round(stuckCheckIntervalMs / 1000)}s ` +
+                `(+${cpuTicksDelta} ticks) -- se considera "lento, no trabado": no se corta por este mecanismo todavía.`,
+            );
+            return;
+          }
+
           stuck = true;
           clearInterval(stuckTimer);
           void handleStuckDetected({ lastProgressEvent, msSinceLastProgress });
-        }
+        })();
       }, stuckCheckIntervalMs);
     }
 
@@ -309,31 +404,52 @@ export const runRemotionRender = ({
       // terminó bien solo) se confirma cuántos procesos del grupo
       // siguen vivos. Un instante de margen para que el SIGKILL de
       // arriba termine de propagarse antes de contar.
+      let descendantProcessesAliveAfterCut = null;
       if (isCancelled() || stuck || timedOut) {
         await new Promise((r) => setTimeout(r, processTreeCheckDelayMs));
-        const aliveCount = typeof child.pid === "number" ? await countAliveProcessesInGroup(child.pid) : null;
+        descendantProcessesAliveAfterCut = typeof child.pid === "number" ? await countAliveProcessesInGroup(child.pid) : null;
         onLog(
-          aliveCount === null
+          descendantProcessesAliveAfterCut === null
             ? `no se pudo comprobar procesos descendientes vivos (sin /proc disponible -- esperado en macOS de desarrollo, no en el contenedor de producción).`
-            : `procesos descendientes del render vivos tras el corte: ${aliveCount}${aliveCount === 0 ? " (ninguno)" : " -- REVISAR, se esperaba 0"}.`,
+            : `procesos descendientes del render vivos tras el corte: ${descendantProcessesAliveAfterCut}${descendantProcessesAliveAfterCut === 0 ? " (ninguno)" : " -- REVISAR, se esperaba 0"}.`,
         );
       }
+
+      // Evidencia accesible por la API (criterio 1) -- antes, todo
+      // esto (línea del video fuente -- agregada por quien llama en
+      // index.mjs --, stdout/stderr completos, diagnóstico de atasco,
+      // conteo de huérfanos) solo existía en el log de Portainer, que
+      // Alex no puede leer de forma fiable. Se adjunta al error mismo
+      // para que index.mjs lo guarde en el estado del job sin tener
+      // que rehacer ninguna de estas mediciones.
+      const buildEvidence = (endedReason) => ({
+        endedReason,
+        stdoutTail,
+        stderrTail,
+        lastProgressEvent,
+        descendantProcessesAliveAfterCut,
+        stuckDiagnosis,
+      });
 
       if (isCancelled()) {
         reject(makeCancelledError());
       } else if (stuck) {
-        reject(
-          new RenderStuckError(
-            `El render se quedó sin reportar ningún cuadro nuevo durante ${Math.round(stuckAfterMs / 60000)} min -- se terminó el proceso. ` +
-              `Último evento visto: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno"}.`,
-          ),
+        const err = new RenderStuckError(
+          `El render se quedó sin reportar ningún cuadro nuevo Y sin actividad de CPU durante ${Math.round(stuckAfterMs / 60000)} min -- se terminó el proceso. ` +
+            `Último evento visto: ${lastProgressEvent ? JSON.stringify(lastProgressEvent) : "ninguno"}.`,
         );
+        err.evidence = buildEvidence("stuck");
+        reject(err);
       } else if (timedOut) {
-        reject(new RenderTimeoutError(`El render superó el límite de ${Math.round(timeoutMs / 60000)} minutos.`));
+        const err = new RenderTimeoutError(`El render superó el límite de ${Math.round(timeoutMs / 60000)} minutos.`);
+        err.evidence = buildEvidence("timeout");
+        reject(err);
       } else if (code === 0) {
         resolve();
       } else {
-        reject(new Error(`remotion render exited with code=${code} signal=${signal}: ${stderrTail}`));
+        const err = new Error(`remotion render exited with code=${code} signal=${signal}: ${stderrTail}`);
+        err.evidence = buildEvidence("exit-error");
+        reject(err);
       }
     });
     child.on("error", (err) => {

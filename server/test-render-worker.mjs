@@ -10,7 +10,7 @@
 // producción) -- no son strings inventadas a partir de la
 // documentación (que explícitamente no garantiza el formato).
 
-import { parseRenderProgressLine, buildRenderArgs, ENGINE_FPS, DESTINATION_DIMENSIONS } from "./render-worker.mjs";
+import { parseRenderProgressLine, buildRenderArgs, shouldConsiderStuck, ENGINE_FPS, DESTINATION_DIMENSIONS } from "./render-worker.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -135,11 +135,61 @@ check(
   check("buildRenderArgs: --concurrency=2", args.includes("--concurrency=2"));
 }
 
+{
+  // frames/logLevel: SOLO para el render de diagnóstico (criterio 3, 09-nov-2026) -- undefined = sin bandera, igual que antes, nunca afecta un render real de producción.
+  const normalArgs = buildRenderArgs({ compositionId: "VideoEngine", outputPath: "/out.mp4", propsJobFile: "uploads/jobs/x.json", concurrency: "1" });
+  check("buildRenderArgs: sin frames/logLevel, no agrega --frames ni --log (comportamiento de producción sin cambios)", !normalArgs.some((a) => a.startsWith("--frames")) && !normalArgs.some((a) => a.startsWith("--log")));
+
+  const diagArgs = buildRenderArgs({
+    compositionId: "VideoEngine",
+    outputPath: "/out.mp4",
+    propsJobFile: "uploads/jobs/x.json",
+    concurrency: "1",
+    frames: "0-29,20650-20679",
+    logLevel: "verbose",
+  });
+  check("buildRenderArgs: --frames con el rango exacto dado", diagArgs.includes("--frames=0-29,20650-20679"));
+  check("buildRenderArgs: --log=verbose cuando se pide", diagArgs.includes("--log=verbose"));
+}
+
 // --- Constantes duplicadas de src/types.ts -- confirma que no se desincronizaron ---
 
 check("ENGINE_FPS = 30 (igual a src/types.ts)", ENGINE_FPS === 30);
 check("DESTINATION_DIMENSIONS.youtube-16-9 = 1920x1080 (igual a src/types.ts)", DESTINATION_DIMENSIONS["youtube-16-9"].width === 1920 && DESTINATION_DIMENSIONS["youtube-16-9"].height === 1080);
 check("DESTINATION_DIMENSIONS.vertical-9-16 = 1080x1920 (igual a src/types.ts)", DESTINATION_DIMENSIONS["vertical-9-16"].width === 1080 && DESTINATION_DIMENSIONS["vertical-9-16"].height === 1920);
+
+// --- shouldConsiderStuck: criterio REDISEÑADO del vigilante (Fase 0,
+// causa raíz con evidencia, 09-nov-2026, criterio 6) -- exhaustivo
+// con datos simulados, sin necesitar un proceso real para cada
+// combinación (eso vive en test-render-observability.mjs, con
+// procesos reales en Linux). ---
+
+check(
+  "progreso todavía no está añejo (msSinceLastProgress < stuckAfterMs): nunca se considera trabado, sea cual sea la CPU",
+  shouldConsiderStuck({ msSinceLastProgress: 60_000, stuckAfterMs: 600_000, cpuTicksDelta: 0 }) === false &&
+    shouldConsiderStuck({ msSinceLastProgress: 60_000, stuckAfterMs: 600_000, cpuTicksDelta: null }) === false,
+);
+
+check(
+  "progreso añejo + CPU medida SIN ningún tick nuevo (0): SÍ se considera trabado (inactividad real, coincide con el issue público de Remotion)",
+  shouldConsiderStuck({ msSinceLastProgress: 600_000, stuckAfterMs: 600_000, cpuTicksDelta: 0 }) === true,
+);
+
+check(
+  "progreso añejo + CPU medida CON al menos 1 tick nuevo: NO se considera trabado -- 'lento, no colgado' (inicialización legítima)",
+  shouldConsiderStuck({ msSinceLastProgress: 600_000, stuckAfterMs: 600_000, cpuTicksDelta: 1 }) === false &&
+    shouldConsiderStuck({ msSinceLastProgress: 900_000, stuckAfterMs: 600_000, cpuTicksDelta: 5000 }) === false,
+);
+
+check(
+  "progreso añejo + CPU no se pudo medir (null -- sin /proc, o aún sin segunda lectura): se mantiene la capacidad de cortar (fail-safe hacia CORTAR, no hacia esperar para siempre)",
+  shouldConsiderStuck({ msSinceLastProgress: 600_000, stuckAfterMs: 600_000, cpuTicksDelta: null }) === true,
+);
+
+check(
+  "borde exacto: msSinceLastProgress === stuckAfterMs ya cuenta como 'añejo' (>=, no solo >)",
+  shouldConsiderStuck({ msSinceLastProgress: 600_000, stuckAfterMs: 600_000, cpuTicksDelta: 0 }) === true,
+);
 
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);
 process.exit(failures === 0 ? 0 : 1);

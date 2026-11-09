@@ -14,7 +14,7 @@
 // con el mismo FFmpeg real de producción -- nada de contenido real, ni
 // llamadas de IA, ni costo.
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -22,7 +22,8 @@ import { fileURLToPath } from "node:url";
 import { resolveCompositorFfmpeg, resolveCompositorFfprobe, binaryEnv } from "./compositor.mjs";
 import { runRemotionRender, RenderTimeoutError, RenderStuckError } from "./render-worker.mjs";
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
-import { killProcessGroup, countAliveProcessesInGroup } from "./process-tree.mjs";
+import { runDiagnosticRender, buildDiagnosticFrameRanges } from "./render-diagnose.mjs";
+import { killProcessGroup, countAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
 
 const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -432,6 +433,144 @@ try {
   await checkNoOrphans("caso 6 (vigilante de atasco)", childRef?.pid);
 } catch (err) {
   check("caso 6 (vigilante de atasco): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 7: criterio REDISEÑADO del vigilante (criterio 6) -- un
+// render real con un umbral de atasco agresivo (500ms) no se corta
+// mientras está bundling de verdad, aunque todavía no haya reportado
+// ningún cuadro. Valores elegidos con datos reales, no adivinados: una
+// medición previa en este mismo CI (09-nov-2026) mostró el primer
+// evento de progreso real (bundling) a los 1112ms del spawn -- 500ms
+// queda cómodamente por debajo de eso, y 100ms de intervalo de
+// revisión queda cómodamente por encima de la resolución real de los
+// ticks de CPU en Linux (CLK_TCK=100 = 10ms; confirmado real en CI que
+// valores de intervalo por debajo de eso producen falsos "sin
+// actividad" por cuantización, no por inactividad real). La aserción
+// dura es que NO se corta (eso es lo que pide el criterio 6); el log
+// "lento, no trabado" se registra como evidencia adicional pero no
+// hace fallar la prueba por sí solo -- el instante exacto en que la
+// revisión cae depende del scheduler del runner de CI, no solo del
+// umbral, así que exigir esa línea específica sería frágil sin
+// aportar una garantía real adicional sobre la que ya da "no se cortó".
+try {
+  const jobRelPath = await makeJobFile("caso7", 6);
+  const outputPath = path.join(FIXTURES_DIR, "caso7-out.mp4");
+  const logs = [];
+  let threw = null;
+  try {
+    await runRemotionRender({
+      cwd: PROJECT_ROOT,
+      env: process.env,
+      outputPath,
+      propsJobFile: jobRelPath,
+      concurrency: "1",
+      timeoutMs: 60_000,
+      stuckAfterMs: 500,
+      stuckCheckIntervalMs: 100,
+      onLog: (msg) => logs.push(msg),
+    });
+  } catch (err) {
+    threw = err;
+  }
+  check("caso 7: el render NO se cortó por atasco pese al umbral agresivo (había actividad de CPU real durante el bundling)", threw === null, String(threw?.message ?? ""));
+  const sawActiveLog = logs.some((l) => l.includes('se considera "lento, no trabado"'));
+  console.log(`[caso 7] log de actividad detectada durante el bundling (evidencia adicional, no determina el resultado de la prueba): ${sawActiveLog ? "SÍ se vio" : "no se vio en esta corrida (posible, por el scheduler del runner de CI)"}`);
+} catch (err) {
+  check("caso 7 (vigilante rediseñado, activo no se corta): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 8: medición de actividad de CPU contra procesos reales,
+// SIN Remotion -- confirma el primitivo `sumGroupCpuTicks` de forma
+// aislada y determinística: un proceso real que quema CPU en un
+// bucle muestra ticks subiendo; uno real que solo duerme muestra
+// ticks sin cambiar. Esto es lo que distingue "colgado" de "activo"
+// en el vigilante -- probarlo aislado de Remotion da evidencia más
+// rápida y 100% determinística de que el primitivo en sí funciona
+// contra procesos reales de Linux.
+try {
+  const busyChild = spawn("sh", ["-c", "i=0; while true; do i=$((i+1)); done"], { detached: true });
+  const idleChild = spawn("sh", ["-c", "sleep 5"], { detached: true });
+  try {
+    const busyBefore = await sumGroupCpuTicks(busyChild.pid);
+    const idleBefore = await sumGroupCpuTicks(idleChild.pid);
+    await new Promise((r) => setTimeout(r, 1000));
+    const busyAfter = await sumGroupCpuTicks(busyChild.pid);
+    const idleAfter = await sumGroupCpuTicks(idleChild.pid);
+    check(
+      "caso 8: proceso real ocupado (bucle) -- los ticks de CPU del grupo SUBEN en 1s",
+      busyBefore !== null && busyAfter !== null && busyAfter > busyBefore,
+      `busyBefore=${busyBefore} busyAfter=${busyAfter}`,
+    );
+    check(
+      "caso 8: proceso real inactivo (sleep) -- los ticks de CPU del grupo NO suben en 1s",
+      idleBefore !== null && idleAfter !== null && idleAfter === idleBefore,
+      `idleBefore=${idleBefore} idleAfter=${idleAfter}`,
+    );
+  } finally {
+    killProcessGroup(busyChild, "SIGKILL");
+    killProcessGroup(idleChild, "SIGKILL");
+  }
+} catch (err) {
+  check("caso 8 (medición de actividad de CPU, procesos reales): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 9: render de diagnóstico (criterio 3) contra un video real
+// -- confirma, con Remotion/Chrome reales, que se detectan los hitos
+// esperados (navegador, bundling, composición, video fuente abierto Y
+// primer cuadro extraído), que NO escribe nada persistente (se borra
+// el archivo de salida), y que no queda ningún proceso huérfano tras
+// el corte -- igual que el render real, pero mucho más rápido.
+try {
+  const jobRelPath = await makeJobFile("caso9", 20);
+  const outputPath = path.join(FIXTURES_DIR, "caso9-out.mp4");
+  const frames = buildDiagnosticFrameRanges(600, { initialFrameCount: 10, middleWindowFrameCount: 10 }); // 20s @30fps = 600 cuadros
+  const result = await runDiagnosticRender({
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    outputPath,
+    propsJobFile: jobRelPath,
+    concurrency: "1",
+    frames,
+    timeoutMs: 60_000,
+  });
+  check("caso 9: no hubo error de lanzamiento de la herramienta misma", !result.launchError && !result.spawnError, JSON.stringify(result.launchError ?? result.spawnError));
+  check("caso 9: el render de diagnóstico completó (código 0) dentro del timeout corto", result.completed === true && result.timedOut === false);
+  check("caso 9: hito 'browser-launch-requested' detectado", result.milestones["browser-launch-requested"] !== null);
+  check("caso 9: hito 'bundling-done' detectado", result.milestones["bundling-done"] !== null);
+  check("caso 9: hito 'composition-metadata-loaded' detectado", result.milestones["composition-metadata-loaded"] !== null);
+  check("caso 9: hito 'render-started' detectado", result.milestones["render-started"] !== null);
+  check("caso 9: hito 'source-video-opened' detectado (se solicitó el video base)", result.milestones["source-video-opened"] !== null);
+  check("caso 9: hito 'source-video-first-frame' detectado (se extrajo el primer cuadro del video base)", result.milestones["source-video-first-frame"] !== null);
+  check("caso 9: no quedó ningún proceso descendiente vivo tras el corte", result.descendantProcessesAliveAfterCut === null || result.descendantProcessesAliveAfterCut === 0, `aliveCount=${result.descendantProcessesAliveAfterCut}`);
+  const outputStillExists = await fs
+    .access(outputPath)
+    .then(() => true)
+    .catch(() => false);
+  check("caso 9: el archivo de salida del diagnóstico se borró (nunca queda nada persistente)", outputStillExists === false);
+} catch (err) {
+  check("caso 9 (render de diagnóstico): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 10: render de diagnóstico con un timeout DELIBERADAMENTE
+// corto (1ms) contra un video real -- confirma que "se detiene" se
+// reporta como evidencia (timedOut=true), no como un error de la
+// herramienta, y que tampoco deja huérfanos.
+try {
+  const jobRelPath = await makeJobFile("caso10", 20);
+  const outputPath = path.join(FIXTURES_DIR, "caso10-out.mp4");
+  const result = await runDiagnosticRender({
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    outputPath,
+    propsJobFile: jobRelPath,
+    concurrency: "1",
+    frames: "0-9",
+    timeoutMs: 1,
+  });
+  check("caso 10: con timeout de 1ms, se reporta timedOut=true (evidencia, no una excepción)", result.timedOut === true && result.completed === false);
+  check("caso 10: no quedó ningún proceso descendiente vivo tras el corte por timeout", result.descendantProcessesAliveAfterCut === null || result.descendantProcessesAliveAfterCut === 0, `aliveCount=${result.descendantProcessesAliveAfterCut}`);
+} catch (err) {
+  check("caso 10 (render de diagnóstico, timeout corto): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }
 
 await fs.rm(FIXTURES_DIR, { recursive: true, force: true });

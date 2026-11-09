@@ -1,0 +1,122 @@
+{
+  "name": "Fabrica Videos - Render de diagnóstico",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-640, 0],
+      "id": "trigger-manual",
+      "name": "Ejecutar manualmente"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "jobid-field",
+              "name": "jobId",
+              "value": "PEGA_AQUI_EL_JOBID",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-400, 0],
+      "id": "jobid",
+      "name": "jobId a diagnosticar"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://fabrica-videos-engine:3001/jobs/{{ $json.jobId }}/diagnose",
+        "options": {
+          "timeout": 240000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 0],
+      "id": "lanzar-diagnostico",
+      "name": "Lanzar render de diagnóstico",
+      "notes": "Corre unos pocos cuadros del inicio y una ventana en el medio del video (criterio 3, causa raíz con evidencia, 09-nov-2026). Sin costo de API, sin tocar el job real, sin escribir nada persistente. Tarda hasta RENDER_DIAGNOSE_TIMEOUT_MINUTES (3 min por defecto) -- por eso el timeout del nodo HTTP está en 240s, un poco más generoso."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "r-completed",
+              "name": "completó",
+              "value": "={{ $json.completed }}",
+              "type": "boolean"
+            },
+            {
+              "id": "r-timedout",
+              "name": "seDetuvoPorTimeout",
+              "value": "={{ $json.timedOut }}",
+              "type": "boolean"
+            },
+            {
+              "id": "r-source",
+              "name": "videoFuente",
+              "value": "={{ $json.sourceVideoDiagnosticsLine }}",
+              "type": "string"
+            },
+            {
+              "id": "r-frames",
+              "name": "cuadrosProbados",
+              "value": "={{ $json.frames }}",
+              "type": "string"
+            },
+            {
+              "id": "r-milestones",
+              "name": "hitos",
+              "value": "={{ $json.milestones }}",
+              "type": "object",
+              "notes": "ms desde el arranque en que se vio cada hito (null = nunca se vio -- 'dónde se detiene', criterio 3): browser-launch-requested, bundling-done, composition-metadata-loaded, render-started, source-video-opened, source-video-first-frame."
+            },
+            {
+              "id": "r-orphans",
+              "name": "procesosDescendientesVivos",
+              "value": "={{ $json.descendantProcessesAliveAfterCut }}",
+              "type": "number"
+            },
+            {
+              "id": "r-stdout",
+              "name": "stdoutCompleto",
+              "value": "={{ $json.stdoutTail }}",
+              "type": "string"
+            },
+            {
+              "id": "r-stderr",
+              "name": "stderrCompleto",
+              "value": "={{ $json.stderrTail }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [100, 0],
+      "id": "resumen-diagnostico",
+      "name": "Resumen del diagnóstico"
+    }
+  ],
+  "connections": {
+    "Ejecutar manualmente": {
+      "main": [[{ "node": "jobId a diagnosticar", "type": "main", "index": 0 }]]
+    },
+    "jobId a diagnosticar": {
+      "main": [[{ "node": "Lanzar render de diagnóstico", "type": "main", "index": 0 }]]
+    },
+    "Lanzar render de diagnóstico": {
+      "main": [[{ "node": "Resumen del diagnóstico", "type": "main", "index": 0 }]]
+    }
+  }
+}

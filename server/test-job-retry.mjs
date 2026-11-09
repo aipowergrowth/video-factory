@@ -11,7 +11,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { canRetryJob, describeRetryPlan, RETRYABLE_STATUSES, readJobFileForRetry, checkBaseVideoExists } from "./job-retry.mjs";
+import { canRetryJob, describeRetryPlan, RETRYABLE_STATUSES, readJobFileForRetry, checkBaseVideoExists, appendAttemptHistory } from "./job-retry.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -152,6 +152,21 @@ const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "vf-job-retry-"));
 }
 
 await fs.rm(tmpDir, { recursive: true, force: true });
+
+// --- appendAttemptHistory: un reintento no borra la evidencia del intento anterior (criterio 2) ---
+
+check("primer intento (sin historial previo, undefined): queda un array con una sola entrada", appendAttemptHistory(undefined, { n: 1 }).length === 1);
+check(
+  "intentos sucesivos se van agregando, uno por uno, en orden cronológico",
+  JSON.stringify(appendAttemptHistory([{ n: 1 }, { n: 2 }], { n: 3 })) === JSON.stringify([{ n: 1 }, { n: 2 }, { n: 3 }]),
+);
+{
+  // Más de maxEntries -- se recorta por el principio (los más viejos), nunca se pierde el intento MÁS RECIENTE.
+  let attempts = [];
+  for (let i = 1; i <= 8; i++) attempts = appendAttemptHistory(attempts, { n: i }, 5);
+  check("recorta a maxEntries (5), conservando los 5 MÁS RECIENTES", attempts.length === 5 && attempts.map((a) => a.n).join(",") === "4,5,6,7,8");
+}
+check("existingAttempts corrupto/no-array (nunca debería pasar, pero no debe lanzar): se trata como vacío", appendAttemptHistory("no soy un array", { n: 1 }).length === 1);
 
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);
 process.exit(failures === 0 ? 0 : 1);
