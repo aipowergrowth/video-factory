@@ -1123,8 +1123,12 @@ const processQueue = () => {
       const attempts = appendAttemptHistory(current.attempts, attemptRecord);
 
       if (err instanceof CancelledError) {
+        // Criterio 5 (corrección 10-nov-2026): antes, cancelar un
+        // render no dejaba ningún `renderEvidence` en el estado vivo
+        // del job -- solo quedaba (desde ahora) en `attempts`. Ahora
+        // también queda en el nivel superior, igual que timeout/atasco.
         console.log(`[job ${jobId}] cancelado.`);
-        writeStatus(jobId, { status: "cancelled", attempts });
+        writeStatus(jobId, { status: "cancelled", renderEvidence, attempts });
       } else {
         console.log(`[job ${jobId}] terminó con error:`, err.message ?? err);
         writeStatus(jobId, { status: "error", error: String(err.message ?? err), renderEvidence, attempts });

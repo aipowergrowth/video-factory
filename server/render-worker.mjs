@@ -19,7 +19,7 @@
 // `--log=verbose`: el nivel por defecto ya tiene todo lo necesario, con
 // mucho menos ruido en un render de 60 minutos real.
 import { spawn } from "node:child_process";
-import { killProcessGroup, countAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
+import { killProcessGroup, listAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
 
 // Duplicados a propósito de src/types.ts (mismo patrón que
 // isRenderableByEngine/shouldBurnCaptions en cta-guarantee.mjs: el
@@ -42,6 +42,32 @@ export const DESTINATION_DIMENSIONS = {
 const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
 
 /**
+ * Interpreta "Xh Ym Zs" (horas/minutos opcionales, segundos siempre
+ * presente) a segundos totales -- causa raíz con evidencia
+ * (09-nov-2026): el parser viejo (`, time remaining: (\d+)s` con `$`
+ * pegado al final) descartaba la línea ENTERA de progreso cuando el
+ * tiempo restante superaba 1 minuto, porque Remotion deja de imprimir
+ * solo segundos en ese caso. Confirmado contra el código FUENTE REAL
+ * instalado de @remotion/cli@4.0.538
+ * (node_modules/@remotion/cli/dist/eta-string.js#formatEtaString, el
+ * mismo binario que produce producción, no la documentación -- que
+ * explícitamente no garantiza este formato): construye el texto como
+ * [horas?, minutos?, segundos] filtrado por verdad y unido con
+ * espacios -- horas/minutos se OMITEN cuando son 0, segundos SIEMPRE
+ * aparece. Nunca lanza: si el texto no calza (Remotion podría
+ * cambiarlo en una versión futura), devuelve `null` -- el evento de
+ * progreso (cuadros) nunca depende de poder interpretar esto.
+ */
+export const parseEtaString = (text) => {
+  const m = /^(?:(\d+)h\s)?(?:(\d+)m\s)?(\d+)s$/.exec(text);
+  if (!m) return null;
+  const hours = m[1] !== undefined ? Number(m[1]) : 0;
+  const minutes = m[2] !== undefined ? Number(m[2]) : 0;
+  const seconds = Number(m[3]);
+  return hours * 3600 + minutes * 60 + seconds;
+};
+
+/**
  * Interpreta UNA línea de stdout de `remotion render` como un evento
  * de progreso estructurado, o `null` si la línea no es una de las
  * reconocidas (hay muchas otras líneas informativas que se ignoran a
@@ -56,7 +82,11 @@ export const parseRenderProgressLine = (rawLine) => {
     return { stage: "bundling", percent: Number(m[1]) };
   }
 
-  m = /^Rendered (\d+)\/(\d+)(?:, time remaining: (\d+)s)?$/.exec(line);
+  // El avance (cuadros/total) NUNCA depende de poder interpretar el
+  // tiempo restante -- se captura como texto libre (`.+`) y se
+  // interpreta aparte con `parseEtaString`, que puede fallar sin
+  // tirar el evento entero (criterio 1 de esta corrección).
+  m = /^Rendered (\d+)\/(\d+)(?:, time remaining: (.+))?$/.exec(line);
   if (m) {
     const renderedFrames = Number(m[1]);
     const totalFrames = Number(m[2]);
@@ -65,7 +95,7 @@ export const parseRenderProgressLine = (rawLine) => {
       renderedFrames,
       totalFrames,
       percent: totalFrames > 0 ? Math.round((renderedFrames / totalFrames) * 1000) / 10 : 0,
-      etaSeconds: m[3] !== undefined ? Number(m[3]) : null,
+      etaSeconds: m[3] !== undefined ? parseEtaString(m[3]) : null,
     };
   }
 
@@ -195,6 +225,12 @@ export const runRemotionRender = ({
   enableMultiprocessOnLinux = false,
   browserExecutable,
   binariesDirectory,
+  // Restringe el render a un rango de cuadros (p.ej. "0-799") --
+  // `undefined` en un render real de producción (comportamiento sin
+  // cambios); usado para probar el contador con un render real corto
+  // (ver test-render-observability.mjs) sin tener que renderizar un
+  // video completo.
+  frames,
   timeoutMs = 0,
   // Vigilante de render trabado (criterio 3): si pasan
   // `stuckAfterMs` sin NINGÚN evento de progreso nuevo (ni rendering
@@ -227,7 +263,7 @@ export const runRemotionRender = ({
   makeCancelledError = () => new Error("Render cancelado."),
 }) =>
   new Promise((resolve, reject) => {
-    const args = buildRenderArgs({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory });
+    const args = buildRenderArgs({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames });
     // `detached: true` (y no más que eso -- no `setsid`/nueva sesión,
     // solo nuevo GRUPO de procesos): hace que `child.pid` sea el
     // LÍDER de un grupo de procesos propio, distinto del grupo del
@@ -404,14 +440,48 @@ export const runRemotionRender = ({
       // terminó bien solo) se confirma cuántos procesos del grupo
       // siguen vivos. Un instante de margen para que el SIGKILL de
       // arriba termine de propagarse antes de contar.
+      //
+      // Corrección 10-nov-2026 (causa raíz con evidencia, criterio 6):
+      // antes solo se contaba -- ahora se identifica CADA
+      // descendiente vivo (pid, estado, nombre, línea de comando
+      // completa) para saber QUÉ son, no solo cuántos. Un zombi (Z)
+      // ya está muerto -- solo falta que el padre lo recoja, SIGKILL
+      // no hace nada ahí, y no se cuenta como huérfano real. Si queda
+      // algo realmente vivo (no zombi), se reintenta un SIGKILL
+      // directo a CADA proceso por su pid (no solo al grupo) antes de
+      // reportarlo como huérfano de verdad -- cubre el caso de que el
+      // "close" del proceso padre llegue antes de que el SIGKILL de
+      // respaldo (programado más arriba) alcance a correr.
       let descendantProcessesAliveAfterCut = null;
+      let descendantProcessesDetail = null;
       if (isCancelled() || stuck || timedOut) {
         await new Promise((r) => setTimeout(r, processTreeCheckDelayMs));
-        descendantProcessesAliveAfterCut = typeof child.pid === "number" ? await countAliveProcessesInGroup(child.pid) : null;
+        if (typeof child.pid === "number") {
+          descendantProcessesDetail = await listAliveProcessesInGroup(child.pid);
+          const realSurvivors = (descendantProcessesDetail ?? []).filter((p) => p.state !== "Z");
+          if (realSurvivors.length > 0) {
+            onLog(
+              `${realSurvivors.length} proceso(s) descendiente(s) siguen vivos (no zombis) tras el primer chequeo -- ` +
+                `reintentando SIGKILL directo a cada pid y revisando otra vez en 2s: ${JSON.stringify(realSurvivors)}`,
+            );
+            for (const p of realSurvivors) {
+              try {
+                process.kill(p.pid, "SIGKILL");
+              } catch {
+                // Ya no existe para cuando se intenta -- bien, es lo que se buscaba.
+              }
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+            descendantProcessesDetail = await listAliveProcessesInGroup(child.pid);
+          }
+        }
+        descendantProcessesAliveAfterCut = descendantProcessesDetail?.length ?? null;
         onLog(
           descendantProcessesAliveAfterCut === null
             ? `no se pudo comprobar procesos descendientes vivos (sin /proc disponible -- esperado en macOS de desarrollo, no en el contenedor de producción).`
-            : `procesos descendientes del render vivos tras el corte: ${descendantProcessesAliveAfterCut}${descendantProcessesAliveAfterCut === 0 ? " (ninguno)" : " -- REVISAR, se esperaba 0"}.`,
+            : descendantProcessesAliveAfterCut === 0
+              ? `procesos descendientes del render vivos tras el corte: 0 (ninguno).`
+              : `procesos descendientes del render vivos tras el corte y el reintento de SIGKILL: ${descendantProcessesAliveAfterCut} -- REVISAR: ${JSON.stringify(descendantProcessesDetail)}`,
         );
       }
 
@@ -428,11 +498,19 @@ export const runRemotionRender = ({
         stderrTail,
         lastProgressEvent,
         descendantProcessesAliveAfterCut,
+        descendantProcessesDetail,
         stuckDiagnosis,
       });
 
       if (isCancelled()) {
-        reject(makeCancelledError());
+        // Corrección 10-nov-2026 (criterio 5): antes, cancelar un
+        // render NUNCA adjuntaba evidencia -- Alex no podía cancelar
+        // sin perder lo que se había capturado hasta ese momento
+        // (stdout/stderr, último evento, huérfanos tras el corte).
+        // Mismo mecanismo que stuck/timeout/exit-error.
+        const err = makeCancelledError();
+        err.evidence = buildEvidence("cancelled");
+        reject(err);
       } else if (stuck) {
         const err = new RenderStuckError(
           `El render se quedó sin reportar ningún cuadro nuevo Y sin actividad de CPU durante ${Math.round(stuckAfterMs / 60000)} min -- se terminó el proceso. ` +

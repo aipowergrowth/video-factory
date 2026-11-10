@@ -74,6 +74,81 @@ export const countAliveProcessesInGroup = async (pgid, { procRoot = "/proc" } = 
 };
 
 /**
+ * Extrae el ESTADO (un solo carácter -- R corriendo, S durmiendo, D
+ * esperando E/S sin poder recibir señales, Z zombi ya muerto
+ * esperando que el padre lo recoja, T detenido) de una línea cruda de
+ * /proc/[pid]/stat -- mismo truco del último ")". Causa raíz con
+ * evidencia (10-nov-2026, criterio 6): "sigue vivo" no distingue un
+ * proceso realmente corriendo de un zombi (ya terminado, inofensivo,
+ * solo pendiente de que el padre lo recoja) de uno genuinamente
+ * atascado en E/S (D) -- que SIGKILL no puede terminar hasta que esa
+ * E/S se resuelva, por diseño del kernel, no por un defecto de este
+ * mecanismo.
+ */
+export const parseStatStateField = (rawStatLine) => {
+  const closeParenIndex = rawStatLine.lastIndexOf(")");
+  if (closeParenIndex === -1) return null;
+  const fields = rawStatLine.slice(closeParenIndex + 1).trim().split(/\s+/);
+  return fields[0] || null;
+};
+
+/**
+ * Nombre corto (/proc/[pid]/comm) y línea de comando completa con
+ * argumentos (/proc/[pid]/cmdline, los `\0` se unen con espacios) de
+ * un proceso -- `null` en cualquiera que no se pueda leer (el proceso
+ * pudo morir justo al leerlo, o ya no existe) en vez de lanzar.
+ */
+const readProcessIdentity = async (pid, procRoot) => {
+  let comm = null;
+  let cmdline = null;
+  try {
+    comm = (await fs.readFile(`${procRoot}/${pid}/comm`, "utf8")).trim();
+  } catch {
+    // No se pudo leer -- queda null, nunca inventado.
+  }
+  try {
+    const raw = await fs.readFile(`${procRoot}/${pid}/cmdline`, "utf8");
+    cmdline = raw.split("\0").filter(Boolean).join(" ") || null;
+  } catch {
+    // No se pudo leer -- queda null, nunca inventado.
+  }
+  return { comm, cmdline };
+};
+
+/**
+ * Como `countAliveProcessesInGroup`, pero con el DETALLE de cada
+ * proceso vivo del grupo -- pid, estado, nombre corto y línea de
+ * comando completa -- para saber QUÉ son los descendientes que
+ * sobrevivieron a un corte, no solo cuántos (criterio 6, causa raíz
+ * con evidencia, 10-nov-2026). `null` si no hay /proc (macOS de
+ * desarrollo) -- nunca una lista inventada.
+ */
+export const listAliveProcessesInGroup = async (pgid, { procRoot = "/proc" } = {}) => {
+  let entries;
+  try {
+    entries = await fs.readdir(procRoot);
+  } catch {
+    return null;
+  }
+  const alive = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const raw = await fs.readFile(`${procRoot}/${entry}/stat`, "utf8");
+      if (parsePgrpFromStatLine(raw) === pgid) {
+        const state = parseStatStateField(raw);
+        const { comm, cmdline } = await readProcessIdentity(entry, procRoot);
+        alive.push({ pid: Number(entry), state, comm, cmdline });
+      }
+    } catch {
+      // El proceso pudo morir entre el readdir y esta lectura -- no
+      // es un error real, simplemente no se incluye.
+    }
+  }
+  return alive;
+};
+
+/**
  * Extrae pgrp + utime/stime (ticks de CPU acumulados, en modo usuario
  * y en modo kernel) de una línea cruda de /proc/[pid]/stat -- pura,
  * mismo truco del último ")" que `parsePgrpFromStatLine`. Campos

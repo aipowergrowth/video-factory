@@ -6,7 +6,7 @@
 // matar el grupo completo deja 0 descendientes vivos tras un render
 // real -- vive en test-render-observability.mjs (CI, Linux real).
 
-import { parsePgrpFromStatLine, countAliveProcessesInGroup, killProcessGroup } from "./process-tree.mjs";
+import { parsePgrpFromStatLine, countAliveProcessesInGroup, killProcessGroup, parseStatStateField, listAliveProcessesInGroup } from "./process-tree.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -65,6 +65,24 @@ check(
     threw = err;
   }
   check("child sin pid válido: killProcessGroup no hace nada, nunca lanza", threw === null);
+}
+
+// --- parseStatStateField: criterio 6 (causa raíz con evidencia, 10-nov-2026) ---
+
+check("estado 'R' (corriendo): se extrae tal cual", parseStatStateField("1234 (npx) R 1 999 999 0 -1") === "R");
+check("estado 'Z' (zombi): se extrae tal cual", parseStatStateField("1234 (npx) Z 1 999 999 0 -1") === "Z");
+check("estado 'D' (esperando E/S): se extrae tal cual", parseStatStateField("1234 (npx) D 1 999 999 0 -1") === "D");
+check(
+  "comm con espacios/paréntesis propios: el estado sigue siendo el primer campo tras el ÚLTIMO ')'",
+  parseStatStateField("5678 (remotion (render)) S 1 2000 2000 0 -1") === "S",
+);
+check("línea sin ')' (formato inesperado): devuelve null, nunca lanza", parseStatStateField("línea corrupta") === null);
+
+// --- listAliveProcessesInGroup (fail-safe, sin /proc real) ---
+
+{
+  const result = await listAliveProcessesInGroup(999, { procRoot: "/ruta/que/no/existe" });
+  check("sin /proc disponible: devuelve null, nunca una lista inventada", result === null);
 }
 
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);

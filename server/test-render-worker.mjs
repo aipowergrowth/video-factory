@@ -10,7 +10,7 @@
 // producción) -- no son strings inventadas a partir de la
 // documentación (que explícitamente no garantiza el formato).
 
-import { parseRenderProgressLine, buildRenderArgs, shouldConsiderStuck, ENGINE_FPS, DESTINATION_DIMENSIONS } from "./render-worker.mjs";
+import { parseRenderProgressLine, parseEtaString, buildRenderArgs, shouldConsiderStuck, ENGINE_FPS, DESTINATION_DIMENSIONS } from "./render-worker.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -54,6 +54,75 @@ check(
     return e?.percent === Math.round((89 / 90) * 1000) / 10;
   })(),
 );
+
+// --- Corrección 09-nov-2026 (causa raíz con evidencia, criterio 1):
+// el parser viejo descartaba la línea ENTERA de "Rendered" cuando el
+// tiempo restante superaba 1 minuto (ancla `$` pegada a `(\d+)s`, sin
+// aceptar "Xm Ys" ni "Xh Ym Zs"). Líneas de abajo tomadas tal cual del
+// stdoutTail REAL del job 1fd239de-8f9e-4642-8e42-d848b17d8481
+// (evidencia leída por GET /jobs/:id, imagen 7ae8596) más una
+// combinación con horas, construida siguiendo el formato CONFIRMADO
+// contra el código fuente real instalado
+// (node_modules/@remotion/cli/dist/eta-string.js#formatEtaString,
+// @remotion/cli@4.0.538 -- el mismo binario de producción) -- nunca
+// se asumió el formato por la documentación, que no lo garantiza. ---
+
+check(
+  "Rendered 37457/41331, time remaining: 19s (línea real del job 1fd239de): reconocida igual que antes",
+  (() => {
+    const e = parseRenderProgressLine("Rendered 37457/41331, time remaining: 19s");
+    return e?.stage === "rendering" && e.renderedFrames === 37457 && e.totalFrames === 41331 && e.etaSeconds === 19;
+  })(),
+);
+
+check(
+  "Rendered 37457/41331, time remaining: 18m 24s (línea real del job 1fd239de -- ANTES se descartaba la línea entera): ahora reconocida",
+  (() => {
+    const e = parseRenderProgressLine("Rendered 37457/41331, time remaining: 18m 24s");
+    return e?.stage === "rendering" && e.renderedFrames === 37457 && e.totalFrames === 41331 && e.etaSeconds === 18 * 60 + 24 && e.percent === Math.round((37457 / 41331) * 1000) / 10;
+  })(),
+);
+
+check(
+  "Rendered 5/41331, time remaining: 1h 2m 3s (con horas, formato confirmado contra el código fuente real de @remotion/cli -- ANTES también se descartaba): ahora reconocida",
+  (() => {
+    const e = parseRenderProgressLine("Rendered 5/41331, time remaining: 1h 2m 3s");
+    return e?.stage === "rendering" && e.renderedFrames === 5 && e.totalFrames === 41331 && e.etaSeconds === 3600 + 2 * 60 + 3;
+  })(),
+);
+
+check(
+  "Rendered 5/41331, time remaining: 1h 3s (horas sin minutos -- el minuto se OMITE cuando es 0, confirmado contra el código fuente): reconocida",
+  (() => {
+    const e = parseRenderProgressLine("Rendered 5/41331, time remaining: 1h 3s");
+    return e?.stage === "rendering" && e.etaSeconds === 3600 + 3;
+  })(),
+);
+
+check(
+  "Rendered 37511/41331, time remaining: 18m 20s (última línea real vista en el job 1fd239de antes del timeout a los 180 min): avance correcto (90.8%)",
+  (() => {
+    const e = parseRenderProgressLine("Rendered 37511/41331, time remaining: 18m 20s");
+    return e?.renderedFrames === 37511 && e?.totalFrames === 41331 && Math.abs(e.percent - 90.8) < 0.05;
+  })(),
+);
+
+check(
+  "Un formato de tiempo restante FUTURO/desconocido (p.ej. con días) nunca se descarta el evento -- avance correcto, etaSeconds en null",
+  (() => {
+    const e = parseRenderProgressLine("Rendered 100/41331, time remaining: 2d 3h 4m 5s");
+    return e?.stage === "rendering" && e.renderedFrames === 100 && e.totalFrames === 41331 && e.etaSeconds === null;
+  })(),
+);
+
+// --- parseEtaString: pura, probada exhaustivamente aparte del parser de líneas completo ---
+
+check("parseEtaString: solo segundos ('19s') -> 19", parseEtaString("19s") === 19);
+check("parseEtaString: minutos y segundos ('18m 24s') -> 1104", parseEtaString("18m 24s") === 18 * 60 + 24);
+check("parseEtaString: horas, minutos y segundos ('1h 2m 3s') -> 3723", parseEtaString("1h 2m 3s") === 3723);
+check("parseEtaString: horas sin minutos ('1h 3s') -> 3603 (el minuto se omite cuando es 0)", parseEtaString("1h 3s") === 3603);
+check("parseEtaString: '0s' -> 0 (nunca null solo porque el valor sea cero)", parseEtaString("0s") === 0);
+check("parseEtaString: formato irreconocible (futuro cambio de Remotion, p.ej. con días) -> null, nunca lanza", parseEtaString("2d 3h 4m 5s") === null && parseEtaString("algo raro") === null);
 
 check(
   "Encoded 31/90: reconocida",

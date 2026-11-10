@@ -23,7 +23,7 @@ import { resolveCompositorFfmpeg, resolveCompositorFfprobe, binaryEnv } from "./
 import { runRemotionRender, RenderTimeoutError, RenderStuckError } from "./render-worker.mjs";
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
 import { runDiagnosticRender, buildDiagnosticFrameRanges } from "./render-diagnose.mjs";
-import { killProcessGroup, countAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
+import { killProcessGroup, countAliveProcessesInGroup, listAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
 
 const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -152,6 +152,15 @@ const checkNoOrphans = async (label, pid) => {
     aliveCount === null || aliveCount === 0,
     `aliveCount=${aliveCount}`,
   );
+  // Criterio 6 (corrección 10-nov-2026): la misma verificación pero
+  // con el DETALLE (pid/estado/nombre/comando) -- confirma que la
+  // lista queda vacía (array real de longitud 0), no solo el conteo.
+  const aliveDetail = await listAliveProcessesInGroup(pid);
+  check(
+    `${label}: la lista detallada de descendientes vivos también queda vacía (array de longitud 0)`,
+    aliveDetail === null || aliveDetail.length === 0,
+    `aliveDetail=${JSON.stringify(aliveDetail)}`,
+  );
 };
 
 // --- Caso 2: timeout -- el mismo mecanismo de antes, ahora corta el grupo completo (criterio 2) ---
@@ -231,6 +240,18 @@ try {
   }
   check("caso 3: cancelar mientras corre rechaza con el error que da makeCancelledError (no un error genérico)", threw instanceof FakeCancelledError);
   await checkNoOrphans("caso 3 (cancelación, con Chrome real ya lanzado)", childRef?.pid);
+  // Criterio 5 (corrección 10-nov-2026): antes, cancelar NUNCA
+  // adjuntaba evidencia -- ahora debe traer lo mismo que
+  // stuck/timeout/exit-error (stdout/stderr, último evento, conteo de
+  // huérfanos), con endedReason="cancelled".
+  check("caso 3: la cancelación SÍ trae evidencia (endedReason='cancelled')", threw?.evidence?.endedReason === "cancelled");
+  check("caso 3: la evidencia de la cancelación trae stdout real (no vacío -- Chrome ya había impreso algo)", typeof threw?.evidence?.stdoutTail === "string" && threw.evidence.stdoutTail.length > 0);
+  check("caso 3: la evidencia de la cancelación trae el conteo de huérfanos (0, igual que el chequeo de arriba)", threw?.evidence?.descendantProcessesAliveAfterCut === 0);
+  check(
+    "caso 3: la evidencia de la cancelación trae la lista DETALLADA de descendientes (array vacío -- criterio 6)",
+    Array.isArray(threw?.evidence?.descendantProcessesDetail) && threw.evidence.descendantProcessesDetail.length === 0,
+    `descendantProcessesDetail=${JSON.stringify(threw?.evidence?.descendantProcessesDetail)}`,
+  );
 } catch (err) {
   check("caso 3 (cancelación): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }
@@ -571,6 +592,116 @@ try {
   check("caso 10: no quedó ningún proceso descendiente vivo tras el corte por timeout", result.descendantProcessesAliveAfterCut === null || result.descendantProcessesAliveAfterCut === 0, `aliveCount=${result.descendantProcessesAliveAfterCut}`);
 } catch (err) {
   check("caso 10 (render de diagnóstico, timeout corto): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 11: corrección del contador de progreso (causa raíz,
+// 10-nov-2026, criterio 3) -- un render real en el que Remotion
+// reporta el tiempo restante en formato "Xm Ys" (no solo segundos),
+// y confirma que el contador de progreso (`onProgress`, lo mismo que
+// usa `maybeLogAndStoreProgress`/`writeStatus` en index.mjs para
+// actualizar `renderProgress` del job) SÍ avanza -- antes de esta
+// corrección, el parser descartaba la línea entera apenas el tiempo
+// restante superaba 1 minuto, y el job real 1fd239de se quedó
+// mostrando renderedFrames=0 durante las 3 horas completas aunque
+// Remotion había renderizado el 90,8% del video. Calibrado con datos
+// reales (no adivinado): un video sintético de 600s (18.000 cuadros
+// de duración declarada) renderizando solo los primeros 800
+// (--frames=0-799) alcanza un tiempo restante de varios MINUTOS desde
+// los primeros cuadros (confirmado real en CI, 10-nov-2026: a los 60s
+// de un render de 3000 cuadros ya iba por el cuadro ~650 con "3m 2Xs"
+// de restante) -- 800 cuadros y un tope de 40s de espera quedan con
+// margen de sobra sin alargar la prueba.
+try {
+  const longVideoRel = `${FIXTURES_REL_DIR}/largo-600s.mp4`;
+  await execFileAsync(
+    ffmpegPath,
+    ["-y", "-f", "lavfi", "-i", "nullsrc=size=640x360:rate=30", "-t", "600", "-pix_fmt", "yuv420p", "-c:v", "libx264", path.join(PROJECT_ROOT, "public", longVideoRel)],
+    { env: ffmpegEnv },
+  );
+  const jobRelPath = `${FIXTURES_REL_DIR}/caso11.json`;
+  await fs.writeFile(
+    path.join(PROJECT_ROOT, "public", jobRelPath),
+    JSON.stringify({
+      channel: "a-mi-no-me-cuadra",
+      destination: "youtube-16-9",
+      input: { type: "recorded-video", baseVideo: longVideoRel, durationInSeconds: 600 },
+      overlays: [],
+      captions: [],
+      cuts: [],
+      zooms: [],
+      resources: [],
+    }),
+  );
+  const outputPath = path.join(FIXTURES_DIR, "caso11-out.mp4");
+  const progressEvents = [];
+  let childRef = null;
+  // Criterio 4 (revisión del vigilante ya con el contador fiable):
+  // un umbral de atasco corto a propósito (5s, revisando cada 1s) --
+  // con el contador roto de antes, cualquier render que tardara más
+  // de 1 minuto en terminar un cuadro (formato "Xm Ys") habría
+  // parecido "sin cuadros nuevos" indefinidamente; con el contador
+  // corregido, cada cuadro real actualiza `lastProgressAt` y el
+  // vigilante NUNCA debería considerarlo trabado mientras siga
+  // avanzando -- se prueba acá con cuadros reales llegando varias
+  // veces por segundo, no con la actividad de CPU del bundling
+  // (eso ya lo prueba el caso 7 de la tarea anterior).
+  let threwStuckBeforeManualKill = false;
+  const renderPromise = runRemotionRender({
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    outputPath,
+    propsJobFile: jobRelPath,
+    concurrency: "1",
+    frames: "0-799",
+    timeoutMs: 60_000,
+    stuckAfterMs: 5000,
+    stuckCheckIntervalMs: 1000,
+    onProgress: (event) => {
+      if (event.stage === "rendering") progressEvents.push(event);
+    },
+    onLog: () => {},
+    registerChild: (child) => {
+      childRef = child;
+    },
+  });
+  // No hace falta que termine -- apenas se ve un evento con ETA en
+  // minutos, ya está la evidencia pedida; se cancela para no gastar
+  // minutos de CI de más (mismo mecanismo real que el endpoint de
+  // cancelar).
+  const waitStartedAt = Date.now();
+  while (!progressEvents.some((e) => e.etaSeconds !== null && e.etaSeconds > 60) && Date.now() - waitStartedAt < 40_000) {
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  killProcessGroup(childRef, "SIGKILL");
+  try {
+    await renderPromise;
+  } catch (err) {
+    threwStuckBeforeManualKill = err instanceof RenderStuckError;
+  }
+
+  check(
+    "caso 11 (criterio 4): el vigilante NUNCA lo cortó por atasco mientras los cuadros seguían llegando (umbral de 5s, cuadros reales llegando continuamente)",
+    threwStuckBeforeManualKill === false,
+  );
+
+  const eventWithLongEta = progressEvents.find((e) => e.etaSeconds !== null && e.etaSeconds > 60);
+  check(
+    "caso 11: se recibió un evento real con tiempo restante en formato de minutos (ETA > 60s) -- la línea NO se descartó",
+    Boolean(eventWithLongEta),
+    `eventos vistos=${progressEvents.length}, último etaSeconds=${progressEvents[progressEvents.length - 1]?.etaSeconds}`,
+  );
+  check(
+    "caso 11: el contador de cuadros renderizados (lo que actualiza renderProgress del job) avanzó de verdad, no quedó en 0",
+    eventWithLongEta ? eventWithLongEta.renderedFrames > 0 : false,
+    `renderedFrames=${eventWithLongEta?.renderedFrames}`,
+  );
+  check(
+    "caso 11: se vieron VARIOS eventos de progreso (el render realmente avanzaba, no un solo tick aislado)",
+    progressEvents.length >= 2,
+    `eventos vistos=${progressEvents.length}`,
+  );
+} catch (err) {
+  check("caso 11 (contador con ETA en minutos): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }
 
 await fs.rm(FIXTURES_DIR, { recursive: true, force: true });
