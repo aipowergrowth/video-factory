@@ -219,6 +219,18 @@ check(
   });
   check("buildRenderArgs: --frames con el rango exacto dado", diagArgs.includes("--frames=0-29,20650-20679"));
   check("buildRenderArgs: --log=verbose cuando se pide", diagArgs.includes("--log=verbose"));
+  check("buildRenderArgs: sin muted/codec, no agrega --muted ni --codec (comportamiento de producción sin cambios)", !normalArgs.some((a) => a.startsWith("--muted")) && !normalArgs.some((a) => a.startsWith("--codec")));
+
+  const selectiveArgs = buildRenderArgs({
+    compositionId: "VideoEngine",
+    outputPath: "/out.mp4",
+    propsJobFile: "uploads/jobs/x.json",
+    concurrency: "1",
+    muted: true,
+    codec: "h264-ts",
+  });
+  check("buildRenderArgs: --muted cuando se pide (render selectivo, criterio 6)", selectiveArgs.includes("--muted"));
+  check("buildRenderArgs: --codec=h264-ts cuando se pide", selectiveArgs.includes("--codec=h264-ts"));
 }
 
 // --- Constantes duplicadas de src/types.ts -- confirma que no se desincronizaron ---

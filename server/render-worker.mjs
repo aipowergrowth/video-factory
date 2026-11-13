@@ -189,13 +189,24 @@ export class RenderStuckError extends Error {
  * SIN tocar la duración real de la composición ni renderizar el job
  * completo.
  */
-export const buildRenderArgs = ({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, logLevel }) => {
+export const buildRenderArgs = ({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, logLevel, muted, codec }) => {
   const args = ["remotion", "render", compositionId, outputPath, `--props=${JSON.stringify({ jobFile: propsJobFile })}`, `--concurrency=${concurrency}`];
   if (enableMultiprocessOnLinux) args.push("--enable-multiprocess-on-linux");
   if (browserExecutable) args.push(`--browser-executable=${browserExecutable}`);
   if (binariesDirectory) args.push(`--binaries-directory=${binariesDirectory}`);
   if (frames) args.push(`--frames=${frames}`);
   if (logLevel) args.push(`--log=${logLevel}`);
+  // `muted`/`codec` -- SOLO para el prototipo de render selectivo
+  // (criterio 6, reducir el tiempo de render, 11-nov-2026): los tramos
+  // compuestos se renderizan SIN audio (`--muted`, confirmado contra
+  // la documentación oficial vigente) porque el audio final se
+  // construye UNA sola vez desde el video fuente con los cortes
+  // aplicados (server/segment-assemble.mjs) -- nunca se concatena
+  // audio por tramo, evitando los artefactos de unir pistas AAC que
+  // señala la documentación de render distribuido. `undefined` en
+  // cualquier render real de producción -- comportamiento sin cambios.
+  if (muted) args.push("--muted");
+  if (codec) args.push(`--codec=${codec}`);
   return args;
 };
 
@@ -231,6 +242,10 @@ export const runRemotionRender = ({
   // (ver test-render-observability.mjs) sin tener que renderizar un
   // video completo.
   frames,
+  // Solo para el prototipo de render selectivo (criterio 6) -- ver el
+  // comentario grande en `buildRenderArgs`. `undefined` en producción.
+  muted,
+  codec,
   timeoutMs = 0,
   // Vigilante de render trabado (criterio 3): si pasan
   // `stuckAfterMs` sin NINGÚN evento de progreso nuevo (ni rendering
@@ -263,7 +278,7 @@ export const runRemotionRender = ({
   makeCancelledError = () => new Error("Render cancelado."),
 }) =>
   new Promise((resolve, reject) => {
-    const args = buildRenderArgs({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames });
+    const args = buildRenderArgs({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, muted, codec });
     // `detached: true` (y no más que eso -- no `setsid`/nueva sesión,
     // solo nuevo GRUPO de procesos): hace que `child.pid` sea el
     // LÍDER de un grupo de procesos propio, distinto del grupo del

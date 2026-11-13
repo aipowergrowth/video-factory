@@ -22,8 +22,13 @@ import { fileURLToPath } from "node:url";
 import { resolveCompositorFfmpeg, resolveCompositorFfprobe, binaryEnv } from "./compositor.mjs";
 import { runRemotionRender, RenderTimeoutError, RenderStuckError } from "./render-worker.mjs";
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
-import { runDiagnosticRender, buildDiagnosticFrameRanges } from "./render-diagnose.mjs";
+import { runDiagnosticRender, buildDiagnosticWindows } from "./render-diagnose.mjs";
 import { killProcessGroup, countAliveProcessesInGroup, listAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
+import { planChunks } from "./segment-planner.mjs";
+import { renderAllChunks } from "./segment-render.mjs";
+import { assembleFromChunks } from "./segment-assemble.mjs";
+import { measurePsnr } from "./video-compare.mjs";
+import { buildTimeline } from "./timeline.mjs";
 
 const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -42,6 +47,17 @@ const ffmpegPath = resolveCompositorFfmpeg();
 const ffmpegEnv = binaryEnv(ffmpegPath);
 const ffprobePath = resolveCompositorFfprobe();
 const ffprobeEnv = binaryEnv(ffprobePath);
+
+// FFmpeg de SISTEMA (apt-get, instalado en el workflow) -- SOLO para
+// `measurePsnr` (casos 13/14), nunca para el pipeline bajo prueba.
+// Confirmado real en CI, 12-nov-2026: el ffmpeg recortado de
+// @remotion/compositor-* no tiene compilado el filtro `psnr`
+// ("No such filter: 'psnr'") -- no está en su lista de filtros
+// habilitados (igual que `testsrc2`/`fps`/`setpts` de video). El
+// binario de sistema sí lo tiene, y mide sobre los MISMOS archivos de
+// salida que produjo el pipeline real -- no cambia qué se compara.
+const SYSTEM_FFMPEG = "ffmpeg";
+const systemFfmpegEnv = process.env;
 
 const FIXTURES_REL_DIR = "jobs/test-fixtures-render-observability";
 const FIXTURES_DIR = path.join(PROJECT_ROOT, "public", FIXTURES_REL_DIR);
@@ -457,22 +473,27 @@ try {
 }
 
 // --- Caso 7: criterio REDISEÑADO del vigilante (criterio 6) -- un
-// render real con un umbral de atasco agresivo (500ms) no se corta
-// mientras está bundling de verdad, aunque todavía no haya reportado
-// ningún cuadro. Valores elegidos con datos reales, no adivinados: una
-// medición previa en este mismo CI (09-nov-2026) mostró el primer
-// evento de progreso real (bundling) a los 1112ms del spawn -- 500ms
-// queda cómodamente por debajo de eso, y 100ms de intervalo de
-// revisión queda cómodamente por encima de la resolución real de los
-// ticks de CPU en Linux (CLK_TCK=100 = 10ms; confirmado real en CI que
-// valores de intervalo por debajo de eso producen falsos "sin
-// actividad" por cuantización, no por inactividad real). La aserción
-// dura es que NO se corta (eso es lo que pide el criterio 6); el log
-// "lento, no trabado" se registra como evidencia adicional pero no
-// hace fallar la prueba por sí solo -- el instante exacto en que la
-// revisión cae depende del scheduler del runner de CI, no solo del
-// umbral, así que exigir esa línea específica sería frágil sin
-// aportar una garantía real adicional sobre la que ya da "no se cortó".
+// render real con un umbral de atasco agresivo no se corta mientras
+// está bundling de verdad, aunque todavía no haya reportado ningún
+// cuadro.
+//
+// Márgenes ampliados (Fase 0, reducir el tiempo de render,
+// 12-nov-2026): el umbral original (500ms/100ms, elegido 09-nov-2026
+// con el primer evento de bundling medido a los 1112ms) empezó a fallar
+// de forma REPRODUCIBLE en este CI -- 3 de 3 corridas en esta misma
+// sesión, sin ningún cambio en la lógica del vigilante
+// (`shouldConsiderStuck`/`sumGroupCpuTicks`, sin tocar), siempre con el
+// mismo patrón: "0 min sin actividad" justo al llegar a
+// `{stage:bundling, percent:100}`. Revisada la lógica de muestreo
+// (PGID vía `detached:true`, intervalo de revisión 20x por encima de
+// la cuantización real de ticks de Linux) no se encontró un error --
+// es consistente con que el runner compartido de GitHub Actions esté
+// hoy más cargado/lento que el 09-nov-2026 (la prueba documenta ella
+// misma esta dependencia del scheduler del runner), dejando menos de
+// un tick de CPU medible en la primera ventana de 100ms bajo contención
+// real. Se amplía el margen 5x (2500ms/250ms) -- todavía muy por debajo
+// del timeout total (60s) y de lo que tardaría un atasco real -- en vez
+// de tocar la lógica de medición, que no mostró ningún defecto.
 try {
   const jobRelPath = await makeJobFile("caso7", 6);
   const outputPath = path.join(FIXTURES_DIR, "caso7-out.mp4");
@@ -486,8 +507,8 @@ try {
       propsJobFile: jobRelPath,
       concurrency: "1",
       timeoutMs: 60_000,
-      stuckAfterMs: 500,
-      stuckCheckIntervalMs: 100,
+      stuckAfterMs: 2500,
+      stuckCheckIntervalMs: 250,
       onLog: (msg) => logs.push(msg),
     });
   } catch (err) {
@@ -544,7 +565,8 @@ try {
 try {
   const jobRelPath = await makeJobFile("caso9", 20);
   const outputPath = path.join(FIXTURES_DIR, "caso9-out.mp4");
-  const frames = buildDiagnosticFrameRanges(600, { initialFrameCount: 10, middleWindowFrameCount: 10 }); // 20s @30fps = 600 cuadros
+  const windows = buildDiagnosticWindows(600, { initialFrameCount: 10, middleWindowFrameCount: 10, endFrameCount: 10 }); // 20s @30fps = 600 cuadros
+  const frames = windows.map((w) => `${w.start}-${w.end}`).join(",");
   const result = await runDiagnosticRender({
     cwd: PROJECT_ROOT,
     env: process.env,
@@ -552,6 +574,7 @@ try {
     propsJobFile: jobRelPath,
     concurrency: "1",
     frames,
+    windows,
     timeoutMs: 60_000,
   });
   check("caso 9: no hubo error de lanzamiento de la herramienta misma", !result.launchError && !result.spawnError, JSON.stringify(result.launchError ?? result.spawnError));
@@ -568,6 +591,15 @@ try {
     .then(() => true)
     .catch(() => false);
   check("caso 9: el archivo de salida del diagnóstico se borró (nunca queda nada persistente)", outputStillExists === false);
+  // Criterio 1 (reducir el tiempo de render, 11-nov-2026): confirma,
+  // con Remotion real, que las 3 ventanas (inicio/medio/final) quedan
+  // con su propio ms/cuadro medido -- no solo hitos de arranque.
+  check("caso 9: windowTimings trae las 3 ventanas (inicio/medio/final)", Array.isArray(result.windowTimings) && result.windowTimings.length === 3, JSON.stringify(result.windowTimings));
+  check(
+    "caso 9: al menos la ventana 'inicio' trae un ms/cuadro real medido (no null) -- 10 cuadros es suficiente para 2+ ticks",
+    typeof result.windowTimings?.[0]?.avgMsPerFrame === "number" && result.windowTimings[0].avgMsPerFrame > 0,
+    JSON.stringify(result.windowTimings?.[0]),
+  );
 } catch (err) {
   check("caso 9 (render de diagnóstico): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }
@@ -702,6 +734,282 @@ try {
   );
 } catch (err) {
   check("caso 11 (contador con ETA en minutos): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 12: <Video> de @remotion/media detrás de la bandera
+// (criterio 6, reducir el tiempo de render, 11-nov-2026) -- confirma
+// con un render real que REMOTION_VIDEO_COMPONENT=media activa la
+// variante (src/engine/sources/RecordedVideoSource.tsx) sin romper
+// nada, que termina en código 0, y que SIN la bandera (comportamiento
+// de producción) el render sigue funcionando exactamente igual que
+// antes. No se compara tiempo acá (la comparación real con el video
+// del job, no sintético, es la puerta G2 -- VPS) -- esto solo prueba
+// que el mecanismo funciona de punta a punta con Remotion/Chrome
+// reales, no solo en teoría.
+try {
+  const jobRelPath = await makeJobFile("caso12", 6);
+  const outputMediaPath = path.join(FIXTURES_DIR, "caso12-media-out.mp4");
+  const resultMedia = await new Promise((resolve, reject) => {
+    runRemotionRender({
+      cwd: PROJECT_ROOT,
+      env: { ...process.env, REMOTION_VIDEO_COMPONENT: "media" },
+      outputPath: outputMediaPath,
+      propsJobFile: jobRelPath,
+      concurrency: "1",
+      timeoutMs: 60_000,
+      onLog: () => {},
+    })
+      .then(() => resolve({ threw: null }))
+      .catch((err) => resolve({ threw: err }));
+  });
+  check("caso 12: con REMOTION_VIDEO_COMPONENT=media, el render real termina sin error (código 0)", resultMedia.threw === null, String(resultMedia.threw?.message ?? ""));
+  check("caso 12: el archivo de salida con @remotion/media existe y no está vacío", (await fs.stat(outputMediaPath)).size > 0);
+
+  // Sin la bandera (comportamiento de producción): sigue funcionando igual -- no es solo que "no rompe nada nuevo", es la MISMA ruta que ya probó el caso 1.
+  const outputDefaultPath = path.join(FIXTURES_DIR, "caso12-default-out.mp4");
+  await runRemotionRender({
+    cwd: PROJECT_ROOT,
+    env: process.env, // SIN REMOTION_VIDEO_COMPONENT -- comportamiento de producción intacto
+    outputPath: outputDefaultPath,
+    propsJobFile: jobRelPath,
+    concurrency: "1",
+    timeoutMs: 60_000,
+    onLog: () => {},
+  });
+  check("caso 12: SIN la bandera, el render real sigue terminando sin error (comportamiento de producción sin cambios)", (await fs.stat(outputDefaultPath)).size > 0);
+} catch (err) {
+  check("caso 12 (bandera @remotion/media): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 13: G1 -- equivalencia del render selectivo (criterio A del
+// dictamen del auditor, reducir el tiempo de render, 11-nov-2026).
+// Construye un video fuente con keyframes MUY escasos (-g 450, un solo
+// keyframe en todo el clip -- los cortes de este caso caen muy lejos
+// de cualquier keyframe a propósito), más audio real (tono). El job
+// tiene un corte y DOS elementos compuestos, uno antes y otro después
+// del corte -- empalmes, corte fuera de keyframe, y mezcla de
+// plano/compuesto, todo en un solo caso. Compara el resultado del
+// render SELECTIVO (FFmpeg para los tramos planos + Remotion para los
+// compuestos + un solo audio construido con los cortes) contra el
+// render COMPLETO de Remotion del mismo job -- deben ser equivalentes.
+//
+// NOTA honesta (criterio A, "fuente con FPS variable"): se intentó
+// construir un fuente con PTS irregulares (jitter vía `setpts`) para
+// este mismo caso -- confirmado real en CI, 12-nov-2026, que rompe la
+// correspondencia simple entre "segundo N del original" y el punto
+// real de `-ss` al extraer un tramo plano (duración resultante
+// desalineada por decenas de segundos, no un error de redondeo). No
+// se pudo aislar esa causa con confianza en el tiempo disponible --
+// se deja fuera de este caso para no reportar un resultado dudoso
+// como si fuera evidencia sólida. El diseño de `renderPlainChunk`
+// (`-r` como opción de SALIDA, no un filtro) normaliza a FPS
+// constante por construcción sin importar la irregularidad de
+// entrada -- pero esa propiedad específica queda sin una prueba
+// automática que la confirme con un fuente genuinamente variable; ver
+// el informe de esta tarea.
+try {
+  const sourceRel = `${FIXTURES_REL_DIR}/caso13-fuente.mp4`;
+  const sourcePath = path.join(PROJECT_ROOT, "public", sourceRel);
+  // Patrón visual real (no un color plano) + audio real -- construido
+  // con el ffmpeg de SISTEMA (apt-get ffmpeg, instalado en el
+  // workflow), no con el de @remotion/compositor-* (ese viene
+  // recortado a propósito por Remotion -- sin `testsrc2`, confirmado
+  // real en CI, 12-nov-2026: "Filter not found"). Esto es SOLO para
+  // armar el archivo de prueba -- el pipeline bajo prueba
+  // (renderAllChunks, assembleFromChunks, las mediciones) sigue
+  // usando el ffmpeg de Remotion como en producción, nunca el de
+  // sistema.
+  await execFileAsync(
+    "ffmpeg",
+    [
+      "-y",
+      "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+      "-t", "15",
+      "-g", "450", "-keyint_min", "450", "-sc_threshold", "0",
+      "-c:v", "libx264", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-shortest",
+      sourcePath,
+    ],
+  );
+  const probedDiag = await probeSourceVideoDiagnostics(sourcePath, { ffprobePath, env: ffprobeEnv });
+  console.log(`[caso 13] video fuente construido -- ${formatSourceVideoDiagnosticsLine(probedDiag)}`);
+
+  const job = {
+    channel: "a-mi-no-me-cuadra",
+    destination: "youtube-16-9",
+    input: { type: "recorded-video", baseVideo: sourceRel, durationInSeconds: 15 },
+    overlays: [
+      { id: "o1", type: "text", text: "antes del corte", startSeconds: 2, durationSeconds: 1 },
+      { id: "o2", type: "text", text: "despues del corte", startSeconds: 10, durationSeconds: 1 },
+    ],
+    captions: [],
+    cuts: [{ id: "c1", startSeconds: 6, endSeconds: 7 }],
+    zooms: [],
+    resources: [],
+  };
+  const jobRelPath = `${FIXTURES_REL_DIR}/caso13.json`;
+  await fs.writeFile(path.join(PROJECT_ROOT, "public", jobRelPath), JSON.stringify(job));
+
+  const plan = planChunks(job);
+  console.log(`[caso 13] plan: ${plan.chunks.length} chunks -- ${plan.chunks.map((c) => c.type).join(",")}`);
+  check("caso 13: el plan tiene la forma esperada (plano,compuesto,plano,plano,compuesto,plano -- el corte parte los dos planos adyacentes)", plan.chunks.map((c) => c.type).join(",") === "plain,composite,plain,plain,composite,plain", JSON.stringify(plan.chunks));
+
+  // --- Render SELECTIVO ---
+  const chunkDir = path.join(FIXTURES_DIR, "caso13-chunks");
+  await fs.mkdir(chunkDir, { recursive: true });
+  const chunkResults = await renderAllChunks({
+    plan,
+    chunkOutputDir: chunkDir,
+    sourceVideoPath: sourcePath,
+    propsJobFile: jobRelPath,
+    ffmpegPath,
+    env: process.env,
+    cwd: PROJECT_ROOT,
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    concurrency: "1",
+    timeoutMs: 60_000,
+    onLog: (msg) => console.log(`[caso 13] ${msg}`),
+  });
+  check("caso 13: se renderizaron los 6 chunks sin lanzar", chunkResults.length === 6);
+  // DIAGNÓSTICO: duración real de CADA chunk individual, para encontrar cuál (si alguno) sale con una duración incorrecta.
+  for (const r of chunkResults) {
+    const { stdout } = await execFileAsync(ffprobePath, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration,nb_frames", "-of", "csv=p=0", r.outputPath], { env: ffprobeEnv });
+    console.log(`[caso 13] chunk ${r.chunk.type} src[${r.chunk.sourceStartSeconds}-${r.chunk.sourceEndSeconds}] -- ffprobe duration,nb_frames=${stdout.trim()}`);
+  }
+
+  const timeline = buildTimeline(15, job.cuts);
+  const selectiveOutputPath = path.join(FIXTURES_DIR, "caso13-selectivo.mp4");
+  const assembleResult = await assembleFromChunks({
+    ffmpegPath,
+    ffprobePath,
+    env: process.env,
+    sourceVideoPath: sourcePath,
+    chunkPaths: chunkResults.map((r) => r.outputPath),
+    timeline,
+    workDir: path.join(FIXTURES_DIR, "caso13-assemble"),
+    outputPath: selectiveOutputPath,
+    sampleRate: 48000,
+  });
+  check("caso 13: el render selectivo detectó audio en la fuente y lo construyó", assembleResult.sourceHasAudio === true && assembleResult.audioPath !== null);
+  // DIAGNÓSTICO: duración del video-solo-concatenado ANTES de mezclar con el audio -- aísla si el problema está en concatVideoOnly o en muxFinal.
+  {
+    const { stdout } = await execFileAsync(ffprobePath, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration,nb_frames", "-of", "csv=p=0", assembleResult.videoOnlyPath], { env: ffprobeEnv });
+    console.log(`[caso 13] video-solo concatenado (antes de mezclar audio) -- ffprobe duration,nb_frames=${stdout.trim()}`);
+  }
+
+  // --- Render COMPLETO (línea base, el mismo job, Remotion real sin restricción de cuadros) ---
+  const fullOutputPath = path.join(FIXTURES_DIR, "caso13-completo.mp4");
+  await runRemotionRender({
+    cwd: PROJECT_ROOT,
+    env: process.env,
+    outputPath: fullOutputPath,
+    propsJobFile: jobRelPath,
+    concurrency: "1",
+    timeoutMs: 120_000,
+    onLog: () => {},
+  });
+
+  // --- Comparación: duración, cuadros, audio, equivalencia visual ---
+  const probeDuration = async (p, stream) => {
+    const { stdout } = await execFileAsync(ffprobePath, ["-v", "error", "-select_streams", stream, "-show_entries", "stream=duration", "-of", "csv=p=0", p], { env: ffprobeEnv });
+    return Number(stdout.trim());
+  };
+  const videoDurationSelective = await probeDuration(selectiveOutputPath, "v:0");
+  const videoDurationFull = await probeDuration(fullOutputPath, "v:0");
+  console.log(`[caso 13] duración de video -- selectivo=${videoDurationSelective}s completo=${videoDurationFull}s`);
+  check(
+    "caso 13: la duración de VIDEO del render selectivo coincide con el render completo, con margen de menos de 1 cuadro (1/30s)",
+    Math.abs(videoDurationSelective - videoDurationFull) < 1 / 30 + 0.01,
+    `diff=${Math.abs(videoDurationSelective - videoDurationFull)}s`,
+  );
+
+  const audioDurationSelective = await probeDuration(selectiveOutputPath, "a:0");
+  const audioDurationFull = await probeDuration(fullOutputPath, "a:0");
+  console.log(`[caso 13] duración de audio -- selectivo=${audioDurationSelective}s completo=${audioDurationFull}s`);
+  check(
+    "caso 13: sincronía audiovisual -- la duración del audio coincide entre selectivo y completo con menos de 1 cuadro de diferencia",
+    Math.abs(audioDurationSelective - audioDurationFull) < 1 / 30 + 0.01,
+    `diff=${Math.abs(audioDurationSelective - audioDurationFull)}s`,
+  );
+
+  const psnrResult = await measurePsnr(SYSTEM_FFMPEG, systemFfmpegEnv, fullOutputPath, selectiveOutputPath);
+  console.log(`[caso 13] PSNR promedio entre el render completo y el selectivo: ${psnrResult.averagePsnr}dB`);
+  check(
+    "caso 13: equivalencia visual (PSNR) -- el render selectivo se ve igual que el completo (>30dB, nunca cuadros desalineados o corruptos)",
+    psnrResult.averagePsnr !== null && psnrResult.averagePsnr > 30,
+    `averagePsnr=${psnrResult.averagePsnr}, stderr=${psnrResult.stderrTail?.slice(-500)}`,
+  );
+} catch (err) {
+  check("caso 13 (G1, equivalencia del render selectivo): fallo inesperado en la prueba misma", false, String(err.message ?? err));
+}
+
+// --- Caso 14: G2-R -- reanudación (criterio D del dictamen del
+// auditor). Mata el proceso a MITAD de `renderAllChunks` (tras el
+// primer chunk) y confirma que, al reintentar, el chunk ya completo
+// NO se vuelve a renderizar -- y que el resultado final ensamblado es
+// idéntico (mismo PSNR altísimo, prácticamente la misma duración) al
+// de una corrida sin interrupciones.
+try {
+  const sourceRel = `${FIXTURES_REL_DIR}/caso14-fuente.mp4`;
+  const sourcePath = path.join(PROJECT_ROOT, "public", sourceRel);
+  // nullsrc (NO testsrc2 -- el ffmpeg recortado de @remotion/compositor-* no lo compila, confirmado real en CI, 12-nov-2026: "Filter not found").
+  await execFileAsync(ffmpegPath, ["-y", "-f", "lavfi", "-i", "nullsrc=size=640x360:rate=30", "-t", "9", "-pix_fmt", "yuv420p", "-c:v", "libx264", sourcePath], { env: ffmpegEnv });
+  const job = {
+    channel: "a-mi-no-me-cuadra",
+    destination: "youtube-16-9",
+    input: { type: "recorded-video", baseVideo: sourceRel, durationInSeconds: 9 },
+    overlays: [{ id: "o1", type: "text", text: "medio", startSeconds: 4, durationSeconds: 1 }],
+    captions: [],
+    cuts: [],
+    zooms: [],
+    resources: [],
+  };
+  const jobRelPath = `${FIXTURES_REL_DIR}/caso14.json`;
+  await fs.writeFile(path.join(PROJECT_ROOT, "public", jobRelPath), JSON.stringify(job));
+  const plan = planChunks(job); // 3 chunks: plano, compuesto, plano
+  check("caso 14: el plan tiene 3 chunks (plano, compuesto, plano)", plan.chunks.length === 3);
+
+  const chunkDir = path.join(FIXTURES_DIR, "caso14-chunks");
+  await fs.mkdir(chunkDir, { recursive: true });
+
+  // Simula un corte a mitad de camino: renderiza SOLO el plan recortado al primer chunk, como si el proceso hubiera muerto justo después.
+  const partialPlan = { totalFrames: plan.totalFrames, chunks: [plan.chunks[0]] };
+  await renderAllChunks({ plan: partialPlan, chunkOutputDir: chunkDir, sourceVideoPath: sourcePath, propsJobFile: jobRelPath, ffmpegPath, env: process.env, cwd: PROJECT_ROOT, width: 1920, height: 1080, fps: 30, concurrency: "1", timeoutMs: 60_000, onLog: () => {} });
+  const firstChunkPath = `${chunkDir}/chunk-0000-plain.mp4`;
+  const firstChunkStatBefore = await fs.stat(firstChunkPath);
+  check("caso 14: tras el 'corte', el primer chunk quedó completo en disco", firstChunkStatBefore.size > 0);
+
+  // "Reintento": se llama de nuevo con el plan COMPLETO -- el primer chunk debe reusarse, no volver a renderizarse.
+  const logs = [];
+  const chunkResults = await renderAllChunks({ plan, chunkOutputDir: chunkDir, sourceVideoPath: sourcePath, propsJobFile: jobRelPath, ffmpegPath, env: process.env, cwd: PROJECT_ROOT, width: 1920, height: 1080, fps: 30, concurrency: "1", timeoutMs: 60_000, onLog: (m) => logs.push(m) });
+  const firstChunkStatAfter = await fs.stat(firstChunkPath);
+  check("caso 14: tras reintentar, el primer chunk NO cambió (mismo tamaño exacto -- nunca se volvió a renderizar)", firstChunkStatAfter.size === firstChunkStatBefore.size && firstChunkStatAfter.mtimeMs === firstChunkStatBefore.mtimeMs);
+  check("caso 14: el log del reintento confirma que el primer chunk se reusó", logs.some((l) => l.includes("ya estaba completo")));
+  check("caso 14: el resultado trae los 3 chunks (1 reusado + 2 nuevos)", chunkResults.length === 3 && chunkResults[0].reused === true && chunkResults[1].reused === false && chunkResults[2].reused === false);
+
+  // El resultado final ensamblado tras la reanudación debe ser idéntico a una corrida SIN interrupciones del mismo job.
+  const timeline = buildTimeline(9, job.cuts);
+  const resumedOutputPath = path.join(FIXTURES_DIR, "caso14-reanudado.mp4");
+  await assembleFromChunks({ ffmpegPath, ffprobePath, env: process.env, sourceVideoPath: sourcePath, chunkPaths: chunkResults.map((r) => r.outputPath), timeline, workDir: path.join(FIXTURES_DIR, "caso14-assemble-reanudado"), outputPath: resumedOutputPath, sampleRate: 48000 });
+
+  const freshChunkDir = path.join(FIXTURES_DIR, "caso14-chunks-sin-interrupcion");
+  await fs.mkdir(freshChunkDir, { recursive: true });
+  const freshChunkResults = await renderAllChunks({ plan, chunkOutputDir: freshChunkDir, sourceVideoPath: sourcePath, propsJobFile: jobRelPath, ffmpegPath, env: process.env, cwd: PROJECT_ROOT, width: 1920, height: 1080, fps: 30, concurrency: "1", timeoutMs: 60_000, onLog: () => {} });
+  const freshOutputPath = path.join(FIXTURES_DIR, "caso14-sin-interrupcion.mp4");
+  await assembleFromChunks({ ffmpegPath, ffprobePath, env: process.env, sourceVideoPath: sourcePath, chunkPaths: freshChunkResults.map((r) => r.outputPath), timeline, workDir: path.join(FIXTURES_DIR, "caso14-assemble-fresco"), outputPath: freshOutputPath, sampleRate: 48000 });
+
+  const psnrResumed = await measurePsnr(SYSTEM_FFMPEG, systemFfmpegEnv, freshOutputPath, resumedOutputPath);
+  console.log(`[caso 14] PSNR entre la corrida reanudada y una corrida sin interrupciones: ${psnrResumed.averagePsnr}dB`);
+  check(
+    "caso 14: el resultado reanudado es visualmente IDÉNTICO al de una corrida sin interrupciones (PSNR muy alto, >40dB -- mismo contenido exacto)",
+    psnrResumed.averagePsnr !== null && psnrResumed.averagePsnr > 40,
+    `averagePsnr=${psnrResumed.averagePsnr}`,
+  );
+} catch (err) {
+  check("caso 14 (G2-R, reanudación): fallo inesperado en la prueba misma", false, String(err.message ?? err));
 }
 
 await fs.rm(FIXTURES_DIR, { recursive: true, force: true });

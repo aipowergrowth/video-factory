@@ -28,7 +28,8 @@ import { killProcessGroup } from "./process-tree.mjs";
 import { startContainerMetricsSampling, readContainerMemoryBytes, readContainerCpuUsageMicros } from "./container-metrics.mjs";
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
 import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExists, appendAttemptHistory } from "./job-retry.mjs";
-import { runDiagnosticRender, buildDiagnosticFrameRanges } from "./render-diagnose.mjs";
+import { runDiagnosticRender, buildDiagnosticWindows } from "./render-diagnose.mjs";
+import { planSegments } from "./segment-planner.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -1715,6 +1716,26 @@ app.post("/jobs/:id/retry", async (req, res) => {
 });
 
 /**
+ * Puerta G0 (reducir el tiempo de render, 11-nov-2026, autorizado por
+ * Alex): sobre el job.json YA persistido de un job existente, cuenta
+ * cuántos cuadros de SALIDA son "planos" (solo video base) frente a
+ * "compuestos" (con zoom, overlay, recurso o subtítulo quemado), sin
+ * renderizar NADA -- ni un cuadro, ni una llamada a FFmpeg/Chrome. Es
+ * el dato que decide si vale la pena el render selectivo. Nunca toca
+ * el estado del job, nunca compite con un render real -- es solo
+ * lectura + aritmética sobre lo ya persistido.
+ */
+app.get("/jobs/:id/segment-plan", async (req, res) => {
+  const jobId = req.params.id;
+  const fileCheck = await readJobFileForRetry(jobFilePath(jobId), RETENTION_DAYS);
+  if (!fileCheck.ok) {
+    return res.status(404).json({ error: fileCheck.reason });
+  }
+  const plan = planSegments(fileCheck.job);
+  res.json({ jobId, ...plan });
+});
+
+/**
  * Render de DIAGNÓSTICO (causa raíz con evidencia del VPS, 09-nov-2026,
  * autorizado por Alex, criterio 3) -- sobre el video base y el
  * job.json YA persistidos de un job existente, corre un render MUY
@@ -1759,34 +1780,57 @@ app.post("/jobs/:id/diagnose", async (req, res) => {
   }
 
   const totalFrames = Math.round((job.input.durationInSeconds ?? 0) * ENGINE_FPS);
-  const frames = buildDiagnosticFrameRanges(totalFrames);
+  // Criterio 1 (reducir el tiempo de render, 11-nov-2026): ventanas de
+  // inicio, medio Y final -- no solo inicio+medio -- para medir
+  // ms/cuadro real en partes representativas del video, no solo el
+  // arranque. `windows` lleva la posición de cada una dentro de la
+  // selección combinada, para poder atribuirle a cada una su propio
+  // ms/cuadro (ver computeWindowTimings en render-diagnose.mjs).
+  const windows = buildDiagnosticWindows(totalFrames);
+  const frames = windows.length > 0 ? windows.map((w) => `${w.start}-${w.end}`).join(",") : null;
   if (!frames) {
     return res.status(409).json({ error: `No se pudo determinar cuántos cuadros tiene el job (durationInSeconds=${job.input.durationInSeconds}).` });
   }
+
+  // Criterio 3 (concurrencia medida, no supuesta): el body puede pedir
+  // una concurrencia distinta a la de producción SOLO para este
+  // diagnóstico -- nunca cambia REMOTION_CONCURRENCY real. Útil para
+  // correr el mismo workflow de n8n varias veces, cambiando solo este
+  // campo, y comparar cuadros/s medidos a 1/2/3/4.
+  const concurrency = req.body?.concurrency ? String(req.body.concurrency) : REMOTION_CONCURRENCY;
+  // Opción (c): <Video> de @remotion/media frente a OffthreadVideo,
+  // sobre el video REAL del job (no sintético) -- ver
+  // src/engine/sources/RecordedVideoSource.tsx. "media" activa la
+  // variante; cualquier otro valor (u omitirlo) deja el comportamiento
+  // de producción intacto (OffthreadVideo).
+  const videoComponent = req.body?.videoComponent === "media" ? "media" : "offthread";
+  const renderEnv = videoComponent === "media" ? { ...process.env, REMOTION_VIDEO_COMPONENT: "media" } : process.env;
 
   const diagnosticsDir = path.join(PROJECT_ROOT, "diagnostics");
   await fsp.mkdir(diagnosticsDir, { recursive: true });
   const outputPath = path.join(diagnosticsDir, `${jobId}-${Date.now()}.mp4`);
 
-  console.log(`[diagnóstico ${jobId}] iniciando -- frames=${frames}, video fuente -- ${sourceVideoDiagnosticsLine}`);
+  console.log(`[diagnóstico ${jobId}] iniciando -- frames=${frames}, concurrencia=${concurrency}, componente de video=${videoComponent}, video fuente -- ${sourceVideoDiagnosticsLine}`);
   const result = await runDiagnosticRender({
     cwd: PROJECT_ROOT,
-    env: process.env,
+    env: renderEnv,
     outputPath,
     propsJobFile: `uploads/jobs/${jobId}.json`,
-    concurrency: REMOTION_CONCURRENCY,
+    concurrency,
     enableMultiprocessOnLinux: ENABLE_MULTIPROCESS_ON_LINUX,
     browserExecutable: REMOTION_BROWSER_EXECUTABLE,
     binariesDirectory: REMOTION_BINARIES_DIRECTORY,
     frames,
+    windows,
     timeoutMs: RENDER_DIAGNOSE_TIMEOUT_MINUTES * 60 * 1000,
   });
   console.log(
     `[diagnóstico ${jobId}] terminado -- completed=${result.completed} timedOut=${result.timedOut} ` +
-      `huérfanos=${result.descendantProcessesAliveAfterCut ?? "desconocido"} hitos=${JSON.stringify(result.milestones)}`,
+      `huérfanos=${result.descendantProcessesAliveAfterCut ?? "desconocido"} hitos=${JSON.stringify(result.milestones)} ` +
+      `ms/cuadro por ventana=${JSON.stringify(result.windowTimings)}`,
   );
 
-  res.json({ jobId, sourceVideoDiagnosticsLine, totalFrames, frames, ...result });
+  res.json({ jobId, sourceVideoDiagnosticsLine, totalFrames, frames, concurrency, videoComponent, ...result });
 });
 
 app.get("/jobs/:id/download", (req, res) => {

@@ -18,6 +18,11 @@ on:
       - "server/process-tree.mjs"
       - "server/render-diagnose.mjs"
       - "server/verbose-log-milestones.mjs"
+      - "server/timeline.mjs"
+      - "server/segment-planner.mjs"
+      - "server/segment-render.mjs"
+      - "server/segment-assemble.mjs"
+      - "server/video-compare.mjs"
       - "server/test-render-observability.mjs"
       - ".github/workflows/captions-destination-test.yml"
   pull_request:
@@ -30,6 +35,11 @@ on:
       - "server/process-tree.mjs"
       - "server/render-diagnose.mjs"
       - "server/verbose-log-milestones.mjs"
+      - "server/timeline.mjs"
+      - "server/segment-planner.mjs"
+      - "server/segment-render.mjs"
+      - "server/segment-assemble.mjs"
+      - "server/video-compare.mjs"
       - "server/test-render-observability.mjs"
   workflow_dispatch: {}
 
@@ -45,8 +55,8 @@ jobs:
 
       - run: npm ci
 
-      - name: Instalar fuente de emoji (mismo paquete que el Dockerfile de producción -- sin esto, Chromium no tiene glifos de emoji para dibujar)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-noto-color-emoji
+      - name: Instalar fuente de emoji (mismo paquete que el Dockerfile de producción -- sin esto, Chromium no tiene glifos de emoji para dibujar) y un ffmpeg de sistema completo (el binario de @remotion/compositor-* viene recortado -- sin testsrc2/setpts -- solo se usa para ARMAR los videos sintéticos de prueba con patrones/VFR, nunca para el pipeline real bajo prueba, que sigue usando el ffmpeg de Remotion)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-noto-color-emoji ffmpeg
 
       - name: Descargar Chrome Headless Shell (mismo paso que el Dockerfile de producción)
         run: npx remotion browser ensure

@@ -63,6 +63,8 @@ jobs:
           node server/test-process-tree.mjs
           node server/test-verbose-log-milestones.mjs
           node server/test-render-diagnose.mjs
+          node server/test-segment-planner.mjs
+          node server/test-segment-render.mjs
 
       - name: Pruebas de regresión con audio real (mismo FFmpeg que producción)
         run: node server/test-audio-regression.mjs

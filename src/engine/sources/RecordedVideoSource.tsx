@@ -1,9 +1,35 @@
 import { OffthreadVideo, Sequence, staticFile, useCurrentFrame, useVideoConfig } from "remotion";
+import { Video } from "@remotion/media";
 import type { Cut, RecordedVideoInput, ZoomKeyframe } from "../../types";
 import { secondsToFrames } from "../../lib/time";
 import { buildTimeline } from "../timeline";
 
 const DEFAULT_ORIGIN = { x: 0.5, y: 0.5 };
+
+/**
+ * Reducir el tiempo de render (Fase 0, 11-nov-2026, autorizado por
+ * Alex, criterio 6) -- variante detrás de una bandera, APAGADA por
+ * defecto (el motor real sigue usando `<OffthreadVideo>`, sin ningún
+ * cambio de comportamiento). Se activa SOLO pasando la variable de
+ * entorno `REMOTION_VIDEO_COMPONENT=media` al proceso de render
+ * (confirmado contra la documentación oficial vigente de Remotion:
+ * cualquier variable con el prefijo `REMOTION_` pasada por la CLI
+ * queda disponible como `process.env.REMOTION_*` en el código de la
+ * composición -- por diseño, para no exponer el entorno completo del
+ * servidor al bundle de Webpack). Existe para medir (puerta G2, con
+ * el video real del job en el VPS) si `<Video>` de @remotion/media es
+ * más rápido que `<OffthreadVideo>` sin cambiar nada en producción
+ * hasta que los datos lo justifiquen y Alex lo autorice.
+ *
+ * `disallowFallbackToOffthreadVideo`: si el códec del video fuente no
+ * es compatible con @remotion/media, por defecto Remotion cae en
+ * silencio a `<OffthreadVideo>` -- eso falsearía la medición de G2
+ * (parecería que @remotion/media rindió X cuando en realidad corrió
+ * OffthreadVideo todo el tiempo). Con esta bandera, si pasa eso, el
+ * render FALLA explícitamente en vez de fallar en silencio -- la
+ * evidencia de la caída queda en el error, no escondida.
+ */
+const USE_REMOTION_MEDIA = process.env.REMOTION_VIDEO_COMPONENT === "media";
 
 /**
  * Un tramo del video base ya trimeado (`trimBefore`/`durationInFrames`) con
@@ -43,20 +69,18 @@ const TrimmedZoomableVideo: React.FC<{
     origin = activeZoom.origin ?? DEFAULT_ORIGIN;
   }
 
-  return (
-    <OffthreadVideo
-      src={src}
-      trimBefore={trimBeforeFrames}
-      durationInFrames={durationInFrames}
-      style={{
-        width: "100%",
-        height: "100%",
-        objectFit: "cover",
-        transform: `scale(${scale})`,
-        transformOrigin: `${origin.x * 100}% ${origin.y * 100}%`,
-      }}
-    />
-  );
+  const style = {
+    width: "100%",
+    height: "100%",
+    objectFit: "cover" as const,
+    transform: `scale(${scale})`,
+    transformOrigin: `${origin.x * 100}% ${origin.y * 100}%`,
+  };
+
+  if (USE_REMOTION_MEDIA) {
+    return <Video src={src} trimBefore={trimBeforeFrames} durationInFrames={durationInFrames} style={style} disallowFallbackToOffthreadVideo />;
+  }
+  return <OffthreadVideo src={src} trimBefore={trimBeforeFrames} durationInFrames={durationInFrames} style={style} />;
 };
 
 /**
