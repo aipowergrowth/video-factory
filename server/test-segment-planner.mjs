@@ -5,7 +5,8 @@
 // (1fd239de y otros) es la puerta G0 -- solo se puede correr en el
 // VPS, ver el informe de esta tarea para los pasos exactos.
 
-import { planSegments, planChunks } from "./segment-planner.mjs";
+import { planSegments, planChunks, fuseCompositeRanges, summarizeChunkPlan, decideRenderMode, chooseMeasurementWindowFrames, clipChunksToWindow, clipTimelineToOutputSeconds } from "./segment-planner.mjs";
+import { buildTimeline } from "./timeline.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -240,6 +241,108 @@ const baseJob = (overrides = {}) => ({
 }
 
 check("job de duración 0: planChunks devuelve 0 chunks, nunca lanza", planChunks(baseJob({ input: { type: "recorded-video", baseVideo: "x.mp4", durationInSeconds: 0 } })).chunks.length === 0);
+
+// --- planChunks con fuseGapFrames: dos overlays cercanos se fusionan en UNA invocación de Remotion (criterio 4) ---
+{
+  // overlays en 1-2s y 2.5-3.5s -- hueco plano de 0.5s = 15 cuadros entre ellos.
+  const twoCloseOverlaysJob = baseJob({
+    overlays: [
+      { id: "o1", type: "text", text: "uno", startSeconds: 1, durationSeconds: 1 },
+      { id: "o2", type: "text", text: "dos", startSeconds: 2.5, durationSeconds: 1 },
+    ],
+  });
+  const noFusion = planChunks(twoCloseOverlaysJob, { fuseGapFrames: 0 });
+  check("sin fuseGapFrames: 5 chunks (plano,compuesto,plano,compuesto,plano) -- no se fusiona nada", noFusion.chunks.map((c) => c.type).join(",") === "plain,composite,plain,composite,plain", JSON.stringify(noFusion.chunks.map((c) => c.type)));
+  check("sin fuseGapFrames: 2 corridas compuestas antes Y después de fusionar (no hubo fusión)", noFusion.compositeRunsBeforeFusion === 2 && noFusion.compositeRunsAfterFusion === 2);
+
+  const fused = planChunks(twoCloseOverlaysJob, { fuseGapFrames: 20 }); // hueco de 15 cuadros <= 20
+  check("con fuseGapFrames=20 (hueco real de 15): 3 chunks -- plano,compuesto,plano (las 2 corridas se fusionaron en 1)", fused.chunks.map((c) => c.type).join(",") === "plain,composite,plain", JSON.stringify(fused.chunks.map((c) => c.type)));
+  check("fusión: compositeRunsBeforeFusion=2, compositeRunsAfterFusion=1", fused.compositeRunsBeforeFusion === 2 && fused.compositeRunsAfterFusion === 1);
+  check("fusión: fusedGapFrames=15 (el hueco real que se absorbió)", fused.fusedGapFrames === 15, `fusedGapFrames=${fused.fusedGapFrames}`);
+  check("el chunk compuesto fusionado queda marcado spansCut=false (no hay corte real, solo un hueco plano absorbido)", fused.chunks[1].spansCut === false);
+}
+
+// --- planChunks: un chunk compuesto que SÍ cruza un corte real queda marcado spansCut=true y nunca se parte ---
+{
+  const overlaySpanningCut = baseJob({
+    cuts: [{ id: "c1", startSeconds: 4.4, endSeconds: 4.6 }], // corte de 0.2s, DENTRO del rango del overlay
+    overlays: [{ id: "o1", type: "text", text: "cruza el corte", startSeconds: 4, durationSeconds: 1 }], // 4-5s, el corte cae en medio
+  });
+  const plan = planChunks(overlaySpanningCut, { fuseGapFrames: 0 });
+  check("overlay con un corte real en medio: sigue siendo 1 sola corrida compuesta (nunca se parte por un corte)", plan.chunks.filter((c) => c.type === "composite").length === 1, JSON.stringify(plan.chunks));
+  const compositeChunk = plan.chunks.find((c) => c.type === "composite");
+  check("ese chunk compuesto queda marcado spansCut=true (SÍ hay un corte real adentro)", compositeChunk?.spansCut === true);
+}
+
+// --- summarizeChunkPlan: cuenta invocaciones reales de Remotion y cuadros por tipo ---
+{
+  const plan = planChunks(baseJob({ overlays: [{ id: "o1", type: "text", text: "x", startSeconds: 2, durationSeconds: 2 }] }));
+  const summary = summarizeChunkPlan(plan);
+  check("summarizeChunkPlan: 1 invocación de Remotion (1 chunk compuesto)", summary.remotionInvocations === 1 && summary.compositeChunks === 1);
+  check("summarizeChunkPlan: plainFrames=240, compositeFrames=60", summary.plainFrames === 240 && summary.compositeFrames === 60);
+}
+
+// --- decideRenderMode: apagado por defecto (producción sin cambios) ---
+{
+  const job = baseJob();
+  const plan = planSegments(job);
+  const decision = decideRenderMode({ configuredMode: "full", job, plan });
+  check("configuredMode='full' (valor por defecto del servidor): siempre 'full', nunca híbrido aunque el job califique", decision.mode === "full");
+}
+
+// --- decideRenderMode: híbrido activado, dentro del umbral ---
+{
+  const job = baseJob({ overlays: [{ id: "o1", type: "text", text: "x", startSeconds: 1, durationSeconds: 1 }] }); // 10% compuesto
+  const plan = planSegments(job);
+  const decision = decideRenderMode({ configuredMode: "hybrid", job, plan, maxCompositePercent: 70 });
+  check("híbrido activado, 10% compuesto <= 70%: modo 'hybrid'", decision.mode === "hybrid", decision.reason);
+}
+
+// --- decideRenderMode: híbrido activado pero el job supera el umbral de % compuesto -- cae a 'full' ---
+{
+  const job = baseJob({ zooms: [{ id: "z1", startSeconds: 0, endSeconds: 9, fromScale: 1, toScale: 1.1 }] }); // 90% compuesto
+  const plan = planSegments(job);
+  const decision = decideRenderMode({ configuredMode: "hybrid", job, plan, maxCompositePercent: 70 });
+  check("híbrido activado, 90% compuesto > 70%: cae a 'full' (el híbrido ya no conviene)", decision.mode === "full", decision.reason);
+}
+
+// --- decideRenderMode: solo aplica a video grabado con baseVideo resuelto ---
+{
+  const notRecordedJob = { ...baseJob(), input: { type: "ai-generated", durationInSeconds: 10 } };
+  const plan = planSegments(notRecordedJob);
+  const decision = decideRenderMode({ configuredMode: "hybrid", job: notRecordedJob, plan });
+  check("híbrido activado pero el job no es video grabado: cae a 'full'", decision.mode === "full", decision.reason);
+}
+
+// --- decideRenderMode: un reintento puede forzar 'full' explícitamente aunque el servidor tenga RENDER_MODE=hybrid ---
+{
+  const job = baseJob();
+  const plan = planSegments(job);
+  const decision = decideRenderMode({ configuredMode: "hybrid", override: "full", job, plan });
+  check("override='full' en el reintento: fuerza 'full' aunque el servidor tenga RENDER_MODE=hybrid", decision.mode === "full" && /pedido explícitamente/.test(decision.reason));
+}
+
+// --- chooseMeasurementWindowFrames / clipChunksToWindow: la ventana de medición siempre cubre el primer tramo compuesto completo ---
+{
+  const job = baseJob({ overlays: [{ id: "o1", type: "text", text: "x", startSeconds: 2, durationSeconds: 2 }] }); // compuesto en cuadros 60-120
+  const plan = planChunks(job);
+  const windowFrames = chooseMeasurementWindowFrames(plan, { minWindowFrames: 30, fps: 30 }); // 30 cuadros NO alcanzarían a cubrir el compuesto (termina en 120)
+  check("la ventana se extiende más allá de minWindowFrames para cubrir el primer chunk compuesto completo + 1s de margen", windowFrames >= 120 && windowFrames <= 150, `windowFrames=${windowFrames}`);
+
+  const clipped = clipChunksToWindow(plan, windowFrames);
+  check("clipChunksToWindow: el plan recortado nunca excede totalFrames=windowFrames", clipped.totalFrames === windowFrames);
+  check("clipChunksToWindow: el último chunk se acorta exactamente al límite de la ventana", clipped.chunks[clipped.chunks.length - 1].outputEndFrame === windowFrames);
+  check("clipChunksToWindow: el chunk compuesto completo sigue presente (no se cortó a mitad)", clipped.chunks.some((c) => c.type === "composite" && c.outputStartFrame === 60 && c.outputEndFrame === 120));
+}
+
+// --- clipTimelineToOutputSeconds: recorta una línea de tiempo (con cortes) a los primeros N segundos de SALIDA ---
+{
+  const timeline = buildTimeline(10, [{ startSeconds: 4, endSeconds: 6 }]); // salida: 0-4s (de 0-4 original) + 4-8s (de 6-10 original)
+  const clipped = clipTimelineToOutputSeconds(timeline, 5); // los primeros 5s de SALIDA
+  check("clipTimelineToOutputSeconds: outputDurationInSeconds=5", clipped.outputDurationInSeconds === 5);
+  check("clipTimelineToOutputSeconds: 2 tramos (el corte sigue aplicado dentro de la ventana)", clipped.segments.length === 2, JSON.stringify(clipped.segments));
+  check("clipTimelineToOutputSeconds: el segundo tramo se acorta a 1s de salida (4-5s), fuente 6-7s (el corte sigue aplicado)", clipped.segments[1].outputEnd === 5 && clipped.segments[1].sourceEnd === 7, JSON.stringify(clipped.segments[1]));
+}
 
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);
 process.exit(failures === 0 ? 0 : 1);

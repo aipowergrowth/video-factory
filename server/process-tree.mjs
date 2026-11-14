@@ -220,6 +220,17 @@ export const sumGroupCpuTicks = async (pgid, { procRoot = "/proc" } = {}) => {
  * directo) -- requiere que se haya lanzado con `detached: true`. Si el
  * grupo ya no existe (ya terminó, ESRCH) o `child.pid` no es válido,
  * cae de respaldo a señalar solo el proceso directo -- nunca lanza.
+ *
+ * LIMITACIÓN REAL (encontrada 14-nov-2026 con el código instalado de
+ * Remotion 4.0.538, no asumida): Remotion lanza Chrome con
+ * `detached: true` (`@remotion/renderer/dist/browser/BrowserRunner.js`,
+ * línea 87: `detached: process.platform !== 'win32'`), así que Chrome
+ * y sus subprocesos viven en OTRO grupo de procesos -- esta función no
+ * los alcanza, y `sumGroupCpuTicks`/`listAliveProcessesInGroup` no los
+ * ven. Por eso existen las variantes por ÁRBOL de más abajo
+ * (`killProcessTree`, `sumProcessTreeCpuTicks`), que siguen la cadena
+ * de ppid en vez del pgrp. Esta función se conserva como primer paso
+ * de `killProcessTree` y para compatibilidad.
  */
 export const killProcessGroup = (child, signal) => {
   if (typeof child?.pid !== "number") return;
@@ -232,4 +243,200 @@ export const killProcessGroup = (child, signal) => {
       // El proceso ya no existe de ninguna forma -- nada que hacer.
     }
   }
+};
+
+// --------------------------------------------------------------------
+// Variantes por ÁRBOL de procesos (cadena de ppid), 14-nov-2026.
+//
+// Causa raíz con evidencia (código instalado, no supuesto): Remotion
+// lanza Chrome con `detached: true` (ver arriba), así que el navegador
+// -- que es quien hace el trabajo pesado entre "bundling listo" y el
+// primer cuadro, y quien decodifica el video fuente -- NO pertenece al
+// grupo de procesos del render. Consecuencias reales:
+//   1. El vigilante por grupo (`sumGroupCpuTicks`) puede ver 0 ticks
+//      mientras Chrome sí trabaja: el proceso Node de Remotion espera
+//      al navegador sin gastar CPU. Explica el fallo reproducible del
+//      caso 7 de test-render-observability.mjs ("0 min sin actividad"
+//      justo tras bundling 100%).
+//   2. El conteo de huérfanos por grupo nunca podía ver un Chrome
+//      sobreviviente -- "0 descendientes vivos" solo probaba que el
+//      grupo de npx/node murió.
+// La cadena ppid sí une todo: npx -> node (remotion) -> chrome
+// (ppid = node) -> subprocesos de chrome. Después de matar a node, sus
+// hijos se re-adoptan por init (ppid=1) y la cadena se rompe -- por
+// eso el corte toma primero una FOTO del árbol (pids + tiempo de
+// arranque, para no confundir un pid reutilizado) y el chequeo
+// posterior de supervivientes se hace contra esa foto, no contra el
+// árbol vivo.
+// --------------------------------------------------------------------
+
+/**
+ * Parsea una línea completa de /proc/[pid]/stat -- pura. Campos tras
+ * el ÚLTIMO ")" (orden fijo, `man proc`): state(0) ppid(1) pgrp(2)
+ * session(3) tty_nr(4) tpgid(5) flags(6) minflt(7) cminflt(8)
+ * majflt(9) cmajflt(10) utime(11) stime(12) cutime(13) cstime(14)
+ * priority(15) nice(16) num_threads(17) itrealvalue(18) starttime(19).
+ */
+export const parseStatLine = (rawStatLine) => {
+  const openParenIndex = rawStatLine.indexOf("(");
+  const closeParenIndex = rawStatLine.lastIndexOf(")");
+  if (openParenIndex === -1 || closeParenIndex === -1 || closeParenIndex < openParenIndex) return null;
+  const pid = Number(rawStatLine.slice(0, openParenIndex).trim());
+  const comm = rawStatLine.slice(openParenIndex + 1, closeParenIndex);
+  const fields = rawStatLine.slice(closeParenIndex + 1).trim().split(/\s+/);
+  const state = fields[0] || null;
+  const ppid = Number(fields[1]);
+  const pgrp = Number(fields[2]);
+  const utimeTicks = Number(fields[11]);
+  const stimeTicks = Number(fields[12]);
+  const startTimeTicks = Number(fields[19]);
+  if (![pid, ppid, pgrp, utimeTicks, stimeTicks].every(Number.isFinite)) return null;
+  return { pid, comm, state, ppid, pgrp, utimeTicks, stimeTicks, startTimeTicks: Number.isFinite(startTimeTicks) ? startTimeTicks : null };
+};
+
+/** Lee /proc completo una sola vez -> Map pid -> parseStatLine. `null` sin /proc (macOS de desarrollo). */
+export const readProcessTable = async ({ procRoot = "/proc" } = {}) => {
+  let entries;
+  try {
+    entries = await fs.readdir(procRoot);
+  } catch {
+    return null;
+  }
+  const table = new Map();
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const parsed = parseStatLine(await fs.readFile(`${procRoot}/${entry}/stat`, "utf8"));
+      if (parsed) table.set(parsed.pid, parsed);
+    } catch {
+      // Murió entre el readdir y la lectura -- condición normal, se omite.
+    }
+  }
+  return table;
+};
+
+/** Raíz + todos sus descendientes por cadena de ppid (BFS, raíz primero) -- pura sobre una tabla ya leída. */
+export const collectProcessTree = (rootPid, table) => {
+  const root = table.get(rootPid);
+  if (!root) return [];
+  const childrenByPpid = new Map();
+  for (const p of table.values()) {
+    if (!childrenByPpid.has(p.ppid)) childrenByPpid.set(p.ppid, []);
+    childrenByPpid.get(p.ppid).push(p);
+  }
+  const result = [root];
+  const queue = [rootPid];
+  const seen = new Set([rootPid]);
+  while (queue.length > 0) {
+    const pid = queue.shift();
+    for (const child of childrenByPpid.get(pid) ?? []) {
+      if (seen.has(child.pid)) continue;
+      seen.add(child.pid);
+      result.push(child);
+      queue.push(child.pid);
+    }
+  }
+  return result;
+};
+
+/**
+ * Como `sumGroupCpuTicks`, pero sobre el ÁRBOL (incluye Chrome aunque
+ * esté en otro grupo). `null` si no hay /proc o la raíz ya no existe.
+ */
+export const sumProcessTreeCpuTicks = async (rootPid, { procRoot = "/proc" } = {}) => {
+  const table = await readProcessTable({ procRoot });
+  if (!table) return null;
+  const tree = collectProcessTree(rootPid, table);
+  if (tree.length === 0) return null;
+  return tree.reduce((sum, p) => sum + p.utimeTicks + p.stimeTicks, 0);
+};
+
+/** Detalle (pid, ppid, pgrp, estado, comm, cmdline) de cada proceso vivo del ÁRBOL de `rootPid`. `null` sin /proc. */
+export const listAliveProcessesInTree = async (rootPid, { procRoot = "/proc" } = {}) => {
+  const table = await readProcessTable({ procRoot });
+  if (!table) return null;
+  const tree = collectProcessTree(rootPid, table);
+  const detailed = [];
+  for (const p of tree) {
+    const { comm, cmdline } = await readProcessIdentity(p.pid, procRoot);
+    detailed.push({ pid: p.pid, ppid: p.ppid, pgrp: p.pgrp, state: p.state, comm: comm ?? p.comm, cmdline });
+  }
+  return detailed;
+};
+
+/** Foto del árbol (pid, pgrp, tiempo de arranque, comm) para poder verificar supervivientes DESPUÉS de cortar, cuando la cadena de ppid ya se rompió. */
+export const snapshotProcessTree = async (rootPid, { procRoot = "/proc" } = {}) => {
+  const table = await readProcessTable({ procRoot });
+  if (!table) return null;
+  return collectProcessTree(rootPid, table).map((p) => ({ pid: p.pid, pgrp: p.pgrp, startTimeTicks: p.startTimeTicks, comm: p.comm }));
+};
+
+/**
+ * Qué procesos de una foto previa siguen vivos -- un pid que existe
+ * pero con OTRO tiempo de arranque es un pid reutilizado por el
+ * sistema, no un superviviente, y no se cuenta. `null` sin /proc.
+ */
+export const listSurvivorsFromSnapshot = async (snapshot, { procRoot = "/proc" } = {}) => {
+  if (!snapshot) return null;
+  const survivors = [];
+  for (const entry of snapshot) {
+    let parsed;
+    try {
+      parsed = parseStatLine(await fs.readFile(`${procRoot}/${entry.pid}/stat`, "utf8"));
+    } catch {
+      continue; // ya no existe -- es lo que se buscaba
+    }
+    if (!parsed) continue;
+    if (entry.startTimeTicks !== null && parsed.startTimeTicks !== null && parsed.startTimeTicks !== entry.startTimeTicks) continue; // pid reutilizado
+    const { comm, cmdline } = await readProcessIdentity(entry.pid, procRoot);
+    survivors.push({ pid: entry.pid, ppid: parsed.ppid, pgrp: parsed.pgrp, state: parsed.state, comm: comm ?? parsed.comm, cmdline });
+  }
+  return survivors;
+};
+
+const lastKillSnapshots = new WeakMap();
+/** Última foto tomada por `killProcessTree` para este `child` (para que quien espera el "close" pueda contar supervivientes contra ella). */
+export const getLastKillSnapshot = (child) => (child && typeof child === "object" ? (lastKillSnapshots.get(child) ?? null) : null);
+
+/**
+ * Corta TODO el árbol: toma la foto, señala al grupo del hijo directo
+ * (como siempre), y además a CADA proceso del árbol por su pid y a
+ * cada grupo de procesos AJENO que aparezca en el árbol (el de Chrome)
+ * -- así también caen subprocesos de Chrome creados entre la foto y la
+ * señal. Nunca señala al grupo propio del servidor. Nunca lanza.
+ * Devuelve la foto (o `null` sin /proc, en cuyo caso solo se señaló el
+ * grupo directo, igual que antes).
+ */
+export const killProcessTree = async (child, signal, { procRoot = "/proc" } = {}) => {
+  if (typeof child?.pid !== "number") return null;
+  const snapshot = await snapshotProcessTree(child.pid, { procRoot });
+  if (snapshot) lastKillSnapshots.set(child, snapshot);
+  killProcessGroup(child, signal);
+  if (!snapshot) return null;
+  const ownGroup = (() => {
+    try {
+      return process.getpgid ? process.getpgid(process.pid) : null;
+    } catch {
+      return null;
+    }
+  })();
+  const foreignGroups = new Set();
+  for (const p of snapshot) {
+    if (p.pgrp !== child.pid && p.pgrp > 1 && p.pgrp !== ownGroup && p.pgrp !== process.pid) foreignGroups.add(p.pgrp);
+  }
+  for (const pgrp of foreignGroups) {
+    try {
+      process.kill(-pgrp, signal);
+    } catch {
+      // Grupo ya inexistente -- bien.
+    }
+  }
+  for (const p of snapshot) {
+    try {
+      process.kill(p.pid, signal);
+    } catch {
+      // Ya no existe -- bien.
+    }
+  }
+  return snapshot;
 };

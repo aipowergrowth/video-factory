@@ -19,7 +19,7 @@
 // `--log=verbose`: el nivel por defecto ya tiene todo lo necesario, con
 // mucho menos ruido en un render de 60 minutos real.
 import { spawn } from "node:child_process";
-import { killProcessGroup, listAliveProcessesInGroup, sumGroupCpuTicks } from "./process-tree.mjs";
+import { killProcessTree, getLastKillSnapshot, listSurvivorsFromSnapshot, listAliveProcessesInGroup, sumProcessTreeCpuTicks } from "./process-tree.mjs";
 
 // Duplicados a propósito de src/types.ts (mismo patrón que
 // isRenderableByEngine/shouldBurnCaptions en cta-guarantee.mjs: el
@@ -189,8 +189,13 @@ export class RenderStuckError extends Error {
  * SIN tocar la duración real de la composición ni renderizar el job
  * completo.
  */
-export const buildRenderArgs = ({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, logLevel, muted, codec }) => {
-  const args = ["remotion", "render", compositionId, outputPath, `--props=${JSON.stringify({ jobFile: propsJobFile })}`, `--concurrency=${concurrency}`];
+export const buildRenderArgs = ({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, logLevel, muted, codec, entryPoint, crf, x264Preset, gopSize }) => {
+  // `entryPoint` (híbrido, 14-nov-2026, criterio 4): ruta a un bundle
+  // YA construido (ver render-bundle.mjs) -- el CLI lo detecta por su
+  // index.html y se salta el bundling (confirmado en
+  // @remotion/cli/dist/setup-cache.js:18). `undefined` en producción:
+  // el CLI determina la entrada como siempre (src/index.ts) y bundlea.
+  const args = ["remotion", "render", ...(entryPoint ? [entryPoint] : []), compositionId, outputPath, `--props=${JSON.stringify({ jobFile: propsJobFile })}`, `--concurrency=${concurrency}`];
   if (enableMultiprocessOnLinux) args.push("--enable-multiprocess-on-linux");
   if (browserExecutable) args.push(`--browser-executable=${browserExecutable}`);
   if (binariesDirectory) args.push(`--binaries-directory=${binariesDirectory}`);
@@ -207,6 +212,14 @@ export const buildRenderArgs = ({ compositionId, outputPath, propsJobFile, concu
   // cualquier render real de producción -- comportamiento sin cambios.
   if (muted) args.push("--muted");
   if (codec) args.push(`--codec=${codec}`);
+  // `crf`/`x264Preset`/`gopSize` (híbrido, 14-nov-2026, adenda criterio
+  // 2: "con parámetros idénticos a los tramos compuestos") -- confirmados
+  // como flags reales de `npx remotion render` contra la documentación
+  // oficial vigente. `undefined` en producción -- Remotion usa sus
+  // propios valores por defecto, sin cambios.
+  if (crf !== undefined) args.push(`--crf=${crf}`);
+  if (x264Preset) args.push(`--x264-preset=${x264Preset}`);
+  if (gopSize !== undefined) args.push(`--gop=${gopSize}`);
   return args;
 };
 
@@ -246,6 +259,12 @@ export const runRemotionRender = ({
   // comentario grande en `buildRenderArgs`. `undefined` en producción.
   muted,
   codec,
+  // Bundle pre-construido (híbrido, criterio 4) -- ver buildRenderArgs. `undefined` en producción.
+  entryPoint,
+  // Parámetros de codificación idénticos a los tramos planos (híbrido, adenda criterio 2). `undefined` en producción.
+  crf,
+  x264Preset,
+  gopSize,
   timeoutMs = 0,
   // Vigilante de render trabado (criterio 3): si pasan
   // `stuckAfterMs` sin NINGÚN evento de progreso nuevo (ni rendering
@@ -278,7 +297,12 @@ export const runRemotionRender = ({
   makeCancelledError = () => new Error("Render cancelado."),
 }) =>
   new Promise((resolve, reject) => {
-    const args = buildRenderArgs({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, muted, codec });
+    const args = buildRenderArgs({ compositionId, outputPath, propsJobFile, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, frames, muted, codec, entryPoint, crf, x264Preset, gopSize });
+    const spawnedAt = Date.now();
+    // Arranque medido (criterio 4): ms desde el spawn hasta el PRIMER
+    // tick real de "Rendered N/M" -- bundling + navegador + composición
+    // + primer cuadro del video fuente. `null` si nunca llegó.
+    let firstRenderTickAt = null;
     // `detached: true` (y no más que eso -- no `setsid`/nueva sesión,
     // solo nuevo GRUPO de procesos): hace que `child.pid` sea el
     // LÍDER de un grupo de procesos propio, distinto del grupo del
@@ -319,6 +343,7 @@ export const runRemotionRender = ({
     const recordProgress = (event) => {
       lastProgressAt = Date.now();
       lastProgressEvent = event;
+      if (firstRenderTickAt === null && event.stage === "rendering") firstRenderTickAt = Date.now();
       onProgress(event);
     };
 
@@ -345,9 +370,9 @@ export const runRemotionRender = ({
     if (timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
         timedOut = true;
-        onLog(`superó ${Math.round(timeoutMs / 60000)} min, terminando el proceso (grupo completo).`);
-        killProcessGroup(child, "SIGTERM");
-        setTimeout(() => killProcessGroup(child, "SIGKILL"), 10_000);
+        onLog(`superó ${Math.round(timeoutMs / 60000)} min, terminando el proceso (árbol completo, Chrome incluido).`);
+        void killProcessTree(child, "SIGTERM");
+        setTimeout(() => void killProcessTree(child, "SIGKILL"), 10_000);
       }, timeoutMs);
     }
 
@@ -375,10 +400,10 @@ export const runRemotionRender = ({
         new Promise((resolve) => setTimeout(resolve, stuckDiagnosisTimeoutMs)),
       ]);
       onLog(
-        `diagnóstico completado en ${Date.now() - diagnosisStartedAt}ms, MEDIDO ANTES DE CUALQUIER SEÑAL -- terminando el proceso (grupo completo) ahora.`,
+        `diagnóstico completado en ${Date.now() - diagnosisStartedAt}ms, MEDIDO ANTES DE CUALQUIER SEÑAL -- terminando el proceso (árbol completo, Chrome incluido) ahora.`,
       );
-      killProcessGroup(child, "SIGTERM");
-      setTimeout(() => killProcessGroup(child, "SIGKILL"), 10_000);
+      await killProcessTree(child, "SIGTERM");
+      setTimeout(() => void killProcessTree(child, "SIGKILL"), 10_000);
     };
 
     let stuckTimer = null;
@@ -399,7 +424,11 @@ export const runRemotionRender = ({
           // primera revisión (aunque todavía no esté añejo) ya hay
           // una lectura anterior real con la que comparar para
           // cuando SÍ se vuelve añejo.
-          const currentTicks = typeof child.pid === "number" ? await sumGroupCpuTicks(child.pid) : null;
+          // Por ÁRBOL de procesos, no por grupo (corrección 14-nov-2026
+          // con evidencia del código instalado de Remotion: Chrome corre
+          // en su propio grupo -- `detached: true` en BrowserRunner.js:87
+          // -- y la medición por grupo no lo veía; ver process-tree.mjs).
+          const currentTicks = typeof child.pid === "number" ? await sumProcessTreeCpuTicks(child.pid) : null;
           const cpuTicksDelta = lastGroupCpuTicks !== null && currentTicks !== null ? currentTicks - lastGroupCpuTicks : null;
           if (currentTicks !== null) lastGroupCpuTicks = currentTicks;
 
@@ -415,7 +444,7 @@ export const runRemotionRender = ({
           // límite final absoluto).
           if (!shouldConsiderStuck({ msSinceLastProgress, stuckAfterMs, cpuTicksDelta })) {
             onLog(
-              `sin cuadros nuevos en ${Math.round(msSinceLastProgress / 60000)} min, pero el grupo de procesos SÍ usó CPU en los últimos ${Math.round(stuckCheckIntervalMs / 1000)}s ` +
+              `sin cuadros nuevos en ${Math.round(msSinceLastProgress / 60000)} min, pero el árbol de procesos (Chrome incluido) SÍ usó CPU en los últimos ${Math.round(stuckCheckIntervalMs / 1000)}s ` +
                 `(+${cpuTicksDelta} ticks) -- se considera "lento, no trabado": no se corta por este mecanismo todavía.`,
             );
             return;
@@ -467,12 +496,23 @@ export const runRemotionRender = ({
       // reportarlo como huérfano de verdad -- cubre el caso de que el
       // "close" del proceso padre llegue antes de que el SIGKILL de
       // respaldo (programado más arriba) alcance a correr.
+      //
+      // Corrección 14-nov-2026 (evidencia del código instalado de
+      // Remotion): Chrome corre en OTRO grupo de procesos (detached), así
+      // que contar "vivos en el grupo" nunca podía ver un Chrome
+      // sobreviviente. Ahora se cuenta contra la FOTO del árbol tomada
+      // por `killProcessTree` justo antes de señalar (pid + tiempo de
+      // arranque, inmune a pids reutilizados); si no hay foto (p.ej. el
+      // corte vino de afuera con el mecanismo viejo), se cae al chequeo
+      // por grupo de antes.
       let descendantProcessesAliveAfterCut = null;
       let descendantProcessesDetail = null;
       if (isCancelled() || stuck || timedOut) {
         await new Promise((r) => setTimeout(r, processTreeCheckDelayMs));
         if (typeof child.pid === "number") {
-          descendantProcessesDetail = await listAliveProcessesInGroup(child.pid);
+          const snapshot = getLastKillSnapshot(child);
+          const listSurvivors = () => (snapshot ? listSurvivorsFromSnapshot(snapshot) : listAliveProcessesInGroup(child.pid));
+          descendantProcessesDetail = await listSurvivors();
           const realSurvivors = (descendantProcessesDetail ?? []).filter((p) => p.state !== "Z");
           if (realSurvivors.length > 0) {
             onLog(
@@ -487,7 +527,7 @@ export const runRemotionRender = ({
               }
             }
             await new Promise((r) => setTimeout(r, 2000));
-            descendantProcessesDetail = await listAliveProcessesInGroup(child.pid);
+            descendantProcessesDetail = await listSurvivors();
           }
         }
         descendantProcessesAliveAfterCut = descendantProcessesDetail?.length ?? null;
@@ -538,7 +578,9 @@ export const runRemotionRender = ({
         err.evidence = buildEvidence("timeout");
         reject(err);
       } else if (code === 0) {
-        resolve();
+        // Tiempos medidos de ESTA invocación (criterio 4, híbrido) --
+        // quien no los necesite (producción) los ignora, como antes.
+        resolve({ startupMs: firstRenderTickAt !== null ? firstRenderTickAt - spawnedAt : null, elapsedMs: Date.now() - spawnedAt });
       } else {
         const err = new Error(`remotion render exited with code=${code} signal=${signal}: ${stderrTail}`);
         err.evidence = buildEvidence("exit-error");

@@ -5,7 +5,10 @@
       "parameters": {},
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [-640, 0],
+      "position": [
+        -640,
+        0
+      ],
       "id": "trigger-manual",
       "name": "Ejecutar manualmente"
     },
@@ -25,7 +28,10 @@
       },
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
-      "position": [-400, 0],
+      "position": [
+        -400,
+        0
+      ],
       "id": "jobid",
       "name": "jobId a consultar"
     },
@@ -37,7 +43,10 @@
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [-160, 0],
+      "position": [
+        -160,
+        0
+      ],
       "id": "consultar-estado",
       "name": "Consultar estado"
     },
@@ -88,6 +97,20 @@
               "value": "={{ $json.attempts }}",
               "type": "array",
               "notes": "NUEVO (09-nov-2026, criterio 2) -- hasta los 5 intentos más recientes de este job, cada uno con attemptNumber/startedAt/endedAt/outcome/error/renderEvidence. Un reintento YA NO borra el motivo del intento anterior -- queda acá."
+            },
+            {
+              "id": "f-render-mode",
+              "name": "modoDeRender",
+              "value": "={{ $json.renderMode }}",
+              "type": "string",
+              "notes": "NUEVO (14-nov-2026, render híbrido) -- \"hybrid\" solo si RENDER_MODE=hybrid en el servidor Y el planificador decidió usarlo para este job; ausente/undefined en un render completo normal (RENDER_MODE=full, el valor por defecto -- sin cambios de comportamiento)."
+            },
+            {
+              "id": "f-segments",
+              "name": "tramos",
+              "value": "={{ $json.segments }}",
+              "type": "array",
+              "notes": "NUEVO (14-nov-2026, render híbrido, adenda criterio 5/C) -- solo presente si modoDeRender=\"hybrid\". Un registro por tramo: type (plain/composite), outputStartFrame/outputEndFrame, status (done/error), reused (true si se reaprovechó de un intento anterior YA VERIFICADO), checksum, renderMs."
             }
           ]
         },
@@ -95,20 +118,47 @@
       },
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
-      "position": [100, 0],
+      "position": [
+        100,
+        0
+      ],
       "id": "resumen",
       "name": "Resumen"
     }
   ],
   "connections": {
     "Ejecutar manualmente": {
-      "main": [[{ "node": "jobId a consultar", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "jobId a consultar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "jobId a consultar": {
-      "main": [[{ "node": "Consultar estado", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Consultar estado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Consultar estado": {
-      "main": [[{ "node": "Resumen", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Resumen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   }
 }

@@ -232,6 +232,7 @@ node server/test-audio-regression.mjs             # .github/workflows/audio-regr
 node server/test-video-conversion-regression.mjs  # .github/workflows/audio-regression-tests.yml
 node server/test-captions-render.mjs              # .github/workflows/captions-destination-test.yml
 node server/test-render-observability.mjs         # .github/workflows/captions-destination-test.yml
+node server/test-hybrid-render.mjs                # .github/workflows/captions-destination-test.yml
 ```
 
 ## Mantenimiento

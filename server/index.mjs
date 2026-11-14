@@ -29,7 +29,9 @@ import { startContainerMetricsSampling, readContainerMemoryBytes, readContainerC
 import { probeSourceVideoDiagnostics, formatSourceVideoDiagnosticsLine } from "./source-video-diagnostics.mjs";
 import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExists, appendAttemptHistory } from "./job-retry.mjs";
 import { runDiagnosticRender, buildDiagnosticWindows } from "./render-diagnose.mjs";
-import { planSegments } from "./segment-planner.mjs";
+import { planSegments, planChunks, decideRenderMode } from "./segment-planner.mjs";
+import { runHybridRenderForJob } from "./segment-pipeline.mjs";
+import { runHybridDiagnostic } from "./render-diagnose-hybrid.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -134,6 +136,27 @@ const VIDEO_CONVERSION_CRF = Number(process.env.VIDEO_CONVERSION_CRF ?? 20);
 // use más hilos de los que el contenedor en realidad tiene.
 const VIDEO_CONVERSION_THREADS = Number(process.env.VIDEO_CONVERSION_THREADS ?? 4);
 
+// Render híbrido (Fase 0, 14-nov-2026, autorizado por Alex; adenda del
+// auditor del mismo día, criterio F) -- APAGADO por defecto
+// ("full" = el render completo de siempre, SIN cambios de
+// comportamiento). Cambiar a "hybrid" activa, job por job, la decisión
+// de segment-planner.mjs#decideRenderMode -- NUNCA se activa solo por
+// desplegar esta imagen; requiere que Alex cambie esta variable
+// explícitamente en Portainer DESPUÉS de validar con datos del VPS
+// (ver el informe de esta tarea).
+const RENDER_MODE = process.env.RENDER_MODE === "hybrid" ? "hybrid" : "full";
+const HYBRID_MAX_COMPOSITE_PERCENT = Number(process.env.HYBRID_MAX_COMPOSITE_PERCENT ?? 70);
+const HYBRID_FUSE_GAP_FRAMES = Number(process.env.HYBRID_FUSE_GAP_FRAMES ?? 45);
+const HYBRID_CRF = Number(process.env.HYBRID_CRF ?? 18);
+const HYBRID_X264_PRESET = process.env.HYBRID_X264_PRESET ?? "medium";
+const HYBRID_GOP_SIZE = Number(process.env.HYBRID_GOP_SIZE ?? 90);
+const HYBRID_BUNDLE_DIR = process.env.HYBRID_BUNDLE_DIR ?? path.join(PROJECT_ROOT, ".remotion-hybrid-bundle");
+const HYBRID_BUNDLE_VERSION_TAG = process.env.GIT_SHA ?? "dev";
+// Ventana mínima del diagnóstico híbrido (criterio 7/E) -- 5s de
+// salida por defecto, extendida sola para cubrir el primer tramo
+// compuesto completo (ver chooseMeasurementWindowFrames).
+const HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES = Number(process.env.HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES ?? 150);
+
 // Reintentos para la descarga desde Google Drive.
 const DRIVE_DOWNLOAD_MAX_ATTEMPTS = Number(
   process.env.DRIVE_DOWNLOAD_MAX_ATTEMPTS ?? 3,
@@ -220,6 +243,12 @@ let active = 0;
 // chequean este set en sus puntos naturales y abortan solas.
 const runningChildren = new Map(); // jobId -> ChildProcess
 const cancelledJobIds = new Set();
+// Override de modo de render SOLO para el próximo intento de un job
+// puntual -- lo fija POST /jobs/:id/retry con {"mode":"full"} (criterio
+// 6: "se puede reintentar en modo completo sin perder el trabajo"
+// cuando el híbrido falló). Se consume una sola vez (se borra al
+// leerlo) -- nunca persiste más allá de ese reintento.
+const renderModeOverrides = new Map(); // jobId -> "full"
 
 class CancelledError extends Error {
   constructor(jobId) {
@@ -381,6 +410,16 @@ const runRender = async (jobId, job) => {
   // en error -- antes solo existía en este console.log, invisible para
   // Alex si el visor de Portainer se queda sin mostrar líneas.
   let sourceVideoDiagnosticsLine = null;
+  // Resolución REAL de la fuente (ancho/alto probados, no asumidos) --
+  // necesaria para el render híbrido (`canStreamCopyPlainChunks`,
+  // criterio 2 de la adenda): solo se puede copiar flujo sin recodificar
+  // cuando la fuente YA tiene exactamente la resolución de destino. Un
+  // defecto real que esto evita a propósito: usar las dimensiones de
+  // DESTINO en vez de las de la fuente aquí haría que un video que en
+  // realidad tiene otra resolución se "copiara" igual, produciendo un
+  // video final con la resolución equivocada sin que nada lo detecte.
+  let sourceWidth = null;
+  let sourceHeight = null;
   if (job.input?.type === "recorded-video" && job.input.baseVideo) {
     try {
       const ffprobePath = resolveFfprobe();
@@ -389,10 +428,75 @@ const runRender = async (jobId, job) => {
         env: binaryEnv(ffprobePath),
       });
       sourceVideoDiagnosticsLine = formatSourceVideoDiagnosticsLine(diag);
+      sourceWidth = diag.width;
+      sourceHeight = diag.height;
       console.log(`[render ${jobId}] video fuente -- ${sourceVideoDiagnosticsLine}`);
     } catch (err) {
       sourceVideoDiagnosticsLine = `no se pudo diagnosticar (${err.message ?? err})`;
       console.log(`[render ${jobId}] no se pudo diagnosticar el video fuente (se continúa igual): ${err.message ?? err}`);
+    }
+  }
+
+  // Regla de decisión por trabajo (adenda, criterio 6/F, 14-nov-2026):
+  // `RENDER_MODE=full` (valor por defecto del servidor) hace que esto
+  // SIEMPRE devuelva "full" -- el resto de esta función sigue sin
+  // ningún cambio de comportamiento. Solo con `RENDER_MODE=hybrid`
+  // (cambio explícito de Alex en Portainer, después de validar con
+  // datos del VPS) entra en juego `decideRenderMode`, y solo para
+  // trabajos de video grabado dentro del umbral de % compuesto.
+  const retryOverride = renderModeOverrides.get(jobId) ?? null;
+  renderModeOverrides.delete(jobId);
+  let renderModeDecision = { mode: "full", reason: "no es un trabajo de video grabado -- no aplica la decisión híbrida" };
+  if (job.input?.type === "recorded-video" && job.input.baseVideo) {
+    if (sourceWidth === null || sourceHeight === null) {
+      renderModeDecision = { mode: "full", reason: "no se pudo determinar la resolución real de la fuente (el probe de arriba falló) -- el híbrido necesita ese dato para decidir si puede copiar flujo sin recodificar" };
+    } else {
+      const plan = planChunks(job, { fuseGapFrames: HYBRID_FUSE_GAP_FRAMES });
+      const compositeFrames = plan.chunks.filter((c) => c.type === "composite").reduce((s, c) => s + c.frames, 0);
+      const compositePercent = plan.totalFrames > 0 ? (compositeFrames / plan.totalFrames) * 100 : 0;
+      renderModeDecision = decideRenderMode({ configuredMode: RENDER_MODE, override: retryOverride, job, plan: { ...plan, compositePercent }, maxCompositePercent: HYBRID_MAX_COMPOSITE_PERCENT });
+    }
+  }
+  console.log(`[render ${jobId}] modo de render -- ${renderModeDecision.mode} (${renderModeDecision.reason})`);
+
+  if (renderModeDecision.mode === "hybrid") {
+    writeStatus(jobId, { renderMode: "hybrid", segments: [] });
+    try {
+      const { segments } = await runHybridRenderForJob({
+        jobId,
+        job,
+        outputPath,
+        destWidth: dims?.width,
+        destHeight: dims?.height,
+        srcWidth: sourceWidth,
+        srcHeight: sourceHeight,
+        fps: ENGINE_FPS,
+        ffmpegPath: resolveFfmpeg(),
+        ffprobePath: resolveFfprobe(),
+        env: process.env,
+        cwd: PROJECT_ROOT,
+        bundleDir: HYBRID_BUNDLE_DIR,
+        bundleVersionTag: HYBRID_BUNDLE_VERSION_TAG,
+        chunkWorkDir: path.join(OUTPUTS_DIR, `.hybrid-${jobId}`),
+        concurrency: REMOTION_CONCURRENCY,
+        enableMultiprocessOnLinux: ENABLE_MULTIPROCESS_ON_LINUX,
+        browserExecutable: REMOTION_BROWSER_EXECUTABLE,
+        binariesDirectory: REMOTION_BINARIES_DIRECTORY,
+        fuseGapFrames: HYBRID_FUSE_GAP_FRAMES,
+        crf: HYBRID_CRF,
+        preset: HYBRID_X264_PRESET,
+        gopSize: HYBRID_GOP_SIZE,
+        timeoutMs: RENDER_TIMEOUT_MINUTES * 60 * 1000,
+        onLog: (msg) => console.log(`[render ${jobId}] [híbrido] ${msg}`),
+        onSegments: (segments) => writeStatus(jobId, { renderMode: "hybrid", segments }),
+      });
+      console.log(`[render ${jobId}] [híbrido] terminado -- ${segments.filter((s) => s.reused).length} tramo(s) reusado(s), ${segments.filter((s) => !s.reused).length} renderizado(s) de nuevo.`);
+      return;
+    } catch (err) {
+      if (err && typeof err === "object") {
+        err.evidence = { ...(err.evidence ?? {}), sourceVideoDiagnosticsLine, renderMode: "hybrid" };
+      }
+      throw err;
     }
   }
 
@@ -1704,6 +1808,16 @@ app.post("/jobs/:id/retry", async (req, res) => {
     console.log(`[job ${jobId}]   ${step.skipped ? "SE OMITE" : "SE REPITE"} -- ${step.name}: ${step.detail}`);
   }
 
+  // Criterio 6 (adenda, 14-nov-2026): un reintento puede forzar el modo
+  // "full" para ESTE intento, aunque RENDER_MODE=hybrid -- para
+  // recuperar un job cuyo render híbrido falló sin perder el trabajo ya
+  // hecho (transcripción/plan/recursos, que `describeRetryPlan` ya
+  // omite repetir). Se consume una sola vez dentro de `runRender`.
+  if (req.body?.mode === "full") {
+    renderModeOverrides.set(jobId, "full");
+    console.log(`[job ${jobId}] reintento pedido EN MODO "full" explícito (pedido en el cuerpo del POST) -- este intento no usa el híbrido aunque RENDER_MODE=hybrid.`);
+  }
+
   // A diferencia de enqueue() (jobs nuevos), nunca se pisa createdAt --
   // es el mismo job de antes, no uno nuevo. Tampoco queda el `error`
   // viejo colgado junto al estado "queued" nuevo.
@@ -1831,6 +1945,91 @@ app.post("/jobs/:id/diagnose", async (req, res) => {
   );
 
   res.json({ jobId, sourceVideoDiagnosticsLine, totalFrames, frames, concurrency, videoComponent, ...result });
+});
+
+/**
+ * Medición del render HÍBRIDO de punta a punta (adenda del auditor,
+ * 14-nov-2026, criterio 7/E) -- sobre una VENTANA corta de un job real
+ * YA persistido (los primeros segundos de salida, extendidos para
+ * cubrir el primer tramo compuesto completo), compara el híbrido
+ * contra un render completo de esa misma ventana: tiempos por etapa
+ * (bundle, cada tramo, ensamblado), memoria/CPU del contenedor durante
+ * TODO el proceso (no solo Remotion), y equivalencia visual (PSNR).
+ * Nunca toca el estado del job real ni `OUTPUTS_DIR` -- usa
+ * `diagnostics/` igual que `/jobs/:id/diagnose`, y lo borra al
+ * terminar. No corre si hay un render real en curso (compite por CPU).
+ */
+app.post("/jobs/:id/diagnose-hybrid", async (req, res) => {
+  const jobId = req.params.id;
+  if (active > 0 || runningChildren.has(jobId)) {
+    return res.status(409).json({ error: "Hay un render real en curso -- el diagnóstico híbrido no corre junto a un render real." });
+  }
+  const fileCheck = await readJobFileForRetry(jobFilePath(jobId), RETENTION_DAYS);
+  if (!fileCheck.ok) {
+    return res.status(404).json({ error: fileCheck.reason });
+  }
+  const job = fileCheck.job;
+  if (job.input?.type !== "recorded-video" || !job.input.baseVideo) {
+    return res.status(409).json({ error: "El job no tiene un video base grabado -- el híbrido no aplica." });
+  }
+  const baseVideoAbsolutePath = path.join(PROJECT_ROOT, "public", job.input.baseVideo);
+  const videoCheck = await checkBaseVideoExists(baseVideoAbsolutePath, RETENTION_DAYS);
+  if (!videoCheck.ok) {
+    return res.status(409).json({ error: videoCheck.reason });
+  }
+  const dims = DESTINATION_DIMENSIONS[job.destination];
+  if (!dims) {
+    return res.status(409).json({ error: `Destino "${job.destination}" sin dimensiones conocidas.` });
+  }
+  // Resolución REAL de la fuente (probada, no asumida igual al
+  // destino) -- mismo motivo que en runRender: sin esto, un video que
+  // en realidad tiene otra resolución "copiaría" flujo igual,
+  // produciendo una medición que no refleja lo que de verdad pasaría.
+  let sourceDiag;
+  try {
+    const ffprobePath = resolveFfprobe();
+    sourceDiag = await probeSourceVideoDiagnostics(baseVideoAbsolutePath, { ffprobePath, env: binaryEnv(ffprobePath) });
+  } catch (err) {
+    return res.status(409).json({ error: `No se pudo determinar la resolución real del video fuente: ${err.message ?? err}` });
+  }
+
+  const diagnosticsDir = path.join(PROJECT_ROOT, "diagnostics");
+  await fsp.mkdir(diagnosticsDir, { recursive: true });
+  const minWindowFrames = req.body?.minWindowFrames ? Number(req.body.minWindowFrames) : HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES;
+
+  console.log(`[diagnóstico híbrido ${jobId}] iniciando -- minWindowFrames=${minWindowFrames}, fuente=${sourceDiag.width}x${sourceDiag.height}, destino=${dims.width}x${dims.height}.`);
+  const result = await runHybridDiagnostic({
+    job,
+    jobRelPath: `uploads/jobs/${jobId}.json`,
+    sourceVideoAbsolutePath: baseVideoAbsolutePath,
+    destWidth: dims.width,
+    destHeight: dims.height,
+    srcWidth: sourceDiag.width,
+    srcHeight: sourceDiag.height,
+    fps: ENGINE_FPS,
+    ffmpegPath: resolveFfmpeg(),
+    ffprobePath: resolveFfprobe(),
+    env: process.env,
+    cwd: PROJECT_ROOT,
+    bundleDir: HYBRID_BUNDLE_DIR,
+    bundleVersionTag: HYBRID_BUNDLE_VERSION_TAG,
+    diagnosticsDir,
+    concurrency: REMOTION_CONCURRENCY,
+    enableMultiprocessOnLinux: ENABLE_MULTIPROCESS_ON_LINUX,
+    browserExecutable: REMOTION_BROWSER_EXECUTABLE,
+    binariesDirectory: REMOTION_BINARIES_DIRECTORY,
+    fuseGapFrames: HYBRID_FUSE_GAP_FRAMES,
+    maxCompositePercent: HYBRID_MAX_COMPOSITE_PERCENT,
+    minWindowFrames,
+    crf: HYBRID_CRF,
+    preset: HYBRID_X264_PRESET,
+    gopSize: HYBRID_GOP_SIZE,
+    timeoutMs: RENDER_DIAGNOSE_TIMEOUT_MINUTES * 60 * 1000 * 2, // el doble: esto hace DOS renders de la ventana (híbrido + línea base) más el bundle
+    onLog: (msg) => console.log(`[diagnóstico híbrido ${jobId}] ${msg}`),
+  });
+  console.log(`[diagnóstico híbrido ${jobId}] terminado -- ok=${result.ok} ${result.ok ? `chunksMs=${result.chunksMs} assembleMs=${result.assemble.totalMs} baselineFullRenderMs=${result.baselineFullRenderMs} psnr=${result.equivalence.averagePsnr}` : `error=${result.error}`}`);
+
+  res.json({ jobId, ...result });
 });
 
 app.get("/jobs/:id/download", (req, res) => {

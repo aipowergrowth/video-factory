@@ -22,8 +22,12 @@ on:
       - "server/segment-planner.mjs"
       - "server/segment-render.mjs"
       - "server/segment-assemble.mjs"
+      - "server/segment-pipeline.mjs"
+      - "server/render-bundle.mjs"
+      - "server/render-diagnose-hybrid.mjs"
       - "server/video-compare.mjs"
       - "server/test-render-observability.mjs"
+      - "server/test-hybrid-render.mjs"
       - ".github/workflows/captions-destination-test.yml"
   pull_request:
     paths:
@@ -39,8 +43,12 @@ on:
       - "server/segment-planner.mjs"
       - "server/segment-render.mjs"
       - "server/segment-assemble.mjs"
+      - "server/segment-pipeline.mjs"
+      - "server/render-bundle.mjs"
+      - "server/render-diagnose-hybrid.mjs"
       - "server/video-compare.mjs"
       - "server/test-render-observability.mjs"
+      - "server/test-hybrid-render.mjs"
   workflow_dispatch: {}
 
 jobs:
@@ -66,3 +74,6 @@ jobs:
 
       - name: Observabilidad del render con FFmpeg/Chrome reales (progreso, timeout, cancelación)
         run: node server/test-render-observability.mjs
+
+      - name: Render híbrido con FFmpeg/Chrome reales (ensamblado sin recodificar, FPS variable, verificación de integridad)
+        run: node server/test-hybrid-render.mjs

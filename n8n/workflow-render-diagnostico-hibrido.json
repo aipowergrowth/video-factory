@@ -1,0 +1,169 @@
+{
+  "name": "Fabrica Videos - Render de diagnóstico híbrido",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-640, 0],
+      "id": "trigger-manual",
+      "name": "Ejecutar manualmente"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "jobid-field",
+              "name": "jobId",
+              "value": "PEGA_AQUI_EL_JOBID",
+              "type": "string"
+            },
+            {
+              "id": "minwindow-field",
+              "name": "minWindowFrames",
+              "value": 150,
+              "type": "number",
+              "notes": "Cuadros mínimos de la ventana de medición (150 = 5s a 30fps). Se extiende sola para cubrir el primer tramo compuesto completo -- no hace falta ajustarlo salvo que se quiera una ventana más larga a propósito."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-400, 0],
+      "id": "jobid",
+      "name": "jobId a diagnosticar (híbrido)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://fabrica-videos-engine:3001/jobs/{{ $json.jobId }}/diagnose-hybrid",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "minWindowFrames",
+              "value": "={{ $json.minWindowFrames }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 0],
+      "id": "lanzar-diagnostico-hibrido",
+      "name": "Lanzar render de diagnóstico híbrido",
+      "notes": "Render híbrido (Fase 0, 14-nov-2026) -- mide, sobre una VENTANA corta del job real (unos pocos segundos, extendida sola para cubrir el primer tramo compuesto), el pipeline COMPLETO: bundle, tramos planos (FFmpeg), tramos compuestos (Remotion), ensamblado, Y lo compara contra un render completo de esa misma ventana (tiempo, PSNR). Memoria/CPU del contenedor durante TODO el proceso, no solo Remotion. Sin costo de API, sin tocar el job real ni OUTPUTS_DIR. Tarda hasta 2x RENDER_DIAGNOSE_TIMEOUT_MINUTES (dos renders de la ventana + el bundle) -- timeout del nodo HTTP en 600s, generoso."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "r-ok",
+              "name": "ok",
+              "value": "={{ $json.ok }}",
+              "type": "boolean"
+            },
+            {
+              "id": "r-error",
+              "name": "error",
+              "value": "={{ $json.error }}",
+              "type": "string"
+            },
+            {
+              "id": "r-decision",
+              "name": "decisionDeModo",
+              "value": "={{ $json.decision }}",
+              "type": "object",
+              "notes": "mode ('hybrid'/'full') y reason -- qué habría decidido el planificador para el job COMPLETO (no solo la ventana medida)."
+            },
+            {
+              "id": "r-window",
+              "name": "ventanaMedida",
+              "value": "={{ { frames: $json.windowFrames, seconds: $json.windowSeconds } }}",
+              "type": "object"
+            },
+            {
+              "id": "r-bundle",
+              "name": "bundle",
+              "value": "={{ $json.bundle }}",
+              "type": "object",
+              "notes": "reused (true/false) y ms -- cuánto tardó construir el bundle de Remotion (solo la primera vez por versión de imagen)."
+            },
+            {
+              "id": "r-segments",
+              "name": "tramos",
+              "value": "={{ $json.segments }}",
+              "type": "array",
+              "notes": "Un registro por tramo: type (plain/composite), frames, renderMs, startupMs (solo compuestos), copiedFraction (solo planos -- qué fracción se copió sin recodificar), checksum."
+            },
+            {
+              "id": "r-chunksms",
+              "name": "msTramos",
+              "value": "={{ $json.chunksMs }}",
+              "type": "number",
+              "notes": "Tiempo TOTAL de renderizar todos los tramos de la ventana (suma de FFmpeg+Remotion)."
+            },
+            {
+              "id": "r-assemble",
+              "name": "ensamblado",
+              "value": "={{ $json.assemble }}",
+              "type": "object",
+              "notes": "stages: concatMs (unión SIN recodificar), audioMs, muxMs."
+            },
+            {
+              "id": "r-baseline",
+              "name": "msRenderCompletoDeLaMismaVentana",
+              "value": "={{ $json.baselineFullRenderMs }}",
+              "type": "number"
+            },
+            {
+              "id": "r-speedup",
+              "name": "factorDeAceleracion",
+              "value": "={{ $json.speedupRatio }}",
+              "type": "number",
+              "notes": "msRenderCompletoDeLaMismaVentana / (msTramos + ensamblado + bundle) -- >1 significa que el híbrido fue más rápido en ESTA ventana."
+            },
+            {
+              "id": "r-equivalence",
+              "name": "equivalenciaVisual",
+              "value": "={{ $json.equivalence }}",
+              "type": "object",
+              "notes": "averagePsnr/minPsnr (dB, >30 es buena señal, Infinity = idéntico) y frameCountMismatch (debe ser false)."
+            },
+            {
+              "id": "r-metrics",
+              "name": "memoriaYCpuDelContenedor",
+              "value": "={{ $json.containerMetrics }}",
+              "type": "object",
+              "notes": "peakMemoryMB/avgMemoryMB, peakCpuCores/avgCpuCores -- durante TODO el proceso (bundle+tramos+ensamblado), no solo Remotion."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [100, 0],
+      "id": "resumen-diagnostico-hibrido",
+      "name": "Resumen del diagnóstico híbrido"
+    }
+  ],
+  "connections": {
+    "Ejecutar manualmente": {
+      "main": [[{ "node": "jobId a diagnosticar (híbrido)", "type": "main", "index": 0 }]]
+    },
+    "jobId a diagnosticar (híbrido)": {
+      "main": [[{ "node": "Lanzar render de diagnóstico híbrido", "type": "main", "index": 0 }]]
+    },
+    "Lanzar render de diagnóstico híbrido": {
+      "main": [[{ "node": "Resumen del diagnóstico híbrido", "type": "main", "index": 0 }]]
+    }
+  }
+}
