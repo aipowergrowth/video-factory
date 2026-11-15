@@ -16,15 +16,37 @@
             {
               "id": "jobid-field",
               "name": "jobId",
-              "value": "PEGA_AQUI_EL_JOBID",
-              "type": "string"
+              "value": "1fd239de-8f9e-4642-8e42-d848b17d8481",
+              "type": "string",
+              "notes": "El job real de 23min usado en la primera medición (14-nov-2026). Cambiar solo si venció su retención de 7 días o si se quiere medir otro job."
             },
             {
               "id": "minwindow-field",
               "name": "minWindowFrames",
-              "value": 150,
+              "value": 3600,
               "type": "number",
-              "notes": "Cuadros mínimos de la ventana de medición (150 = 5s a 30fps). Se extiende sola para cubrir el primer tramo compuesto completo -- no hace falta ajustarlo salvo que se quiera una ventana más larga a propósito."
+              "notes": "Piso de la ventana REPRESENTATIVA (adenda, 14-nov-2026): 3600 cuadros = 2min a 30fps. La ventana se dimensiona sola a partir del tramo compuesto real para quedar por debajo de targetCompositeFraction (15%) -- la versión anterior de esto daba 63% compuesto, nada representativo."
+            },
+            {
+              "id": "maxwindow-field",
+              "name": "maxWindowFrames",
+              "value": 5400,
+              "type": "number",
+              "notes": "Techo de la ventana: 5400 cuadros = 3min a 30fps. Si el tramo compuesto es tan grande que ni con este techo se llega a <15% compuesto, la ventana queda en este techo igual (el resultado trae achievedCompositeFraction con el % REAL logrado, nunca lo esconde)."
+            },
+            {
+              "id": "x264preset-field",
+              "name": "x264Preset",
+              "value": "",
+              "type": "string",
+              "notes": "Criterio 5 (adenda): deja VACÍO para usar el preset real de producción (HYBRID_X264_PRESET, 'medium' por defecto). Para comparar velocidad/calidad de otros presets SIN reconstruir la imagen, poner aquí 'veryfast', 'fast', 'slow', etc. y volver a ejecutar -- comparar msTramos y equivalenciaVisual.bySegment entre corridas."
+            },
+            {
+              "id": "parallel-field",
+              "name": "parallelPlainWithComposite",
+              "value": true,
+              "type": "boolean",
+              "notes": "Criterio 4 (adenda): true = tramos planos (FFmpeg) EN PARALELO con los compuestos (Remotion). Poner en false y volver a ejecutar para comparar contra el comportamiento secuencial anterior (comparar msTramos y memoriaYCpuDelContenedor.picoMemoriaAnonimaMB entre las dos corridas)."
             }
           ]
         },
@@ -43,10 +65,10 @@
         "sendBody": true,
         "bodyParameters": {
           "parameters": [
-            {
-              "name": "minWindowFrames",
-              "value": "={{ $json.minWindowFrames }}"
-            }
+            { "name": "minWindowFrames", "value": "={{ $json.minWindowFrames }}" },
+            { "name": "maxWindowFrames", "value": "={{ $json.maxWindowFrames }}" },
+            { "name": "x264Preset", "value": "={{ $json.x264Preset }}" },
+            { "name": "parallelPlainWithComposite", "value": "={{ $json.parallelPlainWithComposite }}" }
           ]
         },
         "options": {
@@ -58,7 +80,7 @@
       "position": [-160, 0],
       "id": "lanzar-diagnostico-hibrido",
       "name": "Lanzar render de diagnóstico híbrido",
-      "notes": "Render híbrido (Fase 0, 14-nov-2026) -- mide, sobre una VENTANA corta del job real (unos pocos segundos, extendida sola para cubrir el primer tramo compuesto), el pipeline COMPLETO: bundle, tramos planos (FFmpeg), tramos compuestos (Remotion), ensamblado, Y lo compara contra un render completo de esa misma ventana (tiempo, PSNR). Memoria/CPU del contenedor durante TODO el proceso, no solo Remotion. Sin costo de API, sin tocar el job real ni OUTPUTS_DIR. Tarda hasta 2x RENDER_DIAGNOSE_TIMEOUT_MINUTES (dos renders de la ventana + el bundle) -- timeout del nodo HTTP en 600s, generoso."
+      "notes": "Render híbrido (Fase 0, 14-nov-2026; ampliado por la adenda del mismo día tras la primera medición real) -- mide, sobre una ventana REPRESENTATIVA del job real (2-3min, <15% compuesto, centrada en un tramo compuesto real), el pipeline COMPLETO: bundle, tramos planos (FFmpeg) y compuestos (Remotion) -- en paralelo si parallelPlainWithComposite=true --, ensamblado, Y lo compara contra un render completo de esa misma ventana: duración exacta en cuadros, sincronía de audio, PSNR por tramo y por empalme. Memoria (con desglose anónima/caché) y CPU del contenedor durante TODO el proceso, no solo Remotion. Sin costo de API, sin tocar el job real ni OUTPUTS_DIR. Tarda hasta 2x RENDER_DIAGNOSE_TIMEOUT_MINUTES (dos renders de la ventana + el bundle) -- timeout del nodo HTTP en 600s, generoso."
     },
     {
       "parameters": {
@@ -77,17 +99,32 @@
               "type": "string"
             },
             {
+              "id": "r-preset",
+              "name": "presetUsado",
+              "value": "={{ $json.preset }}",
+              "type": "string",
+              "notes": "Qué preset de x264 se usó en esta corrida (criterio 5) -- el real de producción si x264Preset quedó vacío arriba."
+            },
+            {
+              "id": "r-parallel",
+              "name": "paraleloUsado",
+              "value": "={{ $json.parallelPlainWithComposite }}",
+              "type": "boolean",
+              "notes": "Si esta corrida ejecutó los tramos planos en paralelo con los compuestos (criterio 4)."
+            },
+            {
               "id": "r-decision",
               "name": "decisionDeModo",
               "value": "={{ $json.decision }}",
               "type": "object",
-              "notes": "mode ('hybrid'/'full') y reason -- qué habría decidido el planificador para el job COMPLETO (no solo la ventana medida)."
+              "notes": "mode ('hybrid'/'full') y reason -- qué habría decidido el planificador para el job COMPLETO (no solo la ventana medida). El reason ya no dice 'undefined corrida(s)' (defecto corregido)."
             },
             {
               "id": "r-window",
               "name": "ventanaMedida",
-              "value": "={{ { frames: $json.windowFrames, seconds: $json.windowSeconds } }}",
-              "type": "object"
+              "value": "={{ { cuadroInicio: $json.windowStartFrame, frames: $json.windowFrames, seconds: $json.windowSeconds, porcentajeCompuestoLogrado: $json.achievedCompositeFraction } }}",
+              "type": "object",
+              "notes": "cuadroInicio casi nunca es 0 -- la ventana queda CENTRADA sobre un tramo compuesto real, no forzada a arrancar desde el principio del video. porcentajeCompuestoLogrado por encima de 0.15 significa que el video no tiene margen plano suficiente alrededor de ese tramo para bajarlo más (se dice con evidencia, nunca se esconde)."
             },
             {
               "id": "r-bundle",
@@ -101,14 +138,14 @@
               "name": "tramos",
               "value": "={{ $json.segments }}",
               "type": "array",
-              "notes": "Un registro por tramo: type (plain/composite), frames, renderMs, startupMs (solo compuestos), copiedFraction (solo planos -- qué fracción se copió sin recodificar), checksum."
+              "notes": "Un registro por tramo: type (plain/composite), outputStartFrame/outputEndFrame, renderMs, startupMs (solo compuestos), copiedFraction (solo planos -- qué fracción se copió sin recodificar), checksum. Dividiendo (outputEndFrame-outputStartFrame) / (renderMs/1000) da los cuadros/segundo REALES por tipo de tramo -- la base para cualquier extrapolación (que debe marcarse CALCULADA, nunca medida)."
             },
             {
               "id": "r-chunksms",
               "name": "msTramos",
               "value": "={{ $json.chunksMs }}",
               "type": "number",
-              "notes": "Tiempo TOTAL de renderizar todos los tramos de la ventana (suma de FFmpeg+Remotion)."
+              "notes": "Tiempo de renderizar todos los tramos de la ventana (FFmpeg+Remotion, en paralelo o en serie según paraleloUsado)."
             },
             {
               "id": "r-assemble",
@@ -116,6 +153,13 @@
               "value": "={{ $json.assemble }}",
               "type": "object",
               "notes": "stages: concatMs (unión SIN recodificar), audioMs, muxMs."
+            },
+            {
+              "id": "r-rendertotal",
+              "name": "msRenderHibridoTotal",
+              "value": "={{ $json.renderMs }}",
+              "type": "number",
+              "notes": "bundle + tramos + ensamblado -- el tiempo TOTAL real de producir el .mp4 final de la ventana (criterio 7b: \"con el ensamblado completo dentro del tiempo medido\")."
             },
             {
               "id": "r-baseline",
@@ -128,21 +172,21 @@
               "name": "factorDeAceleracion",
               "value": "={{ $json.speedupRatio }}",
               "type": "number",
-              "notes": "msRenderCompletoDeLaMismaVentana / (msTramos + ensamblado + bundle) -- >1 significa que el híbrido fue más rápido en ESTA ventana."
+              "notes": "msRenderCompletoDeLaMismaVentana / msRenderHibridoTotal -- >1 significa que el híbrido fue más rápido en ESTA ventana."
             },
             {
               "id": "r-equivalence",
               "name": "equivalenciaVisual",
-              "value": "={{ $json.equivalence }}",
+              "value": "={{ { cuadrosExactos: $json.equivalence.frameCountExact, cuadrosHibrido: $json.equivalence.hybridVideoFrames, cuadrosCompleto: $json.equivalence.baselineVideoFrames, sincroniaDeAudioOk: $json.equivalence.audioSyncOk, diferenciaDeAudioSegundos: $json.equivalence.audioSyncDiffSeconds, psnrPromedio: $json.equivalence.averagePsnr, psnrMinimo: $json.equivalence.minPsnr, porTramo: $json.equivalence.bySegment.byChunk, porEmpalme: $json.equivalence.bySegment.byBoundary } }}",
               "type": "object",
-              "notes": "averagePsnr/minPsnr (dB, >30 es buena señal, Infinity = idéntico) y frameCountMismatch (debe ser false)."
+              "notes": "cuadrosExactos debe ser true (duración exacta en cuadros, criterio 7b). psnrPromedio/psnrMinimo son GLOBALES (>22dB es buena señal con contenido real, no el patrón sintético adversarial de las pruebas de CI) -- pero el dato que de verdad localiza un defecto es porEmpalme: cada entrada trae boundaryFrame/fromType/toType/averagePsnr/minPsnr de la ventana justo alrededor de esa frontera. porTramo da lo mismo por cada tramo completo (plano o compuesto) por separado."
             },
             {
               "id": "r-metrics",
               "name": "memoriaYCpuDelContenedor",
-              "value": "={{ $json.containerMetrics }}",
+              "value": "={{ { picoMemoriaTotalMB: $json.containerMetrics.peakMemoryMB, picoMemoriaAnonimaMB: $json.containerMetrics.peakAnonMemoryMB, promedioMemoriaAnonimaMB: $json.containerMetrics.avgAnonMemoryMB, picoCpuNucleos: $json.containerMetrics.peakCpuCores, promedioCpuNucleos: $json.containerMetrics.avgCpuCores, porcentajeCpuPico: $json.containerMetrics.peakCpuPercentOfLimit, porcentajeCpuPromedio: $json.containerMetrics.avgCpuPercentOfLimit } }}",
               "type": "object",
-              "notes": "peakMemoryMB/avgMemoryMB, peakCpuCores/avgCpuCores -- durante TODO el proceso (bundle+tramos+ensamblado), no solo Remotion."
+              "notes": "picoMemoriaTotalMB (con caché de archivos, reclamable) vs picoMemoriaAnonimaMB (memoria real, la que de verdad puede provocar un OOM-kill -- criterio 3). Si picoMemoriaAnonimaMB queda bien por debajo de 6144MB aunque picoMemoriaTotalMB esté cerca, el pico anterior era caché, no un riesgo real."
             }
           ]
         },

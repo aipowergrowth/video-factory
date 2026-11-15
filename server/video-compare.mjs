@@ -23,7 +23,34 @@
 //   detectar cuadros desalineados/corruptos (que es lo que se busca),
 //   con un costo de memoria acotado (los dos flujos se leen en
 //   paralelo cuadro a cuadro, nunca se cargan completos).
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Conteo EXACTO de cuadros de video de un archivo -- paquetes de
+ * `ffprobe`, el mismo mecanismo ya probado real en CI (confirmado que
+ * `-count_frames`/`nb_read_frames` da `NaN` en el ffmpeg recortado de
+ * Remotion; contar paquetes h264 es exacto). Usado para la
+ * equivalencia de "duración exacta en cuadros" (adenda criterio 7b)
+ * sin depender del campo `duration` del contenedor.
+ */
+export const countVideoPackets = async (ffprobePath, env, filePath) => {
+  const { stdout } = await execFileAsync(ffprobePath, ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "json", filePath], { env, maxBuffer: 16 * 1024 * 1024 });
+  return (JSON.parse(stdout).packets ?? []).length;
+};
+
+/** Duración (segundos) de un stream (`"v:0"`/`"a:0"`) vía ffprobe -- usado para sincronía de audio/video (adenda criterio 7b). `null` si el stream no existe o no se pudo leer. */
+export const probeStreamDuration = async (ffprobePath, env, filePath, streamSelector) => {
+  try {
+    const { stdout } = await execFileAsync(ffprobePath, ["-v", "error", "-select_streams", streamSelector, "-show_entries", "stream=duration", "-of", "csv=p=0", filePath], { env });
+    const value = Number(stdout.trim());
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
+};
 
 /**
  * PSNR promedio (dB) con el filtro `psnr` real de FFmpeg. Compara
@@ -134,14 +161,65 @@ const createFrameReader = (stream, frameBytes, { highWaterFrames = 8 } = {}) => 
 };
 
 /**
+ * Desglosa una serie de PSNR por cuadro (en espacio de cuadros de
+ * SALIDA, uno por índice) en resúmenes POR TRAMO y POR EMPALME -- pura.
+ *
+ * Adenda del auditor, 14-nov-2026, criterio 2: "reporte PSNR por tramo
+ * y en cada empalme" -- antes solo existía un promedio/mínimo GLOBAL
+ * de todo el video, que no distingue "un defecto real en UN empalme"
+ * de "ruido parejo en todos lados" (el 13,8dB mínimo medido en el VPS
+ * podía ser cualquiera de los dos, sin esto no había forma de saber
+ * cuál). `chunks` es la lista de `planChunks` (cada uno con
+ * `outputStartFrame`/`outputEndFrame`/`type`); `byBoundary` cubre una
+ * ventana de `boundaryMarginFrames` cuadros a cada lado de CADA punto
+ * donde un tramo termina y el siguiente empieza -- el lugar exacto
+ * donde viviría un defecto de empalme si lo hay.
+ */
+export const summarizePsnrByChunks = (values, chunks, { boundaryMarginFrames = 5 } = {}) => {
+  if (!Array.isArray(chunks) || chunks.length === 0 || !Array.isArray(values)) return { byChunk: [], byBoundary: [] };
+  const byChunk = chunks.map((c) => {
+    const slice = values.slice(c.outputStartFrame, c.outputEndFrame);
+    return { type: c.type, outputStartFrame: c.outputStartFrame, outputEndFrame: c.outputEndFrame, ...summarizePsnrSeries(slice) };
+  });
+  const byBoundary = [];
+  for (let i = 1; i < chunks.length; i++) {
+    const boundaryFrame = chunks[i].outputStartFrame;
+    const windowStart = Math.max(0, boundaryFrame - boundaryMarginFrames);
+    const windowEnd = Math.min(values.length, boundaryFrame + boundaryMarginFrames);
+    const slice = values.slice(windowStart, windowEnd);
+    byBoundary.push({ boundaryFrame, fromType: chunks[i - 1].type, toType: chunks[i].type, windowStart, windowEnd, ...summarizePsnrSeries(slice) });
+  }
+  return { byChunk, byBoundary };
+};
+
+/**
  * PSNR cuadro a cuadro entre dos videos decodificados en paralelo con
  * `ffmpegPath` (el de Remotion sirve). Devuelve el resumen de
  * `summarizePsnrSeries` más el conteo total de cuadros de cada lado
  * (si difieren, la comparación solo cubre los comunes y
  * `frameCountMismatch` queda en true -- eso YA es un fallo de
  * equivalencia aunque el PSNR sea alto).
+ *
+ * `fps` (adenda criterio 2, 14-nov-2026 -- causa raíz real del PSNR
+ * mínimo de 13,8dB medido en el VPS): SIN esto, los cuadros se
+ * emparejaban por POSICIÓN de lectura cruda -- si un lado tiene una
+ * discontinuidad de timestamps en un empalme (normal, documentado en
+ * `concatTsFiles`) que hace que el decodificador entregue los cuadros
+ * en un orden/cadencia levemente distinto al del otro lado, el cuadro
+ * N de un archivo deja de corresponder al cuadro N del otro -- un
+ * desajuste de POSICIÓN, no de contenido, que esta herramienta
+ * confundía con un defecto visual real. `-r <fps>` como opción de
+ * SALIDA de AMBAS decodificaciones fuerza a cada una a entregar
+ * EXACTAMENTE un cuadro por cada 1/fps de tiempo de PRESENTACIÓN
+ * (duplicando/descartando cuadros para lograrlo, el mismo mecanismo ya
+ * usado y probado en `buildPlainPieceFfmpegArgs`) -- así el cuadro N
+ * de cualquiera de los dos lados representa el MISMO instante nominal,
+ * y comparar por posición ya es, por construcción, comparar por
+ * tiempo de presentación. `chunks` (opcional, ver
+ * `summarizePsnrByChunks`): si se da, el resultado trae `bySegment`
+ * con el desglose por tramo y por empalme.
  */
-export const compareVideosPsnr = ({ ffmpegPath, env, pathA, pathB, width = 320, height = 180 }) =>
+export const compareVideosPsnr = ({ ffmpegPath, env, pathA, pathB, width = 320, height = 180, fps, chunks, boundaryMarginFrames = 5 }) =>
   new Promise((resolve) => {
     const frameBytes = width * height;
     // `+genpts+igndts` -- confirmado real en CI, 14-nov-2026: SIN estas
@@ -151,7 +229,17 @@ export const compareVideosPsnr = ({ ffmpegPath, env, pathA, pathB, width = 320, 
     // esta lectura, no del archivo). Mismas banderas que
     // `verifyChunkIntegrity` y el remux final, por la misma causa:
     // discontinuidades de PTS/DTS normales entre tramos.
-    const spawnRaw = (p) => spawn(ffmpegPath, ["-v", "error", "-fflags", "+genpts+igndts", "-nostdin", "-i", p, "-an", "-vf", `scale=${width}:${height}:flags=bilinear`, "-pix_fmt", "gray", "-f", "image2pipe", "-c:v", "rawvideo", "pipe:1"], { env });
+    const spawnRaw = (p) =>
+      spawn(
+        ffmpegPath,
+        [
+          "-v", "error", "-fflags", "+genpts+igndts", "-nostdin", "-i", p, "-an",
+          "-vf", `scale=${width}:${height}:flags=bilinear`,
+          ...(fps ? ["-r", String(fps)] : []),
+          "-pix_fmt", "gray", "-f", "image2pipe", "-c:v", "rawvideo", "pipe:1",
+        ],
+        { env },
+      );
     const a = spawnRaw(pathA);
     const b = spawnRaw(pathB);
     let stderr = "";
@@ -191,6 +279,7 @@ export const compareVideosPsnr = ({ ffmpegPath, env, pathA, pathB, width = 320, 
         values.push(computeFramePsnr(fa, fb));
       }
       await Promise.all([a, b].map((child) => new Promise((r) => (child.exitCode !== null ? r() : child.once("close", r)))));
-      resolve({ ...summarizePsnrSeries(values), framesA, framesB, frameCountMismatch: framesA !== framesB, width, height, stderrTail: stderr });
-    })().catch((err) => resolve({ framesCompared: 0, identicalFrames: 0, averagePsnr: null, minPsnr: null, framesA: null, framesB: null, frameCountMismatch: true, stderrTail: `${stderr} ${err?.message ?? err}` }));
+      const bySegment = chunks ? summarizePsnrByChunks(values, chunks, { boundaryMarginFrames }) : null;
+      resolve({ ...summarizePsnrSeries(values), framesA, framesB, frameCountMismatch: framesA !== framesB, width, height, fps: fps ?? null, bySegment, stderrTail: stderr });
+    })().catch((err) => resolve({ framesCompared: 0, identicalFrames: 0, averagePsnr: null, minPsnr: null, framesA: null, framesB: null, frameCountMismatch: true, bySegment: null, stderrTail: `${stderr} ${err?.message ?? err}` }));
   });

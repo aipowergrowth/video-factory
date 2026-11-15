@@ -9,7 +9,7 @@
 // Linux real) -- no se puede ejecutar un render real en esta máquina
 // de desarrollo (ver README.md).
 
-import { buildPlainPieceFfmpegArgs, computeObjectFitCover, buildObjectFitCoverFilter, canStreamCopyPlainChunks, planPlainChunkPieces } from "./segment-render.mjs";
+import { buildPlainPieceFfmpegArgs, computeObjectFitCover, buildObjectFitCoverFilter, canStreamCopyPlainChunks, planPlainChunkPieces, classifyFrameTimingVariability, nativeFpsMatchesDestination } from "./segment-render.mjs";
 import { buildAudioFilterComplex, buildTsToMp4ConcatArgs } from "./segment-assemble.mjs";
 
 let failures = 0;
@@ -41,7 +41,18 @@ const check = (label, cond, detail = "") => {
 {
   // Misma resolución pero fuente VFR: false -- una copia de flujo no puede normalizar a FPS constante (adenda criterio 3/B).
   check("canStreamCopyPlainChunks: misma resolución pero fuente VFR -- false (la copia no puede normalizar FPS, solo recodificar puede)", canStreamCopyPlainChunks(1920, 1080, 1920, 1080, true) === false);
-  check("canStreamCopyPlainChunks: misma resolución, sourceIsVfr sin dar (por defecto false) -- true, comportamiento sin cambios", canStreamCopyPlainChunks(1920, 1080, 1920, 1080) === true);
+  check("canStreamCopyPlainChunks: misma resolución, disableStreamCopy sin dar (por defecto false) -- true, comportamiento sin cambios", canStreamCopyPlainChunks(1920, 1080, 1920, 1080) === true);
+}
+
+// --- nativeFpsMatchesDestination (adenda criterio 1/3-B, 14-nov-2026 -- causa raíz real de CI: una fuente CFR real puede seguir dando un conteo de cuadros equivocado si su FPS nativo no es el de salida) ---
+
+{
+  check("nativeFpsMatchesDestination: 30 contra 30 -- coincide exacto", nativeFpsMatchesDestination(30, 30) === true);
+  check("nativeFpsMatchesDestination: 29.97 (NTSC real) contra 30 declarado -- coincide (0,1% de diferencia, puro redondeo)", nativeFpsMatchesDestination(29.97002997002997, 30) === true);
+  check("nativeFpsMatchesDestination: 24 contra 30 -- NO coincide (20% de diferencia, el caso real de CI: fuente CFR a 24fps, salida a 30fps)", nativeFpsMatchesDestination(24, 30) === false);
+  check("nativeFpsMatchesDestination: 25 contra 30 -- NO coincide (16,7% de diferencia)", nativeFpsMatchesDestination(25, 30) === false);
+  check("nativeFpsMatchesDestination: declaredFps nulo -- false, nunca lanza", nativeFpsMatchesDestination(null, 30) === false);
+  check("nativeFpsMatchesDestination: destFps cero -- false, nunca lanza", nativeFpsMatchesDestination(30, 0) === false);
 }
 
 {
@@ -52,6 +63,44 @@ const check = (label, cond, detail = "") => {
   const filter = buildObjectFitCoverFilter(1200, 900, 1920, 1080);
   check("buildObjectFitCoverFilter: arma scale+crop con esos valores exactos", filter === "scale=1920:1440:flags=lanczos,crop=1920:1080:0:180", filter);
 }
+
+// --- classifyFrameTimingVariability (adenda criterio 1, 14-nov-2026 -- mide, no compara texto) ---
+
+{
+  // Caso REAL del VPS, job 1fd239de: declarado 30fps, promedio medido 29,9987fps (0,004% de diferencia) -- puro redondeo del contenedor, NUNCA debe clasificarse como VFR.
+  // Simula 300 cuadros (10s) a un intervalo real de 1/29.9987s (en vez de exactamente 1/30s) -- la misma magnitud de desvío que el job real.
+  const realIntervalSeconds = 1 / 29.9987;
+  const presentationTimes = Array.from({ length: 300 }, (_, i) => i * realIntervalSeconds);
+  const result = classifyFrameTimingVariability(presentationTimes, 30);
+  check("caso real del VPS (30 declarado vs 29.9987 medido, 0,004% de diferencia): NUNCA se clasifica como VFR (antes, comparando como texto, SIEMPRE salía VFR)", result.isVfr === false, JSON.stringify(result));
+  check("caso real del VPS: la fracción irregular es prácticamente 0 (el redondeo del encoder, no una fuente variable)", result.irregularFraction < 0.01, `irregularFraction=${result.irregularFraction}`);
+}
+
+{
+  // Fuente GENUINAMENTE variable (como el caso B sintético de test-hybrid-render.mjs): la mitad de los intervalos a 1/24s, la otra mitad a 1/30s -- declarado 30fps.
+  const presentationTimes = [];
+  let t = 0;
+  for (let i = 0; i < 120; i++) {
+    presentationTimes.push(t);
+    t += i < 60 ? 1 / 24 : 1 / 30;
+  }
+  const result = classifyFrameTimingVariability(presentationTimes, 30);
+  check("fuente genuinamente VFR (mitad a 24fps, mitad a 30fps, declarado 30fps): SÍ se clasifica como VFR", result.isVfr === true, JSON.stringify(result));
+  check("fuente genuinamente VFR: la fracción irregular es sustancial (~50%, los cuadros a 24fps se desvían ~25% del intervalo esperado a 30fps)", result.irregularFraction > 0.4, `irregularFraction=${result.irregularFraction}`);
+}
+
+{
+  // Un solo cuadro repetido/perdido AISLADO en 300 (jitter normal de cualquier captura real) -- no debe bastar para marcar VFR (maxIrregularFraction=1% por defecto, esto es 1/299 ≈ 0.33%).
+  const baseInterval = 1 / 30;
+  const presentationTimes = Array.from({ length: 300 }, (_, i) => i * baseInterval);
+  presentationTimes[150] += baseInterval * 0.5; // un solo cuadro con un retraso real de media duración de cuadro -- afecta a los DOS intervalos que lo tocan (el de antes se alarga, el de después se acorta)
+  const result = classifyFrameTimingVariability(presentationTimes, 30);
+  check("un solo cuadro con jitter aislado (2 de 299 intervalos afectados, ~0.67%): no alcanza el umbral de 1% -- no se clasifica como VFR", result.isVfr === false, JSON.stringify(result));
+  check("los DOS intervalos que tocan ese cuadro SÍ se cuentan como irregulares (no se pasan por alto, solo no alcanzan para clasificar toda la fuente)", result.irregularCount === 2, JSON.stringify(result));
+}
+
+check("classifyFrameTimingVariability: menos de 2 tiempos de presentación -- nunca VFR, nunca lanza", classifyFrameTimingVariability([1.0], 30).isVfr === false && classifyFrameTimingVariability([], 30).isVfr === false);
+check("classifyFrameTimingVariability: sin FPS declarado (null, p.ej. ffprobe no lo pudo determinar) -- nunca VFR por defecto, nunca lanza", classifyFrameTimingVariability([0, 0.033, 0.066], null).isVfr === false);
 
 // --- planPlainChunkPieces ---
 

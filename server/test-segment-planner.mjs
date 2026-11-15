@@ -5,7 +5,7 @@
 // (1fd239de y otros) es la puerta G0 -- solo se puede correr en el
 // VPS, ver el informe de esta tarea para los pasos exactos.
 
-import { planSegments, planChunks, fuseCompositeRanges, summarizeChunkPlan, decideRenderMode, chooseMeasurementWindowFrames, clipChunksToWindow, clipTimelineToOutputSeconds } from "./segment-planner.mjs";
+import { planSegments, planChunks, fuseCompositeRanges, summarizeChunkPlan, decideRenderMode, chooseRepresentativeWindow, clipChunksToRange, clipTimelineToOutputRange } from "./segment-planner.mjs";
 import { buildTimeline } from "./timeline.mjs";
 
 let failures = 0;
@@ -298,6 +298,18 @@ check("job de duración 0: planChunks devuelve 0 chunks, nunca lanza", planChunk
   check("híbrido activado, 10% compuesto <= 70%: modo 'hybrid'", decision.mode === "hybrid", decision.reason);
 }
 
+// --- decideRenderMode: con un plan de planChunks (la forma REAL que usan los dos llamadores de producción, NUNCA planSegments) -- defecto real confirmado en el VPS, 14-nov-2026: salía "undefined corrida(s)" porque planChunks no tiene compositeRuns ---
+{
+  const job = baseJob({ overlays: [{ id: "o1", type: "text", text: "x", startSeconds: 1, durationSeconds: 1 }] }); // 10% compuesto, 1 corrida
+  const chunkPlan = planChunks(job);
+  const compositeFrames = chunkPlan.chunks.filter((c) => c.type === "composite").reduce((s, c) => s + c.frames, 0);
+  const planWithPercent = { ...chunkPlan, compositePercent: (compositeFrames / chunkPlan.totalFrames) * 100 };
+  const decision = decideRenderMode({ configuredMode: "hybrid", job, plan: planWithPercent, maxCompositePercent: 70 });
+  check("decideRenderMode con un plan de planChunks: modo 'hybrid'", decision.mode === "hybrid", decision.reason);
+  check("decideRenderMode con un plan de planChunks: el mensaje NUNCA dice 'undefined corrida(s)' (cuenta directo de plan.chunks, no de un campo que no existe ahí)", !decision.reason.includes("undefined"), decision.reason);
+  check("decideRenderMode con un plan de planChunks: el mensaje dice '1 corrida(s) compuesta(s)' (el número real, no undefined)", decision.reason.includes("1 corrida(s) compuesta(s)"), decision.reason);
+}
+
 // --- decideRenderMode: híbrido activado pero el job supera el umbral de % compuesto -- cae a 'full' ---
 {
   const job = baseJob({ zooms: [{ id: "z1", startSeconds: 0, endSeconds: 9, fromScale: 1, toScale: 1.1 }] }); // 90% compuesto
@@ -322,26 +334,47 @@ check("job de duración 0: planChunks devuelve 0 chunks, nunca lanza", planChunk
   check("override='full' en el reintento: fuerza 'full' aunque el servidor tenga RENDER_MODE=hybrid", decision.mode === "full" && /pedido explícitamente/.test(decision.reason));
 }
 
-// --- chooseMeasurementWindowFrames / clipChunksToWindow: la ventana de medición siempre cubre el primer tramo compuesto completo ---
+// --- chooseRepresentativeWindow (adenda del auditor, 14-nov-2026, criterio 7): la ventana se dimensiona a partir del tramo compuesto REAL para que quede por debajo de targetCompositeFraction, no "cubrir el compuesto + un margen fijo" (eso dio 63% compuesto en el VPS real, nada representativo) ---
 {
-  const job = baseJob({ overlays: [{ id: "o1", type: "text", text: "x", startSeconds: 2, durationSeconds: 2 }] }); // compuesto en cuadros 60-120
+  // Job de 60s @ 30fps = 1800 cuadros; un overlay de 2s (60 cuadros) empezando a los 20s (cuadro 600) -- margen plano de sobra antes Y después.
+  const job = baseJob({ input: { type: "recorded-video", baseVideo: "x.mp4", durationInSeconds: 60 }, overlays: [{ id: "o1", type: "text", text: "x", startSeconds: 20, durationSeconds: 2 }] });
   const plan = planChunks(job);
-  const windowFrames = chooseMeasurementWindowFrames(plan, { minWindowFrames: 30, fps: 30 }); // 30 cuadros NO alcanzarían a cubrir el compuesto (termina en 120)
-  check("la ventana se extiende más allá de minWindowFrames para cubrir el primer chunk compuesto completo + 1s de margen", windowFrames >= 120 && windowFrames <= 150, `windowFrames=${windowFrames}`);
+  const { windowStartFrame, windowFrames, achievedCompositeFraction } = chooseRepresentativeWindow(plan, { targetCompositeFraction: 0.15, minWindowFrames: 30, maxWindowFrames: 1000, fps: 30 });
+  check("chooseRepresentativeWindow: windowFrames = compositeFrames/targetCompositeFraction = 60/0.15 = 400 (no un margen fijo)", windowFrames === 400, `windowFrames=${windowFrames}`);
+  check("chooseRepresentativeWindow: logra EXACTO el 15% objetivo cuando hay margen plano de sobra", achievedCompositeFraction === 0.15, `achievedCompositeFraction=${achievedCompositeFraction}`);
+  check("chooseRepresentativeWindow: windowStartFrame es DISTINTO de 0 -- la ventana queda CENTRADA sobre el tramo compuesto (170 cuadros de margen antes, 600-170=430), no forzada a arrancar desde el principio del video", windowStartFrame === 430, `windowStartFrame=${windowStartFrame}`);
 
-  const clipped = clipChunksToWindow(plan, windowFrames);
-  check("clipChunksToWindow: el plan recortado nunca excede totalFrames=windowFrames", clipped.totalFrames === windowFrames);
-  check("clipChunksToWindow: el último chunk se acorta exactamente al límite de la ventana", clipped.chunks[clipped.chunks.length - 1].outputEndFrame === windowFrames);
-  check("clipChunksToWindow: el chunk compuesto completo sigue presente (no se cortó a mitad)", clipped.chunks.some((c) => c.type === "composite" && c.outputStartFrame === 60 && c.outputEndFrame === 120));
+  const clipped = clipChunksToRange(plan, windowStartFrame, windowStartFrame + windowFrames, { fps: 30 });
+  check("clipChunksToRange: totalFrames = el tamaño de la ventana (400), no el del job completo", clipped.totalFrames === 400);
+  check("clipChunksToRange: el chunk compuesto sigue con sus cuadros ABSOLUTOS (600-660) -- Remotion los necesita así para --frames de la composición COMPLETA, no reindexados a la ventana", clipped.chunks.some((c) => c.type === "composite" && c.outputStartFrame === 600 && c.outputEndFrame === 660), JSON.stringify(clipped.chunks));
+  check("clipChunksToRange: el primer chunk (plano) se recorta EXACTO al borde de la ventana (empieza en el cuadro 430, absoluto)", clipped.chunks[0].outputStartFrame === 430);
 }
 
-// --- clipTimelineToOutputSeconds: recorta una línea de tiempo (con cortes) a los primeros N segundos de SALIDA ---
+{
+  // Mismo job, pero maxWindowFrames muy chico (100): no alcanza el 15% -- la función lo dice con evidencia (achievedCompositeFraction), nunca lo esconde.
+  const job = baseJob({ input: { type: "recorded-video", baseVideo: "x.mp4", durationInSeconds: 60 }, overlays: [{ id: "o1", type: "text", text: "x", startSeconds: 20, durationSeconds: 2 }] });
+  const plan = planChunks(job);
+  const { windowFrames, achievedCompositeFraction } = chooseRepresentativeWindow(plan, { targetCompositeFraction: 0.15, minWindowFrames: 30, maxWindowFrames: 100, fps: 30 });
+  check("chooseRepresentativeWindow: con maxWindowFrames=100, la ventana queda acotada a 100 (nunca se pasa del tope por alcanzar el objetivo)", windowFrames === 100, `windowFrames=${windowFrames}`);
+  check("chooseRepresentativeWindow: el % compuesto REAL logrado (60%) queda por ENCIMA del objetivo -- se reporta con el número real, nunca se oculta ni se finge 15%", achievedCompositeFraction === 0.6, `achievedCompositeFraction=${achievedCompositeFraction}`);
+}
+
+{
+  // Sin ningún tramo compuesto: ventana simple desde el cuadro 0, del tamaño mínimo.
+  const job = baseJob({ input: { type: "recorded-video", baseVideo: "x.mp4", durationInSeconds: 60 } });
+  const plan = planChunks(job);
+  const { windowStartFrame, windowFrames, achievedCompositeFraction } = chooseRepresentativeWindow(plan, { targetCompositeFraction: 0.15, minWindowFrames: 150, maxWindowFrames: 1000, fps: 30 });
+  check("chooseRepresentativeWindow sin tramos compuestos: arranca en 0, tamaño minWindowFrames, 0% compuesto", windowStartFrame === 0 && windowFrames === 150 && achievedCompositeFraction === 0);
+}
+
+// --- clipTimelineToOutputRange: recorta una línea de tiempo (con cortes) a un RANGO [inicio, fin) de SALIDA (no solo desde el segundo 0) ---
 {
   const timeline = buildTimeline(10, [{ startSeconds: 4, endSeconds: 6 }]); // salida: 0-4s (de 0-4 original) + 4-8s (de 6-10 original)
-  const clipped = clipTimelineToOutputSeconds(timeline, 5); // los primeros 5s de SALIDA
-  check("clipTimelineToOutputSeconds: outputDurationInSeconds=5", clipped.outputDurationInSeconds === 5);
-  check("clipTimelineToOutputSeconds: 2 tramos (el corte sigue aplicado dentro de la ventana)", clipped.segments.length === 2, JSON.stringify(clipped.segments));
-  check("clipTimelineToOutputSeconds: el segundo tramo se acorta a 1s de salida (4-5s), fuente 6-7s (el corte sigue aplicado)", clipped.segments[1].outputEnd === 5 && clipped.segments[1].sourceEnd === 7, JSON.stringify(clipped.segments[1]));
+  const clipped = clipTimelineToOutputRange(timeline, 1, 5); // ventana de SALIDA 1s-5s (NO desde 0)
+  check("clipTimelineToOutputRange: outputDurationInSeconds = fin-inicio = 4", clipped.outputDurationInSeconds === 4, JSON.stringify(clipped));
+  check("clipTimelineToOutputRange: 2 tramos (el corte sigue aplicado dentro de la ventana)", clipped.segments.length === 2, JSON.stringify(clipped.segments));
+  check("clipTimelineToOutputRange: el primer tramo se reindexa a outputStart=0 (la ventana es su propio archivo, empieza en su propio tiempo 0), pero su sourceStart ABSOLUTO se recorta a 1 (se saltó el primer segundo de fuente)", clipped.segments[0].outputStart === 0 && clipped.segments[0].sourceStart === 1, JSON.stringify(clipped.segments[0]));
+  check("clipTimelineToOutputRange: el segundo tramo se acorta a su fin real de ventana (outputEnd=4, relativo), fuente ABSOLUTA 6-7s (el corte sigue aplicado, nunca se recalcula distinto)", clipped.segments[1].outputEnd === 4 && clipped.segments[1].sourceStart === 6 && clipped.segments[1].sourceEnd === 7, JSON.stringify(clipped.segments[1]));
 }
 
 console.log(failures === 0 ? "\nTODOS LOS TESTS PASARON" : `\n${failures} TEST(S) FALLARON`);

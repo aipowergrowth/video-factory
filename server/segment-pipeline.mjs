@@ -49,6 +49,7 @@ export const runHybridRenderForJob = async ({
   preset,
   gopSize,
   timeoutMs,
+  parallelPlainWithComposite = true,
   onLog = () => {},
   onSegments = () => {},
 }) => {
@@ -82,6 +83,7 @@ export const runHybridRenderForJob = async ({
     preset,
     gopSize,
     timeoutMs,
+    parallelPlainWithComposite,
     onLog,
     onSegment: (s) => {
       segments.push(s);

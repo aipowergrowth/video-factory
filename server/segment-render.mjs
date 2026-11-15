@@ -36,27 +36,134 @@ import crypto from "node:crypto";
 import { runRemotionRender } from "./render-worker.mjs";
 import { ensureRenderBundle } from "./render-bundle.mjs";
 import { concatTsFiles } from "./segment-assemble.mjs";
+import { parseFrameRateFraction } from "./video-normalization.mjs";
+import { hasMemoryHeadroomForAnotherTask, readContainerMemoryLimitBytes } from "./container-metrics.mjs";
 
 const execFileAsync = promisify(execFile);
 
 /**
- * `true` si la fuente declara un FPS que no coincide con su FPS
- * promedio real -- mismo criterio ya usado y probado en
- * `source-video-diagnostics.mjs#probeSourceVideoDiagnostics`
- * (`likelyVfr`), repetido acá liviano (sin el escaneo de paquetes que
- * hace esa función para contar keyframes, innecesario aquí) para no
- * acoplar este módulo a esa función de diagnóstico. `false` si no se
- * pudo determinar (nunca bloquea la copia de flujo por un fallo de
- * sondeo -- el riesgo real, si la fuente SÍ fuera VFR, lo atrapa
- * `verifyChunkIntegrity` de todos modos).
+ * Clasifica si una fuente es de FPS variable MIDIENDO los intervalos
+ * reales entre cuadros consecutivos (en tiempo de PRESENTACIÓN, no de
+ * decodificación) contra el intervalo que el `declaredFps` predice --
+ * pura, para poder probarla con datos hechos a mano.
+ *
+ * Causa raíz real con evidencia del VPS, 14-nov-2026 (adenda del
+ * auditor): la versión anterior comparaba `r_frame_rate` y
+ * `avg_frame_rate` COMO TEXTO ("30/1" vs "4959480/165323") -- el job
+ * real 1fd239de midió 29,9987fps de promedio contra 30fps declarado
+ * (0,004% de diferencia, puro redondeo del contenedor de
+ * duración/cuadros, NO una fuente genuinamente variable), pero como
+ * las cadenas de texto nunca son iguales, TODO job real quedaba
+ * marcado como VFR -- desactivando la copia de GOP siempre, sin
+ * excepción. Medir el intervalo REAL de cada cuadro es la comparación
+ * que de verdad importa: una fuente CFR tiene cuadros a intervalos
+ * prácticamente idénticos (solo el redondeo del encoder, <1% típico);
+ * una fuente VFR genuina (como la sintética de prueba, que mezcla
+ * 24fps y 30fps) tiene MUCHOS intervalos que se desvían ~20-25% del
+ * esperado.
+ *
+ * `toleranceFraction` (15% por defecto): cuánto puede desviarse UN
+ * intervalo del esperado antes de contarlo como "irregular" -- muy por
+ * encima del 0,004% de ruido real medido en el job 1fd239de, muy por
+ * debajo del ~20-25% que muestra una mezcla real de 24/30fps.
+ * `maxIrregularFraction` (1% por defecto): qué fracción de los
+ * intervalos puede ser irregular antes de clasificar la fuente entera
+ * como VFR -- tolera algún cuadro repetido/perdido aislado (normal en
+ * cualquier captura real) sin marcar como VFR una fuente que en
+ * realidad es CFR.
  */
-export const probeSourceIsVfr = async (ffprobePath, env, sourceVideoPath) => {
+export const classifyFrameTimingVariability = (sortedPresentationTimes, declaredFps, { toleranceFraction = 0.15, maxIrregularFraction = 0.01 } = {}) => {
+  if (!Array.isArray(sortedPresentationTimes) || sortedPresentationTimes.length < 2 || !declaredFps || declaredFps <= 0) {
+    return { isVfr: false, irregularCount: 0, totalIntervals: 0, irregularFraction: 0, expectedIntervalSeconds: declaredFps > 0 ? 1 / declaredFps : null };
+  }
+  const expectedIntervalSeconds = 1 / declaredFps;
+  let irregularCount = 0;
+  for (let i = 1; i < sortedPresentationTimes.length; i++) {
+    const delta = sortedPresentationTimes[i] - sortedPresentationTimes[i - 1];
+    const deviation = Math.abs(delta - expectedIntervalSeconds) / expectedIntervalSeconds;
+    if (deviation > toleranceFraction) irregularCount++;
+  }
+  const totalIntervals = sortedPresentationTimes.length - 1;
+  const irregularFraction = totalIntervals > 0 ? Math.round((irregularCount / totalIntervals) * 10000) / 10000 : 0;
+  return { isVfr: irregularFraction > maxIrregularFraction, irregularCount, totalIntervals, irregularFraction, expectedIntervalSeconds };
+};
+
+/**
+ * `true` si el FPS NATIVO medido de la fuente coincide con el FPS de
+ * SALIDA -- pura. `toleranceFraction` (2% por defecto) tolera solo el
+ * redondeo real de fracciones NTSC (29,97 vs 30 difiere ~0,1%); una
+ * fuente genuinamente de otro FPS (24 vs 30 difiere ~20%, 25 vs 30
+ * ~16,7%) queda fuera de ese margen.
+ *
+ * Causa raíz real con evidencia de CI, 14-nov-2026 (segunda corrida de
+ * esta tarea): el caso B de prueba (fuente real, con evidencia de
+ * `classifyFrameTimingVariability`, de FPS CONSTANTE -- 0,48% de
+ * intervalos irregulares, muy por debajo del umbral de VFR) seguía
+ * dando un conteo de cuadros equivocado (110 donde se esperaban 120)
+ * al copiarse sin recodificar, porque su FPS nativo real (24fps) no
+ * es el mismo que el FPS de salida del motor (30fps) -- una copia de
+ * flujo preserva los cuadros REALES del archivo tal cual existen,
+ * nunca los re-muestrea a otro FPS; solo `-r <fps>` (una
+ * recodificación) hace esa conversión. "FPS variable" y "FPS nativo
+ * distinto al de salida" son dos causas DISTINTAS del mismo síntoma
+ * -- un chunk copiado puede tener el conteo de cuadros equivocado por
+ * cualquiera de las dos, y las dos se miden y registran por separado.
+ */
+export const nativeFpsMatchesDestination = (declaredFps, destFps, toleranceFraction = 0.02) => {
+  if (!declaredFps || declaredFps <= 0 || !destFps || destFps <= 0) return false;
+  return Math.abs(declaredFps - destFps) / destFps <= toleranceFraction;
+};
+
+/**
+ * Mide de verdad si un tramo plano de esta fuente se puede copiar sin
+ * volver a codificar -- MIDE la distribución real de tiempos de
+ * presentación de los paquetes de video (ver
+ * `classifyFrameTimingVariability`) Y si el FPS nativo coincide con
+ * el de salida (ver `nativeFpsMatchesDestination`), no compara texto
+ * ni asume que ambos FPS son iguales. Los paquetes de
+ * `ffprobe -show_packets` llegan en orden de DECODIFICACIÓN, no de
+ * presentación (confirmado real, igual que en
+ * `source-video-diagnostics.mjs`: con B-frames, el pts_time de un
+ * paquete puede ser MENOR que el del paquete anterior en la lista) --
+ * por eso se ORDENAN antes de medir los intervalos.
+ *
+ * Fail-safe INVERTIDO respecto a la primera versión de esto (causa
+ * raíz real con evidencia de CI, 14-nov-2026): si el sondeo falla o no
+ * se puede medir, esto devuelve `true` (DESACTIVAR la copia de flujo)
+ * -- no `false`. La razón: el único efecto de esta bandera es decidir
+ * si es seguro copiar GOPs sin recodificar; `verifyChunkIntegrity` SÍ
+ * atrapa después un conteo de cuadros equivocado, pero ahí ya es
+ * demasiado tarde -- no hay una recodificación de respaldo automática,
+ * el chunk entero falla y lanza. El camino seguro ante cualquier duda
+ * es recodificar (más caro, siempre correcto), nunca copiar a ciegas.
+ *
+ * Deja constancia en el log SIEMPRE (no solo cuando desactiva la
+ * copia) -- observabilidad real desde Portainer de qué midió y por
+ * qué decidió lo que decidió.
+ */
+export const probeSourceDisablesStreamCopy = async (ffprobePath, env, sourceVideoPath, destFps, onLog = () => {}) => {
   try {
-    const { stdout } = await execFileAsync(ffprobePath, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate,avg_frame_rate", "-of", "csv=p=0", sourceVideoPath], { env });
-    const [rFrameRate, avgFrameRate] = stdout.trim().split(",");
-    return Boolean(rFrameRate) && Boolean(avgFrameRate) && rFrameRate !== avgFrameRate;
-  } catch {
-    return false;
+    const { stdout: rateOut } = await execFileAsync(ffprobePath, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", sourceVideoPath], { env });
+    const declaredFps = parseFrameRateFraction(rateOut.trim());
+    const { stdout: packetsOut } = await execFileAsync(
+      ffprobePath,
+      ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "json", sourceVideoPath],
+      { env, maxBuffer: 64 * 1024 * 1024 },
+    );
+    const presentationTimes = (JSON.parse(packetsOut).packets ?? [])
+      .map((p) => Number(p.pts_time))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    const classification = classifyFrameTimingVariability(presentationTimes, declaredFps);
+    const fpsMatches = nativeFpsMatchesDestination(declaredFps, destFps);
+    const disable = classification.isVfr || !fpsMatches;
+    onLog(
+      `medición de FPS de la fuente: declaredFps=${declaredFps ?? "?"} fpsDeSalida=${destFps} coincideConSalida=${fpsMatches} intervalos=${classification.totalIntervals} irregulares=${classification.irregularCount} (${(classification.irregularFraction * 100).toFixed(2)}%) variable=${classification.isVfr} -> ${disable ? "se recodifica completo" : "copia de flujo habilitada"}.`,
+    );
+    return disable;
+  } catch (err) {
+    onLog(`no se pudo medir el FPS real de la fuente (${err.message ?? err}) -- por seguridad se recodifica completo en vez de copiar a ciegas.`);
+    return true;
   }
 };
 
@@ -91,26 +198,15 @@ export const buildObjectFitCoverFilter = (srcWidth, srcHeight, destWidth, destHe
 /**
  * `true` si un tramo plano se puede copiar sin volver a codificar
  * píxeles -- solo cuando la fuente YA tiene la resolución exacta de
- * destino (una copia de flujo no puede escalar/recortar) Y la fuente
- * NO es de FPS variable. Pura.
- *
- * La condición de FPS (adenda criterio 3/B, causa raíz real con
- * evidencia de CI, 14-nov-2026): una copia de flujo preserva los
- * cuadros EXACTOS que existen en ese tramo del archivo original, sin
- * ninguna oportunidad de normalizar -- `-r <fps>` (la forma en que
- * este motor normaliza una fuente VFR a una salida de FPS constante)
- * es una opción de SALIDA que solo aplica cuando se está
- * RECODIFICANDO; una copia de flujo no decodifica nada, así que no
- * hay dónde insertar esa normalización. Si la fuente es VFR, un GOP
- * copiado puede tener MENOS (o más) cuadros reales que
- * `duración×fps_objetivo`, sin forma de corregirlo sin recodificar --
- * confirmado real en CI: un chunk de una fuente VFR dio 110 cuadros
- * reales donde se esperaban 120. Para una fuente VFR, TODO el tramo
- * plano se recodifica (más caro, pero el único camino correcto); la
- * optimización de copia de GOP (criterio 2) solo aplica a fuentes de
- * FPS constante.
+ * destino (una copia de flujo no puede escalar/recortar) Y
+ * `disableStreamCopy` es falso (ver `probeSourceDisablesStreamCopy`:
+ * fuente de FPS variable, o FPS nativo distinto al de salida -- en
+ * cualquiera de los dos casos un GOP copiado puede tener un conteo de
+ * cuadros real distinto de `duración×fps_destino`, sin forma de
+ * corregirlo sin recodificar; confirmado real en CI con AMBAS causas
+ * por separado). Pura.
  */
-export const canStreamCopyPlainChunks = (srcWidth, srcHeight, destWidth, destHeight, sourceIsVfr = false) => srcWidth === destWidth && srcHeight === destHeight && !sourceIsVfr;
+export const canStreamCopyPlainChunks = (srcWidth, srcHeight, destWidth, destHeight, disableStreamCopy = false) => srcWidth === destWidth && srcHeight === destHeight && !disableStreamCopy;
 
 /**
  * Cuadros clave (keyframes) del video fuente dentro de una ventana
@@ -232,10 +328,14 @@ export const buildPlainPieceFfmpegArgs = ({ sourceVideoPath, piece, outputPath, 
 };
 
 /** Renderiza un chunk PLANO completo a un .ts -- una o varias piezas (copia + bordes recodificados), unidas sin recodificar de nuevo. Devuelve metadata de evidencia (fracción copiada, piezas). */
-export const renderPlainChunk = async ({ ffmpegPath, ffprobePath, env, sourceVideoPath, chunk, outputPath, destWidth, destHeight, srcWidth, srcHeight, fps, crf, preset, gopSize, workDir, onLog = () => {} }) => {
-  const sourceIsVfr = await probeSourceIsVfr(ffprobePath, env, sourceVideoPath);
-  if (sourceIsVfr) onLog("fuente con FPS variable detectada -- el tramo plano se recodifica completo (la copia de flujo no puede normalizar a FPS constante, solo recodificar puede).");
-  const canCopy = canStreamCopyPlainChunks(srcWidth, srcHeight, destWidth, destHeight, sourceIsVfr);
+export const renderPlainChunk = async ({ ffmpegPath, ffprobePath, env, sourceVideoPath, chunk, outputPath, destWidth, destHeight, srcWidth, srcHeight, fps, crf, preset, gopSize, disableStreamCopy = false, workDir, onLog = () => {} }) => {
+  // `disableStreamCopy` se mide UNA SOLA VEZ por job (en
+  // `renderAllChunks`), nunca por chunk -- medirlo acá escanearía
+  // TODOS los paquetes del video fuente completo por cada tramo plano
+  // del job (para el job real de 23 min, 41.331 cuadros, repetido una
+  // vez por cada uno de sus tramos planos -- caro y completamente
+  // redundante, el resultado es el mismo archivo fuente siempre).
+  const canCopy = canStreamCopyPlainChunks(srcWidth, srcHeight, destWidth, destHeight, disableStreamCopy);
   let keyframeTimes = [];
   if (canCopy) {
     try {
@@ -393,9 +493,58 @@ export const verifyChunkIntegrity = async ({ ffmpegPath, ffprobePath, env, fileP
  * nuevo) -- quien llama puede persistir `segments[]` incrementalmente
  * en el estado del job sin esperar a que termine todo el plan.
  */
-export const renderAllChunks = async ({ plan, chunkOutputDir, sourceVideoPath, propsJobFile, ffmpegPath, ffprobePath, env, cwd, destWidth, destHeight, srcWidth, srcHeight, fps, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, entryPoint, crf, preset, gopSize, timeoutMs, onLog = () => {}, onSegment = () => {} }) => {
-  const results = [];
-  for (let i = 0; i < plan.chunks.length; i++) {
+export const renderAllChunks = async ({
+  plan,
+  chunkOutputDir,
+  sourceVideoPath,
+  propsJobFile,
+  ffmpegPath,
+  ffprobePath,
+  env,
+  cwd,
+  destWidth,
+  destHeight,
+  srcWidth,
+  srcHeight,
+  fps,
+  concurrency,
+  enableMultiprocessOnLinux,
+  browserExecutable,
+  binariesDirectory,
+  entryPoint,
+  crf,
+  preset,
+  gopSize,
+  timeoutMs,
+  // Criterio 4 (adenda, 14-nov-2026): los tramos PLANOS (FFmpeg) corren
+  // EN PARALELO con los tramos COMPUESTOS (Remotion/Chrome) cuando el
+  // plan tiene de ambos -- la medición real del VPS mostró 55,6% de CPU
+  // promedio del límite de 4 núcleos (holgura real, no supuesta) y que
+  // hoy corrían en serie (la suma de los tiempos individuales
+  // coincidía con el tiempo total). `false` para volver al
+  // comportamiento secuencial anterior si hiciera falta.
+  parallelPlainWithComposite = true,
+  // Compuerta de memoria (criterio 3, adenda): antes de arrancar CADA
+  // tramo plano EN PARALELO (nunca para los compuestos, que siguen
+  // uno a la vez como siempre), se mide la memoria ANÓNIMA real del
+  // contenedor (sin caché de archivos reclamable) contra su límite
+  // real -- si no hay margen, se espera en vez de arrancar un proceso
+  // más encima de un contenedor ya ajustado. `cgroupRoot` solo para
+  // pruebas; en producción es siempre `/sys/fs/cgroup`.
+  cgroupRoot = "/sys/fs/cgroup",
+  onLog = () => {},
+  onSegment = () => {},
+}) => {
+  // Medido UNA SOLA VEZ por job (nunca por chunk -- ver el comentario
+  // grande de `renderPlainChunk`).
+  const disableStreamCopy = await probeSourceDisablesStreamCopy(ffprobePath, env, sourceVideoPath, fps, onLog);
+
+  const memoryLimitBytes = await readContainerMemoryLimitBytes(cgroupRoot);
+
+  const results = new Array(plan.chunks.length);
+  let firstError = null;
+
+  const processChunk = async (i) => {
     const chunk = plan.chunks[i];
     const outputPath = `${chunkOutputDir}/chunk-${String(i).padStart(4, "0")}-${chunk.type}.ts`;
     const expectedFrames = chunk.frames ?? chunk.outputEndFrame - chunk.outputStartFrame;
@@ -408,10 +557,7 @@ export const renderAllChunks = async ({ plan, chunkOutputDir, sourceVideoPath, p
       const verification = await verifyChunkIntegrity({ ffmpegPath, ffprobePath, env, filePath: outputPath, expectedFrames });
       if (verification.ok) {
         onLog(`chunk ${i + 1}/${plan.chunks.length} (${chunk.type}): ya estaba completo y VERIFICADO (checksum ${verification.checksum.slice(0, 12)}...) -- no se vuelve a renderizar.`);
-        const record = { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: outputPath, status: "done", reused: true, checksum: verification.checksum, verifiedAt: new Date().toISOString() };
-        results.push(record);
-        onSegment(record);
-        continue;
+        return { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: outputPath, status: "done", reused: true, checksum: verification.checksum, verifiedAt: new Date().toISOString() };
       }
       onLog(`chunk ${i + 1}/${plan.chunks.length} (${chunk.type}): el archivo existente NO pasó la verificación de integridad (${verification.reason}) -- se descarta y se vuelve a renderizar.`);
       await fs.rm(outputPath, { force: true });
@@ -423,32 +569,67 @@ export const renderAllChunks = async ({ plan, chunkOutputDir, sourceVideoPath, p
     let renderDetail = null;
     try {
       if (chunk.type === "plain") {
-        renderDetail = await renderPlainChunk({ ffmpegPath, ffprobePath, env, sourceVideoPath, chunk, outputPath: tmpOutputPath, destWidth, destHeight, srcWidth, srcHeight, fps, crf, preset, gopSize, workDir: `${chunkOutputDir}/pieces-${i}`, onLog });
+        renderDetail = await renderPlainChunk({ ffmpegPath, ffprobePath, env, sourceVideoPath, chunk, outputPath: tmpOutputPath, destWidth, destHeight, srcWidth, srcHeight, fps, crf, preset, gopSize, disableStreamCopy, workDir: `${chunkOutputDir}/pieces-${i}`, onLog });
       } else {
         renderDetail = await renderCompositeChunk({ cwd, env, propsJobFile, outputPath: tmpOutputPath, chunk, concurrency, enableMultiprocessOnLinux, browserExecutable, binariesDirectory, entryPoint, crf, preset, gopSize, timeoutMs, onLog });
       }
     } catch (err) {
       await fs.rm(tmpOutputPath, { force: true }).catch(() => {});
-      const record = { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: null, status: "error", reused: false, error: String(err.message ?? err) };
-      results.push(record);
-      onSegment(record);
-      throw err;
+      throw Object.assign(err, { segmentRecord: { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: null, status: "error", reused: false, error: String(err.message ?? err) } });
     }
     const renderMs = Date.now() - startedAt;
 
     const verification = await verifyChunkIntegrity({ ffmpegPath, ffprobePath, env, filePath: tmpOutputPath, expectedFrames });
     if (!verification.ok) {
       await fs.rm(tmpOutputPath, { force: true }).catch(() => {});
-      const record = { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: null, status: "error", reused: false, error: `recién renderizado pero no pasó la verificación de integridad: ${verification.reason}` };
-      results.push(record);
-      onSegment(record);
-      throw new Error(record.error);
+      const reason = `recién renderizado pero no pasó la verificación de integridad: ${verification.reason}`;
+      throw Object.assign(new Error(reason), { segmentRecord: { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: null, status: "error", reused: false, error: reason } });
     }
     await fs.rename(tmpOutputPath, outputPath);
-    const record = { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: outputPath, status: "done", reused: false, checksum: verification.checksum, renderMs, startupMs: renderDetail?.startupMs ?? null, copiedFraction: renderDetail?.copiedFraction ?? null, verifiedAt: new Date().toISOString() };
-    results.push(record);
-    onSegment(record);
+    return { index: i, type: chunk.type, outputStartFrame: chunk.outputStartFrame, outputEndFrame: chunk.outputEndFrame, path: outputPath, status: "done", reused: false, checksum: verification.checksum, renderMs, startupMs: renderDetail?.startupMs ?? null, copiedFraction: renderDetail?.copiedFraction ?? null, verifiedAt: new Date().toISOString() };
+  };
+
+  const plainIndices = [];
+  const compositeIndices = [];
+  plan.chunks.forEach((c, i) => (c.type === "plain" ? plainIndices : compositeIndices).push(i));
+  const runInParallel = parallelPlainWithComposite && plainIndices.length > 0 && compositeIndices.length > 0;
+
+  const waitForMemoryHeadroom = async () => {
+    if (!memoryLimitBytes) return;
+    for (let attempt = 0; attempt < 30 && !firstError; attempt++) {
+      if (await hasMemoryHeadroomForAnotherTask({ cgroupRoot, memoryLimitBytes })) return;
+      onLog(`memoria del contenedor cerca del límite -- se espera antes de arrancar el siguiente tramo plano en paralelo con el compuesto en curso.`);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  };
+
+  const runQueue = async (indices, { gateOnMemory = false } = {}) => {
+    for (const i of indices) {
+      if (firstError) return;
+      if (gateOnMemory) await waitForMemoryHeadroom();
+      if (firstError) return;
+      try {
+        results[i] = await processChunk(i);
+        onSegment(results[i]);
+      } catch (err) {
+        if (err.segmentRecord) {
+          results[i] = err.segmentRecord;
+          onSegment(results[i]);
+        }
+        if (!firstError) firstError = err;
+        return;
+      }
+    }
+  };
+
+  if (runInParallel) {
+    onLog(`ejecutando ${plainIndices.length} tramo(s) plano(s) (FFmpeg) EN PARALELO con ${compositeIndices.length} tramo(s) compuesto(s) (Remotion).`);
+    await Promise.all([runQueue(plainIndices, { gateOnMemory: true }), runQueue(compositeIndices)]);
+  } else {
+    await runQueue(plan.chunks.map((_, i) => i));
   }
+
+  if (firstError) throw firstError;
   return results;
 };
 

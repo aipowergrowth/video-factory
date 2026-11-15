@@ -9,7 +9,7 @@
 // exactamente lo que esta prueba no necesita re-probar (ya lo hacía
 // transcribe.mjs, sin incidentes, desde antes de esta extracción).
 
-import { computeCpuCoresPerInterval, summarizeMetricSamples, readContainerMemoryBytes, readContainerCpuLimitCores, readContainerCpuUsageMicros } from "./container-metrics.mjs";
+import { computeCpuCoresPerInterval, summarizeMetricSamples, readContainerMemoryBytes, readContainerCpuLimitCores, readContainerCpuUsageMicros, parseMemoryStatAnonFile, readContainerAnonMemoryBytes, hasMemoryHeadroomForAnotherTask, readContainerMemoryLimitBytes } from "./container-metrics.mjs";
 
 let failures = 0;
 const check = (label, cond, detail = "") => {
@@ -81,6 +81,51 @@ check("summarize: sin ninguna muestra -> available=false (nunca cifras inventada
   const summary = summarizeMetricSamples({ memoryBytesSamples: [1000], cpuCoreSamples: [2.0], cpuLimitCores: null });
   check("summarize: sin cpuLimitCores conocido, el % del límite queda null (nunca inventado)", summary.peakCpuPercentOfLimit === null && summary.avgCpuPercentOfLimit === null);
   check("summarize: los núcleos usados sí se reportan aunque no se conozca el límite", summary.peakCpuCores === 2.0);
+}
+
+// --- parseMemoryStatAnonFile (criterio 3, adenda 14-nov-2026) ---
+
+{
+  const stat = "anon 644245094\nfile 5726623744\nkernel_stack 131072\nslab 2097152\n";
+  const parsed = parseMemoryStatAnonFile(stat);
+  check("parseMemoryStatAnonFile: extrae anon exacto (644245094 bytes ~ 614MB)", parsed.anonBytes === 644245094);
+  check("parseMemoryStatAnonFile: extrae file exacto (5726623744 bytes ~ 5461MB -- la mayor parte del pico de memory.current puede ser esto, caché reclamable, no un riesgo real de OOM)", parsed.fileBytes === 5726623744);
+}
+check("parseMemoryStatAnonFile: contenido vacío o sin esos campos -> ambos null, nunca 0 inventado", parseMemoryStatAnonFile("").anonBytes === null && parseMemoryStatAnonFile("otracosa 123").fileBytes === null);
+check("parseMemoryStatAnonFile: undefined -> no lanza, ambos null", parseMemoryStatAnonFile(undefined).anonBytes === null);
+
+// --- summarizeMetricSamples con anonMemoryBytesSamples ---
+
+{
+  const summary = summarizeMetricSamples({
+    memoryBytesSamples: [1024 * 1024 * 6000],
+    cpuCoreSamples: [4.0],
+    cpuLimitCores: 4,
+    anonMemoryBytesSamples: [1024 * 1024 * 1200, 1024 * 1024 * 1500],
+  });
+  check("summarize con anon: peakMemoryMB (total, con caché) es alto (6000MB)", summary.peakMemoryMB === 6000);
+  check("summarize con anon: peakAnonMemoryMB (real, sin caché) es MUCHO más bajo (1500MB) -- la diferencia es caché reclamable, no riesgo real de OOM", summary.peakAnonMemoryMB === 1500);
+  check("summarize con anon: avgAnonMemoryMB se calcula aparte del promedio total", summary.avgAnonMemoryMB === 1350);
+}
+check("summarize sin anonMemoryBytesSamples (parámetro opcional, omitido): peakAnonMemoryMB queda null, nunca 0 inventado", summarizeMetricSamples({ memoryBytesSamples: [1000], cpuCoreSamples: [1], cpuLimitCores: 4 }).peakAnonMemoryMB === null);
+
+// --- hasMemoryHeadroomForAnotherTask (fail-safe hacia permitir, sin cgroup) ---
+
+{
+  const ok = await hasMemoryHeadroomForAnotherTask({ cgroupRoot: "/ruta/que/no/existe", memoryLimitBytes: 6 * 1024 * 1024 * 1024 });
+  check("hasMemoryHeadroomForAnotherTask sin cgroup disponible: true (fail-safe hacia permitir, el límite real del kernel sigue protegiendo)", ok === true);
+}
+check("hasMemoryHeadroomForAnotherTask sin memoryLimitBytes dado: true (no se puede evaluar margen sin saber el límite)", await hasMemoryHeadroomForAnotherTask({}) === true);
+
+// --- readContainerAnonMemoryBytes / readContainerMemoryLimitBytes (fail-safe, sin cgroup real) ---
+
+{
+  const anon = await readContainerAnonMemoryBytes("/ruta/que/no/existe");
+  check("readContainerAnonMemoryBytes con ruta inexistente: devuelve null, nunca lanza", anon === null);
+}
+{
+  const limit = await readContainerMemoryLimitBytes("/ruta/que/no/existe");
+  check("readContainerMemoryLimitBytes con ruta inexistente: devuelve null, nunca lanza", limit === null);
 }
 
 // --- Lecturas reales (best-effort, fail-safe si no hay cgroup -- esta Mac no lo tiene) ---

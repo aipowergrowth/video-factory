@@ -314,48 +314,111 @@ export const decideRenderMode = ({ configuredMode = "full", override = null, job
   if (plan.compositePercent > maxCompositePercent) {
     return { mode: "full", reason: `${plan.compositePercent}% de cuadros compuestos supera el umbral HYBRID_MAX_COMPOSITE_PERCENT=${maxCompositePercent}% -- el híbrido ya no ahorra lo suficiente frente a su complejidad` };
   }
-  return { mode: "hybrid", reason: `RENDER_MODE=hybrid${override ? " (pedido en el reintento)" : ""}, ${plan.compositePercent}% compuesto <= ${maxCompositePercent}%, ${plan.compositeRuns} corrida(s) compuesta(s)` };
+  // `plan.compositeRuns` NO existe en la forma real de un plan de
+  // `planChunks` (defecto real confirmado en el VPS, 14-nov-2026:
+  // salía literalmente "undefined corrida(s)" -- ese campo solo existe
+  // en la forma que devuelve `planSegments`, una función DISTINTA).
+  // Se cuenta directo de `plan.chunks`, que SÍ existe en ambos
+  // llamadores de producción (index.mjs y render-diagnose-hybrid.mjs).
+  const compositeRunCount = Array.isArray(plan.chunks) ? plan.chunks.filter((c) => c.type === "composite").length : "?";
+  return { mode: "hybrid", reason: `RENDER_MODE=hybrid${override ? " (pedido en el reintento)" : ""}, ${plan.compositePercent}% compuesto <= ${maxCompositePercent}%, ${compositeRunCount} corrida(s) compuesta(s)` };
 };
 
 /**
- * Ventana de medición (criterio 7): los primeros `minWindowFrames`
- * cuadros de SALIDA, extendidos hasta cubrir COMPLETO el primer tramo
- * compuesto (más un segundo de margen) si hace falta -- así la ventana
- * siempre ejercita las dos rutas (FFmpeg y Remotion). Pura.
+ * Ventana de medición REPRESENTATIVA (adenda del auditor, 14-nov-2026,
+ * criterio 7): la primera versión (ahora reemplazada) tomaba los
+ * primeros `minWindowFrames` cuadros "extendidos hasta cubrir el
+ * primer tramo compuesto" -- con un tramo compuesto grande, eso daba
+ * una ventana donde el compuesto dominaba (confirmado real en el VPS:
+ * 63% compuesto en una ventana de un job que en total es 5,4%
+ * compuesto, nada representativo). Esta versión dimensiona la ventana
+ * AL REVÉS: a partir del tamaño real del primer tramo compuesto,
+ * calcula cuánta ventana total hace falta para que ese tramo quede
+ * por DEBAJO de `targetCompositeFraction` (15% por defecto) del total
+ * -- y la centra sobre ese tramo (mitad de margen plano antes, mitad
+ * después, recortado a los bordes del video) para que la ventana se
+ * parezca a un tramo real del job (plano-compuesto-plano), no a un
+ * arranque artificial desde el cuadro 0. `maxWindowFrames` acota el
+ * costo (2-3 min a 30fps = 3600-5400 cuadros) -- si ni así se llega al
+ * 15%, se usa `maxWindowFrames` igual y se deja constancia en el
+ * resultado (`achievedCompositeFraction` puede quedar por encima del
+ * objetivo, nunca se oculta). Devuelve `{windowStartFrame, windowFrames,
+ * achievedCompositeFraction}` -- `windowStartFrame` casi nunca es 0.
  */
-export const chooseMeasurementWindowFrames = (plan, { minWindowFrames, fps = ENGINE_FPS }) => {
-  if (!(plan.totalFrames > 0)) return 0;
-  let windowFrames = Math.min(minWindowFrames, plan.totalFrames);
+export const chooseRepresentativeWindow = (plan, { targetCompositeFraction = 0.15, minWindowFrames, maxWindowFrames, fps = ENGINE_FPS }) => {
+  if (!(plan.totalFrames > 0)) return { windowStartFrame: 0, windowFrames: 0, achievedCompositeFraction: 0 };
   const firstComposite = plan.chunks.find((c) => c.type === "composite");
-  if (firstComposite) windowFrames = Math.max(windowFrames, Math.min(plan.totalFrames, firstComposite.outputEndFrame + fps));
-  return windowFrames;
+  if (!firstComposite) {
+    const windowFrames = Math.min(minWindowFrames, plan.totalFrames);
+    return { windowStartFrame: 0, windowFrames, achievedCompositeFraction: 0 };
+  }
+  const compositeFrames = firstComposite.outputEndFrame - firstComposite.outputStartFrame;
+  let windowFrames = Math.max(minWindowFrames, Math.ceil(compositeFrames / targetCompositeFraction));
+  windowFrames = Math.min(windowFrames, maxWindowFrames, plan.totalFrames);
+  const totalPadding = Math.max(0, windowFrames - compositeFrames);
+  const paddingBefore = Math.min(firstComposite.outputStartFrame, Math.floor(totalPadding / 2));
+  const windowStartFrame = Math.max(0, firstComposite.outputStartFrame - paddingBefore);
+  const windowEndFrame = Math.min(plan.totalFrames, windowStartFrame + windowFrames);
+  return { windowStartFrame, windowFrames: windowEndFrame - windowStartFrame, achievedCompositeFraction: Math.round((compositeFrames / (windowEndFrame - windowStartFrame)) * 1000) / 1000 };
 };
 
-/** Recorta un plan a sus primeros `windowFrames` cuadros de salida -- el último chunk que cruza el límite se acorta (su fuente también, si es plano). Pura. */
-export const clipChunksToWindow = (plan, windowFrames, { fps = ENGINE_FPS } = {}) => {
+/**
+ * Recorta un plan a un RANGO [windowStartFrame, windowEndFrame) de
+ * cuadros de SALIDA -- generaliza la versión anterior (que solo
+ * recortaba desde el cuadro 0). Los chunks que cruzan un borde de la
+ * ventana se acortan (su fuente también, si son planos). Los
+ * `outputStartFrame`/`outputEndFrame` de cada chunk se dejan en su
+ * valor ABSOLUTO (nunca reindexados a 0) -- un chunk compuesto los usa
+ * tal cual para `--frames` de Remotion, que necesita la posición real
+ * dentro de la composición COMPLETA, no relativa a esta ventana. Pura.
+ */
+export const clipChunksToRange = (plan, windowStartFrame, windowEndFrame, { fps = ENGINE_FPS } = {}) => {
   const round3 = (n) => Math.round(n * 1000) / 1000;
   const chunks = [];
   for (const c of plan.chunks) {
-    if (c.outputStartFrame >= windowFrames) break;
-    const outputEndFrame = Math.min(c.outputEndFrame, windowFrames);
-    const frames = outputEndFrame - c.outputStartFrame;
+    if (c.outputEndFrame <= windowStartFrame || c.outputStartFrame >= windowEndFrame) continue;
+    const clippedStart = Math.max(c.outputStartFrame, windowStartFrame);
+    const clippedEnd = Math.min(c.outputEndFrame, windowEndFrame);
+    const trimmedBeforeFrames = clippedStart - c.outputStartFrame;
+    const frames = clippedEnd - clippedStart;
     chunks.push({
       ...c,
-      outputEndFrame,
+      outputStartFrame: clippedStart,
+      outputEndFrame: clippedEnd,
       frames,
-      sourceEndSeconds: c.type === "plain" ? round3(c.sourceStartSeconds + frames / fps) : c.sourceEndSeconds,
+      sourceStartSeconds: c.type === "plain" ? round3(c.sourceStartSeconds + trimmedBeforeFrames / fps) : c.sourceStartSeconds,
+      sourceEndSeconds: c.type === "plain" ? round3(c.sourceStartSeconds + trimmedBeforeFrames / fps + frames / fps) : c.sourceEndSeconds,
     });
   }
-  return { ...plan, totalFrames: Math.min(plan.totalFrames, windowFrames), chunks };
+  return { ...plan, totalFrames: windowEndFrame - windowStartFrame, chunks };
 };
 
-/** Recorta una línea de tiempo (buildTimeline) a sus primeros `outputSeconds` segundos de SALIDA -- para construir el audio de una ventana con los mismos cortes. Pura. */
-export const clipTimelineToOutputSeconds = (timeline, outputSeconds) => {
+/**
+ * Recorta una línea de tiempo (buildTimeline) a un RANGO
+ * [windowStartSeconds, windowEndSeconds) de segundos de SALIDA --
+ * generaliza la versión anterior (solo desde el segundo 0). A
+ * diferencia de `clipChunksToRange`, acá SÍ se reindexa a 0 (`outputStart`
+ * del primer tramo sobreviviente queda en 0) -- el audio de la ventana
+ * es un archivo propio, independiente, que debe empezar en su propio
+ * tiempo 0; `sourceStart`/`sourceEnd` (lo único que usa
+ * `buildAudioFilterComplex` para el `atrim`) quedan en tiempo ABSOLUTO
+ * de la fuente, recortados exactamente a la parte que cae dentro de la
+ * ventana. Pura.
+ */
+export const clipTimelineToOutputRange = (timeline, windowStartSeconds, windowEndSeconds) => {
   const segments = [];
   for (const seg of timeline.segments) {
-    if (seg.outputStart >= outputSeconds) break;
-    const outputEnd = Math.min(seg.outputEnd, outputSeconds);
-    segments.push({ ...seg, outputEnd, sourceEnd: seg.sourceStart + (outputEnd - seg.outputStart) });
+    if (seg.outputEnd <= windowStartSeconds || seg.outputStart >= windowEndSeconds) continue;
+    const clippedOutputStart = Math.max(seg.outputStart, windowStartSeconds);
+    const clippedOutputEnd = Math.min(seg.outputEnd, windowEndSeconds);
+    const trimmedBefore = clippedOutputStart - seg.outputStart;
+    const trimmedAfter = seg.outputEnd - clippedOutputEnd;
+    segments.push({
+      sourceStart: seg.sourceStart + trimmedBefore,
+      sourceEnd: seg.sourceEnd - trimmedAfter,
+      outputStart: clippedOutputStart - windowStartSeconds,
+      outputEnd: clippedOutputEnd - windowStartSeconds,
+    });
   }
-  return { segments, outputDurationInSeconds: Math.min(timeline.outputDurationInSeconds, outputSeconds) };
+  return { segments, outputDurationInSeconds: windowEndSeconds - windowStartSeconds };
 };

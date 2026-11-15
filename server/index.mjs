@@ -152,10 +152,22 @@ const HYBRID_X264_PRESET = process.env.HYBRID_X264_PRESET ?? "medium";
 const HYBRID_GOP_SIZE = Number(process.env.HYBRID_GOP_SIZE ?? 90);
 const HYBRID_BUNDLE_DIR = process.env.HYBRID_BUNDLE_DIR ?? path.join(PROJECT_ROOT, ".remotion-hybrid-bundle");
 const HYBRID_BUNDLE_VERSION_TAG = process.env.GIT_SHA ?? "dev";
-// Ventana mínima del diagnóstico híbrido (criterio 7/E) -- 5s de
-// salida por defecto, extendida sola para cubrir el primer tramo
-// compuesto completo (ver chooseMeasurementWindowFrames).
-const HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES = Number(process.env.HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES ?? 150);
+// Ventana REPRESENTATIVA del diagnóstico híbrido (adenda, criterio 7,
+// 14-nov-2026) -- se dimensiona a partir del tramo compuesto real para
+// que quede por debajo de `HYBRID_DIAGNOSE_TARGET_COMPOSITE_FRACTION`
+// del total, acotada entre MIN y MAX (2-3 min a 30fps por defecto --
+// ver segment-planner.mjs#chooseRepresentativeWindow). La versión
+// anterior ("cubrir el primer compuesto + 1s de margen") dio 63%
+// compuesto en el job real del VPS -- nada representativo.
+const HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES = Number(process.env.HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES ?? 3600);
+const HYBRID_DIAGNOSE_MAX_WINDOW_FRAMES = Number(process.env.HYBRID_DIAGNOSE_MAX_WINDOW_FRAMES ?? 5400);
+const HYBRID_DIAGNOSE_TARGET_COMPOSITE_FRACTION = Number(process.env.HYBRID_DIAGNOSE_TARGET_COMPOSITE_FRACTION ?? 0.15);
+// Criterio 4 (adenda) -- corre los tramos planos de FFmpeg EN PARALELO
+// con los compuestos de Remotion. `true` por defecto: la medición real
+// del VPS mostró 55,6% de CPU promedio del límite de 4 núcleos
+// (holgura real). Puede apagarse por job (vía el cuerpo del POST de
+// diagnóstico) para comparar con/sin paralelismo sin redesplegar.
+const HYBRID_PARALLEL_PLAIN_WITH_COMPOSITE = (process.env.HYBRID_PARALLEL_PLAIN_WITH_COMPOSITE ?? "true") === "true";
 
 // Reintentos para la descarga desde Google Drive.
 const DRIVE_DOWNLOAD_MAX_ATTEMPTS = Number(
@@ -486,6 +498,7 @@ const runRender = async (jobId, job) => {
         crf: HYBRID_CRF,
         preset: HYBRID_X264_PRESET,
         gopSize: HYBRID_GOP_SIZE,
+        parallelPlainWithComposite: HYBRID_PARALLEL_PLAIN_WITH_COMPOSITE,
         timeoutMs: RENDER_TIMEOUT_MINUTES * 60 * 1000,
         onLog: (msg) => console.log(`[render ${jobId}] [híbrido] ${msg}`),
         onSegments: (segments) => writeStatus(jobId, { renderMode: "hybrid", segments }),
@@ -1996,8 +2009,16 @@ app.post("/jobs/:id/diagnose-hybrid", async (req, res) => {
   const diagnosticsDir = path.join(PROJECT_ROOT, "diagnostics");
   await fsp.mkdir(diagnosticsDir, { recursive: true });
   const minWindowFrames = req.body?.minWindowFrames ? Number(req.body.minWindowFrames) : HYBRID_DIAGNOSE_MIN_WINDOW_FRAMES;
+  const maxWindowFrames = req.body?.maxWindowFrames ? Number(req.body.maxWindowFrames) : HYBRID_DIAGNOSE_MAX_WINDOW_FRAMES;
+  // Override por pedido, SOLO para este diagnóstico -- nunca cambia
+  // HYBRID_X264_PRESET/HYBRID_PARALLEL_PLAIN_WITH_COMPOSITE reales.
+  // Permite a Alex comparar presets de x264 (criterio 5) o
+  // con/sin paralelismo (criterio 4) repitiendo la llamada con
+  // distintos valores, sin reconstruir la imagen cada vez.
+  const preset = req.body?.x264Preset ? String(req.body.x264Preset) : HYBRID_X264_PRESET;
+  const parallelPlainWithComposite = req.body?.parallelPlainWithComposite !== undefined ? req.body.parallelPlainWithComposite === true : HYBRID_PARALLEL_PLAIN_WITH_COMPOSITE;
 
-  console.log(`[diagnóstico híbrido ${jobId}] iniciando -- minWindowFrames=${minWindowFrames}, fuente=${sourceDiag.width}x${sourceDiag.height}, destino=${dims.width}x${dims.height}.`);
+  console.log(`[diagnóstico híbrido ${jobId}] iniciando -- minWindowFrames=${minWindowFrames}, maxWindowFrames=${maxWindowFrames}, preset=${preset}, paralelo=${parallelPlainWithComposite}, fuente=${sourceDiag.width}x${sourceDiag.height}, destino=${dims.width}x${dims.height}.`);
   const result = await runHybridDiagnostic({
     job,
     jobRelPath: `uploads/jobs/${jobId}.json`,
@@ -2021,15 +2042,18 @@ app.post("/jobs/:id/diagnose-hybrid", async (req, res) => {
     fuseGapFrames: HYBRID_FUSE_GAP_FRAMES,
     maxCompositePercent: HYBRID_MAX_COMPOSITE_PERCENT,
     minWindowFrames,
+    maxWindowFrames,
+    targetCompositeFraction: HYBRID_DIAGNOSE_TARGET_COMPOSITE_FRACTION,
+    parallelPlainWithComposite,
     crf: HYBRID_CRF,
-    preset: HYBRID_X264_PRESET,
+    preset,
     gopSize: HYBRID_GOP_SIZE,
     timeoutMs: RENDER_DIAGNOSE_TIMEOUT_MINUTES * 60 * 1000 * 2, // el doble: esto hace DOS renders de la ventana (híbrido + línea base) más el bundle
     onLog: (msg) => console.log(`[diagnóstico híbrido ${jobId}] ${msg}`),
   });
   console.log(`[diagnóstico híbrido ${jobId}] terminado -- ok=${result.ok} ${result.ok ? `chunksMs=${result.chunksMs} assembleMs=${result.assemble.totalMs} baselineFullRenderMs=${result.baselineFullRenderMs} psnr=${result.equivalence.averagePsnr}` : `error=${result.error}`}`);
 
-  res.json({ jobId, ...result });
+  res.json({ jobId, preset, parallelPlainWithComposite, ...result });
 });
 
 app.get("/jobs/:id/download", (req, res) => {

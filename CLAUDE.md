@@ -220,6 +220,7 @@ node server/test-verbose-log-milestones.mjs
 node server/test-render-diagnose.mjs
 node server/test-segment-planner.mjs
 node server/test-segment-render.mjs
+node server/test-video-compare.mjs
 ```
 
 Estas **no** corren en esta Mac (necesitan FFmpeg/Chrome reales, que
