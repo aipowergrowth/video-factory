@@ -221,6 +221,7 @@ node server/test-render-diagnose.mjs
 node server/test-segment-planner.mjs
 node server/test-segment-render.mjs
 node server/test-video-compare.mjs
+node server/test-render-diagnose-hybrid.mjs
 ```
 
 Estas **no** corren en esta Mac (necesitan FFmpeg/Chrome reales, que
@@ -234,6 +235,7 @@ node server/test-video-conversion-regression.mjs  # .github/workflows/audio-regr
 node server/test-captions-render.mjs              # .github/workflows/captions-destination-test.yml
 node server/test-render-observability.mjs         # .github/workflows/captions-destination-test.yml
 node server/test-hybrid-render.mjs                # .github/workflows/captions-destination-test.yml
+node server/test-hybrid-diagnose.mjs              # .github/workflows/captions-destination-test.yml
 ```
 
 ## Mantenimiento

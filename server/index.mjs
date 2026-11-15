@@ -31,7 +31,7 @@ import { canRetryJob, describeRetryPlan, readJobFileForRetry, checkBaseVideoExis
 import { runDiagnosticRender, buildDiagnosticWindows } from "./render-diagnose.mjs";
 import { planSegments, planChunks, decideRenderMode } from "./segment-planner.mjs";
 import { runHybridRenderForJob } from "./segment-pipeline.mjs";
-import { runHybridDiagnostic } from "./render-diagnose-hybrid.mjs";
+import { runHybridDiagnostic, planHybridDiagnosticWindow, estimateHybridDiagnosticMs } from "./render-diagnose-hybrid.mjs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const PROJECT_ROOT = process.env.PROJECT_ROOT ?? process.cwd();
@@ -261,6 +261,19 @@ const cancelledJobIds = new Set();
 // cuando el híbrido falló). Se consume una sola vez (se borra al
 // leerlo) -- nunca persiste más allá de ese reintento.
 const renderModeOverrides = new Map(); // jobId -> "full"
+// Estado del diagnóstico híbrido ASÍNCRONO (criterio 3, adenda
+// 15-nov-2026: la medición real sobre una ventana representativa puede
+// tardar más de lo razonable para mantener una conexión HTTP abierta
+// -- POST lanza en segundo plano y devuelve de inmediato; GET consulta
+// el estado/resultado cuando Alex quiera, el mismo patrón ya usado
+// para un render real -- "Fabrica Videos - Estado del job"). Solo en
+// memoria -- es un diagnóstico, no el estado real de un job, nunca se
+// persiste en el store de jobs reales ni sobrevive un reinicio del
+// servicio (igual que `diagnostics/`, que también es temporal). Una
+// clave por jobId -- lanzar un diagnóstico nuevo sobre el mismo job
+// reemplaza el resultado anterior (nunca dos diagnósticos del mismo
+// job a la vez, igual que un render real).
+const hybridDiagnostics = new Map(); // jobId -> { status: "running"|"done"|"error", startedAt, finishedAt, preset, parallelPlainWithComposite, estimate, result, error }
 
 class CancelledError extends Error {
   constructor(jobId) {
@@ -1972,10 +1985,25 @@ app.post("/jobs/:id/diagnose", async (req, res) => {
  * `diagnostics/` igual que `/jobs/:id/diagnose`, y lo borra al
  * terminar. No corre si hay un render real en curso (compite por CPU).
  */
+/**
+ * Lanza el diagnóstico híbrido EN SEGUNDO PLANO y responde de
+ * inmediato (criterio 3, adenda 15-nov-2026) -- la medición real sobre
+ * una ventana representativa (2-3min) puede tardar varios minutos
+ * (bundle + tramos + línea base acotada + comparaciones), demasiado
+ * para mantener una conexión HTTP abierta con un timeout fijo. El
+ * mismo patrón ya usado para un render real: lanzar y consultar aparte
+ * (ver GET más abajo, o "Fabrica Videos - Estado del job" para un
+ * render real). Antes de lanzar, calcula y devuelve una estimación
+ * [CALCULADA] (criterio 4) con las velocidades REALES medidas en el
+ * VPS -- Alex ve cuánto esperar ANTES de que termine, no solo al final.
+ */
 app.post("/jobs/:id/diagnose-hybrid", async (req, res) => {
   const jobId = req.params.id;
   if (active > 0 || runningChildren.has(jobId)) {
     return res.status(409).json({ error: "Hay un render real en curso -- el diagnóstico híbrido no corre junto a un render real." });
+  }
+  if (hybridDiagnostics.get(jobId)?.status === "running") {
+    return res.status(409).json({ error: "Ya hay un diagnóstico híbrido en curso para este job -- consulta GET /jobs/:id/diagnose-hybrid o espera a que termine antes de lanzar otro." });
   }
   const fileCheck = await readJobFileForRetry(jobFilePath(jobId), RETENTION_DAYS);
   if (!fileCheck.ok) {
@@ -2017,9 +2045,28 @@ app.post("/jobs/:id/diagnose-hybrid", async (req, res) => {
   // distintos valores, sin reconstruir la imagen cada vez.
   const preset = req.body?.x264Preset ? String(req.body.x264Preset) : HYBRID_X264_PRESET;
   const parallelPlainWithComposite = req.body?.parallelPlainWithComposite !== undefined ? req.body.parallelPlainWithComposite === true : HYBRID_PARALLEL_PLAIN_WITH_COMPOSITE;
+  const timeoutMarginMultiplier = req.body?.timeoutMarginMultiplier ? Number(req.body.timeoutMarginMultiplier) : undefined;
 
-  console.log(`[diagnóstico híbrido ${jobId}] iniciando -- minWindowFrames=${minWindowFrames}, maxWindowFrames=${maxWindowFrames}, preset=${preset}, paralelo=${parallelPlainWithComposite}, fuente=${sourceDiag.width}x${sourceDiag.height}, destino=${dims.width}x${dims.height}.`);
-  const result = await runHybridDiagnostic({
+  // Estimación [CALCULADA] (criterio 4) -- se calcula con las mismas
+  // funciones puras que usará el diagnóstico real, ANTES de lanzarlo,
+  // para que Alex sepa cuánto esperar antes de que termine.
+  const { windowStartFrame, windowEndFrame, windowFrames, achievedCompositeFraction, plan } = planHybridDiagnosticWindow(job, {
+    fuseGapFrames: HYBRID_FUSE_GAP_FRAMES,
+    minWindowFrames,
+    maxWindowFrames,
+    targetCompositeFraction: HYBRID_DIAGNOSE_TARGET_COMPOSITE_FRACTION,
+    maxCompositePercent: HYBRID_MAX_COMPOSITE_PERCENT,
+    fps: ENGINE_FPS,
+  });
+  const estimate = estimateHybridDiagnosticMs(plan, { windowStartFrame, windowEndFrame });
+
+  const startedAt = new Date().toISOString();
+  hybridDiagnostics.set(jobId, { status: "running", startedAt, finishedAt: null, preset, parallelPlainWithComposite, windowFrames, achievedCompositeFraction, estimate, result: null, error: null });
+  console.log(
+    `[diagnóstico híbrido ${jobId}] lanzado en segundo plano -- minWindowFrames=${minWindowFrames}, maxWindowFrames=${maxWindowFrames}, preset=${preset}, paralelo=${parallelPlainWithComposite}, fuente=${sourceDiag.width}x${sourceDiag.height}, destino=${dims.width}x${dims.height}. Estimación [CALCULADA]: ${Math.round(estimate.totalOptimisticMs / 1000)}s-${Math.round(estimate.totalConservativeMs / 1000)}s. Consultar con GET /jobs/${jobId}/diagnose-hybrid.`,
+  );
+
+  runHybridDiagnostic({
     job,
     jobRelPath: `uploads/jobs/${jobId}.json`,
     sourceVideoAbsolutePath: baseVideoAbsolutePath,
@@ -2048,12 +2095,37 @@ app.post("/jobs/:id/diagnose-hybrid", async (req, res) => {
     crf: HYBRID_CRF,
     preset,
     gopSize: HYBRID_GOP_SIZE,
-    timeoutMs: RENDER_DIAGNOSE_TIMEOUT_MINUTES * 60 * 1000 * 2, // el doble: esto hace DOS renders de la ventana (híbrido + línea base) más el bundle
+    ...(timeoutMarginMultiplier ? { timeoutMarginMultiplier } : {}),
     onLog: (msg) => console.log(`[diagnóstico híbrido ${jobId}] ${msg}`),
-  });
-  console.log(`[diagnóstico híbrido ${jobId}] terminado -- ok=${result.ok} ${result.ok ? `chunksMs=${result.chunksMs} assembleMs=${result.assemble.totalMs} baselineFullRenderMs=${result.baselineFullRenderMs} psnr=${result.equivalence.averagePsnr}` : `error=${result.error}`}`);
+  })
+    .then((result) => {
+      console.log(`[diagnóstico híbrido ${jobId}] terminado -- ok=${result.ok} ${result.ok ? `chunksMs=${result.chunksMs} assembleMs=${result.assemble.totalMs} equivalenceMs=${result.equivalenceMs} psnr=${result.equivalence.averagePsnr}` : `error=${result.error}`}`);
+      const current = hybridDiagnostics.get(jobId);
+      hybridDiagnostics.set(jobId, { ...current, status: result.ok ? "done" : "error", finishedAt: new Date().toISOString(), result, error: result.ok ? null : result.error });
+    })
+    .catch((err) => {
+      console.log(`[diagnóstico híbrido ${jobId}] terminado con error inesperado: ${err.message ?? err}`);
+      const current = hybridDiagnostics.get(jobId);
+      hybridDiagnostics.set(jobId, { ...current, status: "error", finishedAt: new Date().toISOString(), result: null, error: String(err.message ?? err) });
+    });
 
-  res.json({ jobId, preset, parallelPlainWithComposite, ...result });
+  res.json({ jobId, status: "running", startedAt, preset, parallelPlainWithComposite, windowFrames, achievedCompositeFraction, estimate });
+});
+
+/**
+ * Estado/resultado del diagnóstico híbrido lanzado con el POST de
+ * arriba (criterio 3) -- consultable las veces que haga falta mientras
+ * corre ("running") y una vez terminado ("done"/"error"), igual que
+ * "Fabrica Videos - Estado del job" para un render real. 404 si nunca
+ * se lanzó ninguno para este jobId (o si el servicio se reinició desde
+ * entonces -- este estado es solo en memoria).
+ */
+app.get("/jobs/:id/diagnose-hybrid", (req, res) => {
+  const entry = hybridDiagnostics.get(req.params.id);
+  if (!entry) {
+    return res.status(404).json({ error: "No hay ningún diagnóstico híbrido lanzado para este job (o el servicio se reinició desde que se lanzó -- este estado no se persiste en disco)." });
+  }
+  res.json({ jobId: req.params.id, ...entry });
 });
 
 app.get("/jobs/:id/download", (req, res) => {

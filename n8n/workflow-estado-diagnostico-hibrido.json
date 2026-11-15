@@ -1,0 +1,194 @@
+{
+  "name": "Fabrica Videos - Estado del diagnóstico híbrido",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-640, 0],
+      "id": "trigger-manual",
+      "name": "Ejecutar manualmente"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "jobid-field",
+              "name": "jobId",
+              "value": "1fd239de-8f9e-4642-8e42-d848b17d8481",
+              "type": "string",
+              "notes": "El mismo jobId usado al lanzar con 'Fabrica Videos - Render de diagnóstico híbrido'. Re-ejecutar este workflow las veces que haga falta mientras el estado siga en 'running' -- igual que 'Fabrica Videos - Estado del job' para un render real."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-400, 0],
+      "id": "jobid",
+      "name": "jobId a consultar"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=http://fabrica-videos-engine:3001/jobs/{{ $json.jobId }}/diagnose-hybrid",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-160, 0],
+      "id": "consultar-estado",
+      "name": "Consultar estado del diagnóstico híbrido",
+      "notes": "Adenda 15-nov-2026 (criterio 3): el diagnóstico corre en segundo plano desde que se lanzó con el otro workflow -- esto solo LEE su estado actual, nunca lanza nada. 404 si nunca se lanzó un diagnóstico para este jobId (o si el servicio se reinició desde entonces -- el estado es solo en memoria, no se persiste en disco)."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "r-status",
+              "name": "estado",
+              "value": "={{ $json.status }}",
+              "type": "string",
+              "notes": "'running' (todavía no termina -- volver a ejecutar este workflow más tarde), 'done' (terminó bien -- ver el resto de los campos), 'error' (terminó mal -- ver \"errorDelDiagnostico\"), o ausente si nunca se lanzó ninguno (ver \"error\" del HTTP, 404)."
+            },
+            {
+              "id": "r-error-http",
+              "name": "error",
+              "value": "={{ $json.error }}",
+              "type": "string",
+              "notes": "Solo presente en un 404 (nunca se lanzó un diagnóstico para este jobId, o el servicio se reinició)."
+            },
+            {
+              "id": "r-started",
+              "name": "lanzadoA_las",
+              "value": "={{ $json.startedAt }}",
+              "type": "string"
+            },
+            {
+              "id": "r-finished",
+              "name": "terminadoA_las",
+              "value": "={{ $json.finishedAt }}",
+              "type": "string"
+            },
+            {
+              "id": "r-error-diag",
+              "name": "errorDelDiagnostico",
+              "value": "={{ $json.error }}",
+              "type": "string",
+              "notes": "Solo presente si estado='error' -- motivo real del fallo (p.ej. un timeout, aunque no debería pasar con los márgenes calculados)."
+            },
+            {
+              "id": "r-estimate",
+              "name": "estimacionCalculada",
+              "value": "={{ $json.estimate ? { segundosSiElParaleloAyuda: Math.round($json.estimate.totalOptimisticMs/1000), segundosSiElParaleloNoAyuda: Math.round($json.estimate.totalConservativeMs/1000) } : undefined }}",
+              "type": "object",
+              "notes": "La misma estimación [CALCULADA] que ya se vio al lanzar -- útil para comparar contra lo que de verdad tardó (renderMs+equivalenceMs de abajo)."
+            },
+            {
+              "id": "r-preset",
+              "name": "presetUsado",
+              "value": "={{ $json.preset }}",
+              "type": "string"
+            },
+            {
+              "id": "r-parallel",
+              "name": "paraleloUsado",
+              "value": "={{ $json.parallelPlainWithComposite }}",
+              "type": "boolean"
+            },
+            {
+              "id": "r-decision",
+              "name": "decisionDeModo",
+              "value": "={{ $json.result?.decision }}",
+              "type": "object",
+              "notes": "mode ('hybrid'/'full') y reason -- qué habría decidido el planificador para el job COMPLETO (no solo la ventana medida)."
+            },
+            {
+              "id": "r-window",
+              "name": "ventanaMedida",
+              "value": "={{ $json.result ? { cuadroInicio: $json.result.windowStartFrame, frames: $json.result.windowFrames, seconds: $json.result.windowSeconds, porcentajeCompuestoLogrado: $json.result.achievedCompositeFraction } : undefined }}",
+              "type": "object",
+              "notes": "cuadroInicio casi nunca es 0 -- la ventana queda CENTRADA sobre un tramo compuesto real. porcentajeCompuestoLogrado por encima de 0.15 significa que el video no tenía margen plano suficiente alrededor de ese tramo para bajarlo más (se dice con evidencia, nunca se esconde)."
+            },
+            {
+              "id": "r-bundle",
+              "name": "bundle",
+              "value": "={{ $json.result?.bundle }}",
+              "type": "object",
+              "notes": "reused (true/false) y ms -- cuánto tardó construir el bundle de Remotion (solo la primera vez por versión de imagen)."
+            },
+            {
+              "id": "r-segments",
+              "name": "tramos",
+              "value": "={{ $json.result?.segments }}",
+              "type": "array",
+              "notes": "Un registro por tramo, EN ORDEN real (adenda 15-nov-2026: antes podía salir en orden de finalización bajo paralelismo -- corregido): type (plain/composite), outputStartFrame/outputEndFrame, renderMs, startupMs (solo compuestos), copiedFraction (solo planos -- qué fracción se copió sin recodificar), checksum. Dividiendo (outputEndFrame-outputStartFrame)/(renderMs/1000) da los cuadros/segundo REALES por tipo de tramo -- la base para cualquier extrapolación (que debe marcarse CALCULADA, nunca medida)."
+            },
+            {
+              "id": "r-chunksms",
+              "name": "msTramos",
+              "value": "={{ $json.result?.chunksMs }}",
+              "type": "number",
+              "notes": "Tiempo de renderizar todos los tramos de la ventana (FFmpeg+Remotion, en paralelo o en serie según paraleloUsado)."
+            },
+            {
+              "id": "r-assemble",
+              "name": "ensamblado",
+              "value": "={{ $json.result?.assemble }}",
+              "type": "object",
+              "notes": "stages: concatMs (unión SIN recodificar), audioMs, muxMs."
+            },
+            {
+              "id": "r-rendertotal",
+              "name": "msRenderHibridoTotal",
+              "value": "={{ $json.result?.renderMs }}",
+              "type": "number",
+              "notes": "bundle + tramos + ensamblado -- el tiempo TOTAL real de producir el .mp4 final de la ventana híbrida (criterio 7b: \"con el ensamblado completo dentro del tiempo medido\"). Comparar contra estimacionCalculada de arriba."
+            },
+            {
+              "id": "r-equivalencems",
+              "name": "msEquivalencia",
+              "value": "={{ $json.result?.equivalenceMs }}",
+              "type": "number",
+              "notes": "Tiempo de TODA la verificación de equivalencia (adenda 15-nov-2026): comparar los tramos planos contra la fuente + renderizar la línea base acotada de los tramos compuestos + compararlos. Ya NO incluye un render completo de la ventana entera -- por eso debería ser mucho menor que antes."
+            },
+            {
+              "id": "r-equivalence",
+              "name": "equivalenciaVisual",
+              "value": "={{ $json.result ? { cuadrosExactos: $json.result.equivalence.frameCountExact, cuadrosEsperados: $json.result.equivalence.expectedVideoFrames, cuadrosHibrido: $json.result.equivalence.hybridVideoFrames, sincroniaDeAudioOk: $json.result.equivalence.audioSyncOk, diferenciaDeAudioSegundos: $json.result.equivalence.audioSyncDiffSeconds, psnrPromedio: $json.result.equivalence.averagePsnr, psnrMinimo: $json.result.equivalence.minPsnr, cuadrosComparadosContraFuente: $json.result.equivalence.comparedAgainstSourceFrames, cuadrosComparadosContraRenderCompleto: $json.result.equivalence.comparedAgainstFullRenderFrames, cuadrosOmitidosPorCopiaBitIdentica: $json.result.equivalence.skippedBitIdenticalCopyFrames, porSegmento: $json.result.equivalence.bySegment } : undefined }}",
+              "type": "object",
+              "notes": "Adenda 15-nov-2026: ya NO se compara toda la ventana contra un render completo (eso causaba el timeout) -- los tramos PLANOS se comparan contra la FUENTE original (o se omiten si fueron una copia bit-idéntica, nada que medir) y los tramos COMPUESTOS contra un render REAL de Remotion pero SOLO de ese tramo + un margen chico. cuadrosComparadosContraRenderCompleto debe ser MUCHO menor que cuadrosEsperados -- confirma que la línea base quedó acotada. porSegmento trae, por cada entrada, comparedAgainst ('source'/'full-render'/'none-bit-identical-copy') -- deja explícito qué cuadros se compararon contra qué; las entradas type='composite-region' además traen byChunk/byBoundary (PSNR por tramo y por empalme, nunca solo un promedio global que esconda un defecto localizado)."
+            },
+            {
+              "id": "r-metrics",
+              "name": "memoriaYCpuDelContenedor",
+              "value": "={{ $json.result ? { picoMemoriaTotalMB: $json.result.containerMetrics.peakMemoryMB, picoMemoriaAnonimaMB: $json.result.containerMetrics.peakAnonMemoryMB, promedioMemoriaAnonimaMB: $json.result.containerMetrics.avgAnonMemoryMB, picoCpuNucleos: $json.result.containerMetrics.peakCpuCores, promedioCpuNucleos: $json.result.containerMetrics.avgCpuCores, porcentajeCpuPico: $json.result.containerMetrics.peakCpuPercentOfLimit, porcentajeCpuPromedio: $json.result.containerMetrics.avgCpuPercentOfLimit } : undefined }}",
+              "type": "object",
+              "notes": "picoMemoriaTotalMB (con caché de archivos, reclamable) vs picoMemoriaAnonimaMB (memoria real, la que de verdad puede provocar un OOM-kill -- criterio 3). Si picoMemoriaAnonimaMB queda bien por debajo de 6144MB aunque picoMemoriaTotalMB esté cerca, el pico anterior era caché, no un riesgo real."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [100, 0],
+      "id": "resumen",
+      "name": "Resumen del diagnóstico híbrido"
+    }
+  ],
+  "connections": {
+    "Ejecutar manualmente": {
+      "main": [[{ "node": "jobId a consultar", "type": "main", "index": 0 }]]
+    },
+    "jobId a consultar": {
+      "main": [[{ "node": "Consultar estado del diagnóstico híbrido", "type": "main", "index": 0 }]]
+    },
+    "Consultar estado del diagnóstico híbrido": {
+      "main": [[{ "node": "Resumen del diagnóstico híbrido", "type": "main", "index": 0 }]]
+    }
+  }
+}

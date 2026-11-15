@@ -28,6 +28,7 @@ on:
       - "server/video-compare.mjs"
       - "server/test-render-observability.mjs"
       - "server/test-hybrid-render.mjs"
+      - "server/test-hybrid-diagnose.mjs"
       - ".github/workflows/captions-destination-test.yml"
   pull_request:
     paths:
@@ -49,6 +50,7 @@ on:
       - "server/video-compare.mjs"
       - "server/test-render-observability.mjs"
       - "server/test-hybrid-render.mjs"
+      - "server/test-hybrid-diagnose.mjs"
   workflow_dispatch: {}
 
 jobs:
@@ -77,3 +79,6 @@ jobs:
 
       - name: Render híbrido con FFmpeg/Chrome reales (ensamblado sin recodificar, FPS variable, verificación de integridad)
         run: node server/test-hybrid-render.mjs
+
+      - name: Diagnóstico híbrido con FFmpeg/Chrome reales (línea base acotada al tramo compuesto, orden de ensamblado correcto en paralelo)
+        run: node server/test-hybrid-diagnose.mjs

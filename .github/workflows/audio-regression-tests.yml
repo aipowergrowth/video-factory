@@ -66,6 +66,7 @@ jobs:
           node server/test-segment-planner.mjs
           node server/test-segment-render.mjs
           node server/test-video-compare.mjs
+          node server/test-render-diagnose-hybrid.mjs
 
       - name: Pruebas de regresión con audio real (mismo FFmpeg que producción)
         run: node server/test-audio-regression.mjs

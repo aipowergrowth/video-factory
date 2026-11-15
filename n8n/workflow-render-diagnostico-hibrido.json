@@ -39,14 +39,21 @@
               "name": "x264Preset",
               "value": "",
               "type": "string",
-              "notes": "Criterio 5 (adenda): deja VACÍO para usar el preset real de producción (HYBRID_X264_PRESET, 'medium' por defecto). Para comparar velocidad/calidad de otros presets SIN reconstruir la imagen, poner aquí 'veryfast', 'fast', 'slow', etc. y volver a ejecutar -- comparar msTramos y equivalenciaVisual.bySegment entre corridas."
+              "notes": "Criterio 5 (adenda 14-nov-2026): deja VACÍO para usar el preset real de producción (HYBRID_X264_PRESET, 'medium' por defecto). Para comparar velocidad/calidad de otros presets SIN reconstruir la imagen, poner aquí 'veryfast', 'fast', 'slow', etc. y volver a ejecutar -- comparar msTramos y equivalenciaVisual.bySegment entre corridas."
             },
             {
               "id": "parallel-field",
               "name": "parallelPlainWithComposite",
               "value": true,
               "type": "boolean",
-              "notes": "Criterio 4 (adenda): true = tramos planos (FFmpeg) EN PARALELO con los compuestos (Remotion). Poner en false y volver a ejecutar para comparar contra el comportamiento secuencial anterior (comparar msTramos y memoriaYCpuDelContenedor.picoMemoriaAnonimaMB entre las dos corridas)."
+              "notes": "Criterio 4 (adenda 14-nov-2026): true = tramos planos (FFmpeg) EN PARALELO con los compuestos (Remotion). Poner en false y volver a ejecutar para comparar contra el comportamiento secuencial (comparar msTramos y memoriaYCpuDelContenedor.picoMemoriaAnonimaMB entre las dos corridas)."
+            },
+            {
+              "id": "margin-field",
+              "name": "timeoutMarginMultiplier",
+              "value": 3,
+              "type": "number",
+              "notes": "Adenda 15-nov-2026 (corrección del timeout real en el VPS): margen de seguridad sobre la velocidad MEDIDA para cada timeout interno -- 3x por defecto. Solo subir este número si una corrida real falla por timeout a pesar del margen (poco probable; cada timeout ya es proporcional a lo que de verdad se va a renderizar, no a toda la ventana)."
             }
           ]
         },
@@ -68,11 +75,12 @@
             { "name": "minWindowFrames", "value": "={{ $json.minWindowFrames }}" },
             { "name": "maxWindowFrames", "value": "={{ $json.maxWindowFrames }}" },
             { "name": "x264Preset", "value": "={{ $json.x264Preset }}" },
-            { "name": "parallelPlainWithComposite", "value": "={{ $json.parallelPlainWithComposite }}" }
+            { "name": "parallelPlainWithComposite", "value": "={{ $json.parallelPlainWithComposite }}" },
+            { "name": "timeoutMarginMultiplier", "value": "={{ $json.timeoutMarginMultiplier }}" }
           ]
         },
         "options": {
-          "timeout": 600000
+          "timeout": 30000
         }
       },
       "type": "n8n-nodes-base.httpRequest",
@@ -80,113 +88,55 @@
       "position": [-160, 0],
       "id": "lanzar-diagnostico-hibrido",
       "name": "Lanzar render de diagnóstico híbrido",
-      "notes": "Render híbrido (Fase 0, 14-nov-2026; ampliado por la adenda del mismo día tras la primera medición real) -- mide, sobre una ventana REPRESENTATIVA del job real (2-3min, <15% compuesto, centrada en un tramo compuesto real), el pipeline COMPLETO: bundle, tramos planos (FFmpeg) y compuestos (Remotion) -- en paralelo si parallelPlainWithComposite=true --, ensamblado, Y lo compara contra un render completo de esa misma ventana: duración exacta en cuadros, sincronía de audio, PSNR por tramo y por empalme. Memoria (con desglose anónima/caché) y CPU del contenedor durante TODO el proceso, no solo Remotion. Sin costo de API, sin tocar el job real ni OUTPUTS_DIR. Tarda hasta 2x RENDER_DIAGNOSE_TIMEOUT_MINUTES (dos renders de la ventana + el bundle) -- timeout del nodo HTTP en 600s, generoso."
+      "notes": "Adenda 15-nov-2026 (corrección de un timeout real encontrado en el VPS): este POST ya NO espera a que el diagnóstico termine -- lo lanza en SEGUNDO PLANO y responde en segundos con el estado inicial y una estimación [CALCULADA] de cuánto va a tardar. El resultado final se consulta con el workflow separado 'Fabrica Videos - Estado del diagnóstico híbrido' (nodo 'Consultar estado del diagnóstico híbrido'), las veces que haga falta, igual que un render real. Timeout del nodo HTTP en 30s -- generoso para la respuesta INMEDIATA, ya no para el diagnóstico completo."
     },
     {
       "parameters": {
         "assignments": {
           "assignments": [
             {
-              "id": "r-ok",
-              "name": "ok",
-              "value": "={{ $json.ok }}",
-              "type": "boolean"
+              "id": "r-status",
+              "name": "estado",
+              "value": "={{ $json.status }}",
+              "type": "string",
+              "notes": "Debe decir 'running' -- el diagnóstico quedó lanzado en segundo plano. Si en cambio sale un error (jobId desconocido, video fuente faltante, ya hay un diagnóstico corriendo), este nodo trae ese mensaje en su lugar."
             },
             {
-              "id": "r-error",
-              "name": "error",
-              "value": "={{ $json.error }}",
+              "id": "r-started",
+              "name": "lanzadoA_las",
+              "value": "={{ $json.startedAt }}",
               "type": "string"
+            },
+            {
+              "id": "r-estimate",
+              "name": "estimacionCalculada",
+              "value": "={{ { segundosSiElParaleloAyuda: Math.round($json.estimate.totalOptimisticMs/1000), segundosSiElParaleloNoAyuda: Math.round($json.estimate.totalConservativeMs/1000), cuadrosPlanos: $json.estimate.plainFrames, cuadrosCompuestos: $json.estimate.compositeFrames, cuadrosDeLineaBaseAcotada: $json.estimate.baselineFrames } }}",
+              "type": "object",
+              "notes": "[CALCULADA] (criterio 4, adenda 15-nov-2026) con las velocidades REALES medidas en el VPS el 14-nov-2026 -- NUNCA medida en esta corrida todavía, es la predicción de ANTES de empezar. cuadrosDeLineaBaseAcotada debe ser MUCHO menor que cuadrosPlanos+cuadrosCompuestos (la ventana completa) -- la línea base de equivalencia ya solo cubre los tramos compuestos + un margen chico, no la ventana entera (el motivo real de esta adenda: la ventana completa habría tardado 15-28min y superado el timeout)."
+            },
+            {
+              "id": "r-window",
+              "name": "ventanaElegida",
+              "value": "={{ { frames: $json.windowFrames, porcentajeCompuesto: $json.achievedCompositeFraction } }}",
+              "type": "object"
             },
             {
               "id": "r-preset",
               "name": "presetUsado",
               "value": "={{ $json.preset }}",
-              "type": "string",
-              "notes": "Qué preset de x264 se usó en esta corrida (criterio 5) -- el real de producción si x264Preset quedó vacío arriba."
+              "type": "string"
             },
             {
               "id": "r-parallel",
               "name": "paraleloUsado",
               "value": "={{ $json.parallelPlainWithComposite }}",
-              "type": "boolean",
-              "notes": "Si esta corrida ejecutó los tramos planos en paralelo con los compuestos (criterio 4)."
+              "type": "boolean"
             },
             {
-              "id": "r-decision",
-              "name": "decisionDeModo",
-              "value": "={{ $json.decision }}",
-              "type": "object",
-              "notes": "mode ('hybrid'/'full') y reason -- qué habría decidido el planificador para el job COMPLETO (no solo la ventana medida). El reason ya no dice 'undefined corrida(s)' (defecto corregido)."
-            },
-            {
-              "id": "r-window",
-              "name": "ventanaMedida",
-              "value": "={{ { cuadroInicio: $json.windowStartFrame, frames: $json.windowFrames, seconds: $json.windowSeconds, porcentajeCompuestoLogrado: $json.achievedCompositeFraction } }}",
-              "type": "object",
-              "notes": "cuadroInicio casi nunca es 0 -- la ventana queda CENTRADA sobre un tramo compuesto real, no forzada a arrancar desde el principio del video. porcentajeCompuestoLogrado por encima de 0.15 significa que el video no tiene margen plano suficiente alrededor de ese tramo para bajarlo más (se dice con evidencia, nunca se esconde)."
-            },
-            {
-              "id": "r-bundle",
-              "name": "bundle",
-              "value": "={{ $json.bundle }}",
-              "type": "object",
-              "notes": "reused (true/false) y ms -- cuánto tardó construir el bundle de Remotion (solo la primera vez por versión de imagen)."
-            },
-            {
-              "id": "r-segments",
-              "name": "tramos",
-              "value": "={{ $json.segments }}",
-              "type": "array",
-              "notes": "Un registro por tramo: type (plain/composite), outputStartFrame/outputEndFrame, renderMs, startupMs (solo compuestos), copiedFraction (solo planos -- qué fracción se copió sin recodificar), checksum. Dividiendo (outputEndFrame-outputStartFrame) / (renderMs/1000) da los cuadros/segundo REALES por tipo de tramo -- la base para cualquier extrapolación (que debe marcarse CALCULADA, nunca medida)."
-            },
-            {
-              "id": "r-chunksms",
-              "name": "msTramos",
-              "value": "={{ $json.chunksMs }}",
-              "type": "number",
-              "notes": "Tiempo de renderizar todos los tramos de la ventana (FFmpeg+Remotion, en paralelo o en serie según paraleloUsado)."
-            },
-            {
-              "id": "r-assemble",
-              "name": "ensamblado",
-              "value": "={{ $json.assemble }}",
-              "type": "object",
-              "notes": "stages: concatMs (unión SIN recodificar), audioMs, muxMs."
-            },
-            {
-              "id": "r-rendertotal",
-              "name": "msRenderHibridoTotal",
-              "value": "={{ $json.renderMs }}",
-              "type": "number",
-              "notes": "bundle + tramos + ensamblado -- el tiempo TOTAL real de producir el .mp4 final de la ventana (criterio 7b: \"con el ensamblado completo dentro del tiempo medido\")."
-            },
-            {
-              "id": "r-baseline",
-              "name": "msRenderCompletoDeLaMismaVentana",
-              "value": "={{ $json.baselineFullRenderMs }}",
-              "type": "number"
-            },
-            {
-              "id": "r-speedup",
-              "name": "factorDeAceleracion",
-              "value": "={{ $json.speedupRatio }}",
-              "type": "number",
-              "notes": "msRenderCompletoDeLaMismaVentana / msRenderHibridoTotal -- >1 significa que el híbrido fue más rápido en ESTA ventana."
-            },
-            {
-              "id": "r-equivalence",
-              "name": "equivalenciaVisual",
-              "value": "={{ { cuadrosExactos: $json.equivalence.frameCountExact, cuadrosHibrido: $json.equivalence.hybridVideoFrames, cuadrosCompleto: $json.equivalence.baselineVideoFrames, sincroniaDeAudioOk: $json.equivalence.audioSyncOk, diferenciaDeAudioSegundos: $json.equivalence.audioSyncDiffSeconds, psnrPromedio: $json.equivalence.averagePsnr, psnrMinimo: $json.equivalence.minPsnr, porTramo: $json.equivalence.bySegment.byChunk, porEmpalme: $json.equivalence.bySegment.byBoundary } }}",
-              "type": "object",
-              "notes": "cuadrosExactos debe ser true (duración exacta en cuadros, criterio 7b). psnrPromedio/psnrMinimo son GLOBALES (>22dB es buena señal con contenido real, no el patrón sintético adversarial de las pruebas de CI) -- pero el dato que de verdad localiza un defecto es porEmpalme: cada entrada trae boundaryFrame/fromType/toType/averagePsnr/minPsnr de la ventana justo alrededor de esa frontera. porTramo da lo mismo por cada tramo completo (plano o compuesto) por separado."
-            },
-            {
-              "id": "r-metrics",
-              "name": "memoriaYCpuDelContenedor",
-              "value": "={{ { picoMemoriaTotalMB: $json.containerMetrics.peakMemoryMB, picoMemoriaAnonimaMB: $json.containerMetrics.peakAnonMemoryMB, promedioMemoriaAnonimaMB: $json.containerMetrics.avgAnonMemoryMB, picoCpuNucleos: $json.containerMetrics.peakCpuCores, promedioCpuNucleos: $json.containerMetrics.avgCpuCores, porcentajeCpuPico: $json.containerMetrics.peakCpuPercentOfLimit, porcentajeCpuPromedio: $json.containerMetrics.avgCpuPercentOfLimit } }}",
-              "type": "object",
-              "notes": "picoMemoriaTotalMB (con caché de archivos, reclamable) vs picoMemoriaAnonimaMB (memoria real, la que de verdad puede provocar un OOM-kill -- criterio 3). Si picoMemoriaAnonimaMB queda bien por debajo de 6144MB aunque picoMemoriaTotalMB esté cerca, el pico anterior era caché, no un riesgo real."
+              "id": "r-nota",
+              "name": "siguientePaso",
+              "value": "Esperar según la estimación de arriba y después ejecutar el workflow 'Fabrica Videos - Estado del diagnóstico híbrido' (mismo jobId) para ver el resultado -- se puede volver a ejecutar cuantas veces haga falta mientras el estado siga en 'running'.",
+              "type": "string"
             }
           ]
         },
@@ -196,7 +146,7 @@
       "typeVersion": 3.4,
       "position": [100, 0],
       "id": "resumen-diagnostico-hibrido",
-      "name": "Resumen del diagnóstico híbrido"
+      "name": "Diagnóstico lanzado"
     }
   ],
   "connections": {
@@ -207,7 +157,7 @@
       "main": [[{ "node": "Lanzar render de diagnóstico híbrido", "type": "main", "index": 0 }]]
     },
     "Lanzar render de diagnóstico híbrido": {
-      "main": [[{ "node": "Resumen del diagnóstico híbrido", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Diagnóstico lanzado", "type": "main", "index": 0 }]]
     }
   }
 }

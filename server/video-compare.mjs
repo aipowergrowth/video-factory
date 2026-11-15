@@ -53,6 +53,30 @@ export const probeStreamDuration = async (ffprobePath, env, filePath, streamSele
 };
 
 /**
+ * Extrae un rango de cuadros EXACTO de un archivo YA codificado a un
+ * nuevo archivo chico -- adenda 15-nov-2026 (corrección del timeout del
+ * diagnóstico híbrido en el VPS): la línea base de equivalencia ya no
+ * renderiza la VENTANA completa (minutos), solo las regiones
+ * compuestas -- esto extrae la porción correspondiente del .mp4
+ * HÍBRIDO ya ensamblado para comparar cuadro a cuadro contra esa línea
+ * base chica, sin volver a tocar la fuente. `-ss` ANTES de `-i` más
+ * una recodificación (no copia de flujo) da el cuadro exacto aunque no
+ * caiga en un keyframe -- mismo patrón ya probado en
+ * `segment-render.mjs#buildPlainPieceFfmpegArgs` para piezas
+ * "reencode". `timeoutMs` (opcional): mata el proceso si se traba --
+ * proporcional al tamaño del rango, nunca un valor fijo (ver
+ * `render-diagnose-hybrid.mjs#estimateRenderMs`).
+ */
+export const extractFrameRangeToFile = async (ffmpegPath, env, { inputPath, startFrame, frameCount, fps, outputPath, timeoutMs }) => {
+  const startSeconds = startFrame / fps;
+  await execFileAsync(
+    ffmpegPath,
+    ["-y", "-ss", String(startSeconds), "-i", inputPath, "-frames:v", String(frameCount), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", outputPath],
+    { env, maxBuffer: 16 * 1024 * 1024, ...(timeoutMs ? { timeout: timeoutMs } : {}) },
+  );
+};
+
+/**
  * PSNR promedio (dB) con el filtro `psnr` real de FFmpeg. Compara
  * cuadro a cuadro en el orden en que cada archivo los entrega, así que
  * ambos deben tener la MISMA cantidad de cuadros (confirmar aparte).
